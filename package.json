@@ -22,6 +22,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "plugin:build": "npm run build && openclaw plugins build --entry ./dist/index.js",
+    "plugin:check": "openclaw plugins build --entry ./dist/index.js --check",
     "plugin:validate": "npm run build && openclaw plugins validate --entry ./dist/index.js",
     "prepack": "npm run plugin:build",
     "test": "vitest run --config ./vitest.config.ts"
