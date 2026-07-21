@@ -364,6 +364,33 @@ describe("AgentMail reply-only outbound", () => {
     expect(reply).not.toHaveBeenCalled();
   });
 
+  it("maps a deterministic local-file recovery failure to an unresolved verdict", async () => {
+    reply.mockClear();
+    const enoent = Object.assign(new Error("no such file"), { code: "ENOENT" });
+    loadAgentMailOutboundAttachments.mockRejectedValueOnce(enoent);
+    const now = 10_000;
+    const result = await reconcileAgentMailUnknownSend(
+      {
+        cfg: {
+          channels: {
+            agentmail: { apiKey: "key", inboxId: "inbox_1", allowFrom: ["sender@example.com"] },
+          },
+        },
+        queueId: "queue_1",
+        channel: "agentmail",
+        to: "message:msg_1",
+        accountId: "default",
+        enqueuedAt: now - 1_000,
+        retryCount: 1,
+        effectiveReplyToId: "msg_1",
+        payloads: [{ text: "Hello", mediaUrls: ["file:///missing.bin"] }],
+      } as never,
+      { client: client(), now: () => now },
+    );
+    expect(result).toEqual({ status: "unresolved", error: "no such file", retryable: false });
+    expect(reply).not.toHaveBeenCalled();
+  });
+
   it("refuses recovery when the persisted reply target differs", async () => {
     const now = 10_000;
     const result = await reconcileAgentMailUnknownSend(

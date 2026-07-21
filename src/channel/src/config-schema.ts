@@ -7,6 +7,9 @@ import { buildSecretInputSchema } from "openclaw/plugin-sdk/secret-input";
 // (buildChannelConfigSchema); mixing a second zod copy triggers structural type mismatches.
 import { z } from "openclaw/plugin-sdk/zod";
 
+// Documented upper bound for the per-message media buffer (MiB).
+export const AGENTMAIL_MEDIA_MAX_MB = 100;
+
 const SecretInputSchema = buildSecretInputSchema();
 
 const AgentMailAccountConfigSchema = z
@@ -19,7 +22,9 @@ const AgentMailAccountConfigSchema = z
     webhookPath: z.string().optional(),
     dmPolicy: z.enum(["allowlist", "open", "disabled"]).optional(),
     allowFrom: AllowFromListSchema,
-    mediaMaxMb: z.number().positive().optional(),
+    // Bounded so a typo cannot request an impractically large per-message buffer. 100 MiB comfortably
+    // exceeds typical provider attachment limits; accounts.ts still floors this to finite integer bytes.
+    mediaMaxMb: z.number().positive().max(AGENTMAIL_MEDIA_MAX_MB).optional(),
   })
   .strict();
 

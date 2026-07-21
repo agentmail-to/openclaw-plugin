@@ -8,7 +8,7 @@ import { AgentMailMediaPolicyError, loadAgentMailInboundAttachments } from "./me
 import type { AgentMailIngressRecord, ResolvedAgentMailAccount } from "./types.js";
 
 const CHANNEL_ID = "agentmail";
-const HYDRATION_NOT_FOUND_RETRY_WINDOW_MS = 5 * 60_000;
+export const HYDRATION_NOT_FOUND_RETRY_WINDOW_MS = 5 * 60_000;
 
 type AgentMailLog = {
   info?: (message: string) => void;
@@ -84,7 +84,10 @@ export async function dispatchAgentMailInboundEvent(params: {
     });
   } catch (error) {
     if (error instanceof AgentMailError && error.statusCode === 404) {
-      const ageMs = Math.max(0, (params.now?.() ?? Date.now()) - params.record.receivedAt);
+      // Measure from local ingestion, not the (possibly back-dated) email timestamp, so delayed
+      // mail is not discarded on its first 404 while the provider's REST projection catches up.
+      const arrivedAt = params.record.arrivedAt ?? params.record.receivedAt;
+      const ageMs = Math.max(0, (params.now?.() ?? Date.now()) - arrivedAt);
       if (ageMs >= HYDRATION_NOT_FOUND_RETRY_WINDOW_MS) {
         params.log?.warn?.(
           `AgentMail ignored unavailable message ${params.record.messageId} after the hydration retry window`,

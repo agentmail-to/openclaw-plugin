@@ -6,10 +6,22 @@ import type {
   ChannelMessageUnknownSendContext,
   ChannelMessageUnknownSendReconciliationResult,
 } from "openclaw/plugin-sdk/channel-outbound";
+import { LocalMediaAccessError } from "openclaw/plugin-sdk/web-media";
 import { resolveAgentMailAccount } from "./accounts.js";
 import { createAgentMailClient } from "./client.js";
 import { isAgentMailSenderAllowed, parseSingleFromMailbox } from "./mailbox.js";
 import { AgentMailMediaPolicyError, loadAgentMailOutboundAttachments } from "./media.js";
+
+// Recovery failures that re-running the same payload cannot repair. During unknown-send
+// reconciliation these must produce a structured verdict rather than escaping the reconciler,
+// while transient failures (network, provider 5xx) still throw so the queue keeps retrying.
+function isDeterministicRecoveryFailure(error: unknown): boolean {
+  if (error instanceof AgentMailMediaPolicyError || error instanceof LocalMediaAccessError) {
+    return true;
+  }
+  const code = (error as { code?: unknown } | null)?.code;
+  return code === "ENOENT" || code === "EACCES" || code === "EISDIR" || code === "ENOTDIR";
+}
 
 const TARGET_PREFIX = "message:";
 // AgentMail expires idempotency keys 24 hours after a completed send. Stop one hour early because
@@ -248,8 +260,12 @@ export async function reconcileAgentMailUnknownSend(
       options,
     );
   } catch (error) {
-    if (error instanceof AgentMailMediaPolicyError) {
-      return { status: "unresolved", error: error.message, retryable: false };
+    if (isDeterministicRecoveryFailure(error)) {
+      return {
+        status: "unresolved",
+        error: error instanceof Error ? error.message : String(error),
+        retryable: false,
+      };
     }
     throw error;
   }

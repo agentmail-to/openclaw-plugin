@@ -26,7 +26,6 @@ function respond(res: ServerResponse, status: number, body = ""): true {
 }
 
 function parseVerifiedEvent(payload: unknown): {
-  eventId?: string;
   inboxId: string;
   messageId: string;
 } | null {
@@ -39,14 +38,13 @@ function parseVerifiedEvent(payload: unknown): {
     return null;
   }
   const mail = message as Record<string, unknown>;
-  if (typeof mail.inbox_id !== "string" || typeof mail.message_id !== "string") {
+  const inboxId = typeof mail.inbox_id === "string" ? mail.inbox_id.trim() : "";
+  const messageId = typeof mail.message_id === "string" ? mail.message_id.trim() : "";
+  // Require both identifiers to be present and non-empty; an empty id cannot address a message.
+  if (!inboxId || !messageId) {
     return null;
   }
-  return {
-    inboxId: mail.inbox_id,
-    messageId: mail.message_id,
-    ...(typeof event.event_id === "string" ? { eventId: event.event_id } : {}),
-  };
+  return { inboxId, messageId };
 }
 
 export function createAgentMailWebhookHandler(params: {
@@ -105,13 +103,14 @@ export function createAgentMailWebhookHandler(params: {
       return respond(res, 200);
     }
     try {
+      const nowMs = Date.now();
       await params.receive({
         accountId: params.account.accountId,
         inboxId: event.inboxId,
         messageId: event.messageId,
-        eventId: event.eventId,
         transport: "webhook",
-        receivedAt: Date.now(),
+        receivedAt: nowMs,
+        arrivedAt: nowMs,
       });
       return respond(res, 200);
     } catch (error) {

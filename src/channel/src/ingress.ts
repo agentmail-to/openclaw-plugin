@@ -1,6 +1,8 @@
-import { computeBackoff, sleepWithAbort } from "openclaw/plugin-sdk/runtime-env";
+import { computeBackoff } from "openclaw/plugin-sdk/runtime-env";
 import type { createAgentMailDurableInboundReceiveJournal } from "./durable-receive.js";
 import { AgentMailIngressCapacityError, createAgentMailDurableInboundId } from "./durable-receive.js";
+import { HYDRATION_NOT_FOUND_RETRY_WINDOW_MS } from "./inbound.js";
+import { waitForRetry } from "./retry.js";
 import type { AgentMailIngressRecord } from "./types.js";
 
 // Re-exported for transports (websocket) that catch capacity backpressure by class.
@@ -37,13 +39,32 @@ function retryDelayMs(attempt: number): number {
   return computeBackoff({ initialMs: 1_000, maxMs: 30 * 60_000, factor: 2, jitter: 0.2 }, attempt);
 }
 
-async function waitForRetry(signal: AbortSignal | undefined, delayMs: number): Promise<boolean> {
-  try {
-    await sleepWithAbort(delayMs, signal);
-    return !signal?.aborted;
-  } catch {
-    return false;
+function isHydrationNotFound(error: unknown): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    (error as { statusCode?: unknown }).statusCode === 404
+  );
+}
+
+// A 404 dispatch failure means the provider's REST projection has not yet caught up with the
+// receive event. Keep those retries inside the bounded hydration window (measured from local
+// arrival) so exponential backoff never schedules the next attempt past the deadline and silently
+// drops recoverable mail. Non-404 failures keep the full backoff for genuine outages.
+function nextDispatchDelayMs(params: {
+  error: unknown;
+  record: AgentMailIngressRecord;
+  attempts: number;
+  retryDelay: (attempt: number) => number;
+  now?: () => number;
+}): number {
+  const base = params.retryDelay(params.attempts);
+  if (!isHydrationNotFound(params.error)) {
+    return base;
   }
+  const deadline =
+    (params.record.arrivedAt ?? params.record.receivedAt) + HYDRATION_NOT_FOUND_RETRY_WINDOW_MS;
+  return Math.max(0, Math.min(base, deadline - (params.now?.() ?? Date.now())));
 }
 
 function errorText(error: unknown): string {
@@ -165,7 +186,12 @@ async function dispatchAgentMailIngressUntilSettled(params: DispatchParams): Pro
         }
         const shouldRetry = await waitForRetry(
           params.abortSignal,
-          (params.retryDelay ?? retryDelayMs)(attempts),
+          nextDispatchDelayMs({
+            error,
+            record: params.record,
+            attempts,
+            retryDelay: params.retryDelay ?? retryDelayMs,
+          }),
         );
         if (!shouldRetry) {
           return false;
@@ -199,14 +225,36 @@ export async function replayPendingAgentMailIngress(params: {
   retryDelayMs?: (attempt: number) => number;
 }): Promise<void> {
   for (const pending of await params.journal.pending()) {
+    if (params.abortSignal?.aborted) {
+      return;
+    }
+    // Revalidate through accept() before scheduling. During overlapping restarts a row can be
+    // completed (or terminally failed) by another worker after this pending() snapshot was taken;
+    // scheduling it blindly would run a second agent turn and send a duplicate reply.
+    let accepted: Awaited<ReturnType<AgentMailJournal["accept"]>>;
+    try {
+      accepted = await params.journal.accept(pending.id, pending.payload, {
+        receivedAt: pending.payload.receivedAt,
+      });
+    } catch (error) {
+      if (error instanceof AgentMailIngressCapacityError) {
+        // The queue is already at capacity with other pending rows; nothing new to replay here.
+        continue;
+      }
+      throw error;
+    }
+    const acceptedKind: string = accepted.kind;
+    if (acceptedKind === "completed" || acceptedKind === "failed") {
+      continue;
+    }
     scheduleAgentMailIngressDispatch({
       journal: params.journal,
       id: pending.id,
-      record: pending.payload,
+      record: accepted.kind === "pending" ? accepted.record.payload : pending.payload,
       dispatch: params.dispatch,
       abortSignal: params.abortSignal,
       retryDelay: params.retryDelayMs,
-      initialAttempts: pending.attempts,
+      initialAttempts: accepted.kind === "pending" ? accepted.record.attempts : pending.attempts,
     });
   }
 }

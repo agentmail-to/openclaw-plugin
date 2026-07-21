@@ -1,8 +1,10 @@
 import { createHash } from "node:crypto";
 import type { AgentMail, AgentMailClient } from "agentmail";
 import type { PluginStateKeyedStore } from "openclaw/plugin-sdk/plugin-state-runtime";
-import { computeBackoff, sleepWithAbort } from "openclaw/plugin-sdk/runtime-env";
+import { computeBackoff } from "openclaw/plugin-sdk/runtime-env";
 import { createAgentMailClient } from "./client.js";
+import { AgentMailIngressCapacityError } from "./durable-receive.js";
+import { waitForRetry } from "./retry.js";
 import { getAgentMailRuntime } from "./runtime.js";
 import type { AgentMailIngressRecord, ResolvedAgentMailAccount } from "./types.js";
 
@@ -29,25 +31,20 @@ export type AgentMailCatchUpSession = {
   run(params: {
     receive: (record: AgentMailIngressRecord) => Promise<void>;
     abortSignal: AbortSignal;
+    // A deep sweep lists from the monitoring baseline instead of the recent high-water overlap, so
+    // back-dated or long-delayed mail that fell below the overlap window is still recovered.
+    sinceBaseline?: boolean;
   }): Promise<void>;
 };
 
 export type AgentMailCatchUpSupervisor = {
   request(): void;
+  requestDeep(): void;
   settle(): Promise<void>;
 };
 
 function catchUpRetryDelayMs(attempt: number): number {
   return computeBackoff({ initialMs: 1_000, maxMs: 30_000, factor: 2, jitter: 0.2 }, attempt);
-}
-
-async function waitForRetry(signal: AbortSignal, delayMs: number): Promise<boolean> {
-  try {
-    await sleepWithAbort(delayMs, signal);
-    return !signal.aborted;
-  } catch {
-    return false;
-  }
 }
 
 export function createAgentMailCatchUpSupervisor(params: {
@@ -58,6 +55,7 @@ export function createAgentMailCatchUpSupervisor(params: {
   log?: AgentMailCatchUpLog;
 }): AgentMailCatchUpSupervisor {
   let requested = false;
+  let deepRequested = false;
   let worker: Promise<void> | undefined;
   const retryDelay = params.retryDelayMs ?? catchUpRetryDelayMs;
 
@@ -70,15 +68,21 @@ export function createAgentMailCatchUpSupervisor(params: {
       let attempts = 0;
       while (!params.abortSignal.aborted && requested) {
         requested = false;
+        // Consume the deep flag for this pass so a single serialized worker handles both modes
+        // without concurrent runs racing the shared cursor.
+        const sinceBaseline = deepRequested;
+        deepRequested = false;
         try {
           await params.session.run({
             receive: params.receive,
             abortSignal: params.abortSignal,
+            sinceBaseline,
           });
           attempts = 0;
         } catch (error) {
           attempts += 1;
           requested = true;
+          deepRequested ||= sinceBaseline;
           params.log?.error?.(
             `AgentMail REST catch-up failed; retrying: ${error instanceof Error ? error.message : String(error)}`,
           );
@@ -97,6 +101,10 @@ export function createAgentMailCatchUpSupervisor(params: {
 
   return {
     request,
+    requestDeep: () => {
+      deepRequested = true;
+      request();
+    },
     settle: async () => {
       await worker;
     },
@@ -195,14 +203,15 @@ export async function createAgentMailCatchUpSession(params: {
   const client = params.client ?? createAgentMailClient(params.account);
 
   return {
-    run: async ({ receive, abortSignal }) => {
+    run: async ({ receive, abortSignal, sinceBaseline }) => {
       const storedCursor = normalizeCursor(await store.lookup(key));
       if (!storedCursor) {
         throw new Error("AgentMail WebSocket catch-up cursor is unavailable");
       }
-      const afterMs = storedCursor.established
-        ? Math.max(0, storedCursor.highWaterAtMs - AGENTMAIL_REST_CATCH_UP_OVERLAP_MS)
-        : storedCursor.baselineAtMs;
+      const afterMs =
+        sinceBaseline || !storedCursor.established
+          ? storedCursor.baselineAtMs
+          : Math.max(0, storedCursor.highWaterAtMs - AGENTMAIL_REST_CATCH_UP_OVERLAP_MS);
       let highWaterAtMs = storedCursor.highWaterAtMs;
       let pageCursor: string | undefined;
       let admitted = 0;
@@ -230,13 +239,27 @@ export async function createAgentMailCatchUpSession(params: {
           if (!isReceivedMessage(message, params.account.inboxId)) {
             continue;
           }
-          await receive({
-            accountId: params.account.accountId,
-            inboxId: params.account.inboxId,
-            messageId: message.messageId,
-            transport: "rest",
-            receivedAt: message.timestamp.getTime(),
-          });
+          try {
+            await receive({
+              accountId: params.account.accountId,
+              inboxId: params.account.inboxId,
+              messageId: message.messageId,
+              transport: "rest",
+              receivedAt: message.timestamp.getTime(),
+              arrivedAt: now(),
+            });
+          } catch (error) {
+            if (error instanceof AgentMailIngressCapacityError) {
+              // Durable ingress is full. Stop this pass without advancing the cursor past the
+              // unadmitted message and without a tight failure loop that would re-list the same
+              // pages. The periodic sweep re-runs catch-up once capacity frees.
+              params.log?.info?.(
+                `AgentMail catch-up paused: durable ingress is full for account ${params.account.accountId}`,
+              );
+              return;
+            }
+            throw error;
+          }
           admitted += 1;
           highWaterAtMs = Math.max(highWaterAtMs, message.timestamp.getTime());
           pageAdvanced = true;

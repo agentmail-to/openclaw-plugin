@@ -35,7 +35,7 @@ const account: ResolvedAgentMailAccount = {
 };
 
 describe("AgentMail WebSocket ingress", () => {
-  it("re-subscribes after every open and normalizes received events", async () => {
+  it("re-subscribes on each connection and reconnects itself after a close", async () => {
     handlers.clear();
     sendSubscribe.mockClear();
     close.mockClear();
@@ -48,21 +48,21 @@ describe("AgentMail WebSocket ingress", () => {
       abortSignal: controller.signal,
       receive,
       catchUpSession: { run: catchUpRun },
+      reconnectDelayMs: () => 0,
     });
     await vi.waitFor(() => expect(handlers.has("open")).toBe(true));
+    // The plugin owns reconnection, so the SDK's own reconnect is disabled.
     expect(connect).toHaveBeenCalledWith(
-      expect.objectContaining({
-        reconnectAttempts: Number.POSITIVE_INFINITY,
-        waitForOpen: false,
-      }),
+      expect.objectContaining({ reconnectAttempts: 0, waitForOpen: false }),
     );
     expect(waitForOpen).not.toHaveBeenCalled();
     handlers.get("open")?.();
-    await vi.waitFor(() => expect(catchUpRun).toHaveBeenCalledOnce());
+    await vi.waitFor(() => expect(catchUpRun).toHaveBeenCalled());
+    // A close triggers a plugin-managed reconnect (a fresh connect), not an SDK re-open.
     handlers.get("close")?.();
+    await vi.waitFor(() => expect(connect).toHaveBeenCalledTimes(2));
     handlers.get("open")?.();
-    expect(sendSubscribe).toHaveBeenCalledTimes(2);
-    await vi.waitFor(() => expect(catchUpRun).toHaveBeenCalledTimes(2));
+    await vi.waitFor(() => expect(sendSubscribe).toHaveBeenCalledTimes(2));
     expect(sendSubscribe).toHaveBeenLastCalledWith({
       type: "subscribe",
       inboxIds: ["inbox_1"],
@@ -90,7 +90,8 @@ describe("AgentMail WebSocket ingress", () => {
     );
     controller.abort();
     await running;
-    expect(close).toHaveBeenCalledOnce();
+    // The first socket is closed on reconnect and the second on abort.
+    expect(close).toHaveBeenCalledTimes(2);
   });
 
   it("stops cleanly when aborted before the initial socket opens", async () => {

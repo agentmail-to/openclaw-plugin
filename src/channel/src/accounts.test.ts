@@ -73,6 +73,33 @@ describe("AgentMail account config", () => {
     expect(resolveAgentMailAccount(cfg, "billing").webhookPath).toBe("/mail/billing");
   });
 
+  it("does not let named accounts inherit the top-level inboxId", () => {
+    const cfg = {
+      channels: {
+        agentmail: {
+          apiKey: sharedVal,
+          inboxId: "inbox_default",
+          accounts: {
+            support: { apiKey: sharedVal }, // no own inboxId
+            billing: { inboxId: "inbox_billing" },
+          },
+        },
+      },
+    };
+    // A named account without its own inboxId must resolve empty (unconfigured), never the
+    // top-level mailbox — otherwise two accounts would consume the same inbox and double-reply.
+    expect(resolveAgentMailAccount(cfg, "support").inboxId).toBe("");
+    expect(resolveAgentMailAccount(cfg, "billing").inboxId).toBe("inbox_billing");
+    // The implicit default account still owns the top-level inboxId.
+    expect(resolveAgentMailAccount(cfg, "default").inboxId).toBe("inbox_default");
+  });
+
+  it("rejects an impractically large mediaMaxMb", () => {
+    const runtime = AgentMailChannelConfigSchema.runtime;
+    expect(runtime?.safeParse({ mediaMaxMb: 25 }).success).toBe(true);
+    expect(runtime?.safeParse({ mediaMaxMb: 100_000 }).success).toBe(false);
+  });
+
   it("requires an explicit wildcard for open access", () => {
     const runtime = AgentMailChannelConfigSchema.runtime;
     expect(runtime?.safeParse({ dmPolicy: "open", allowFrom: [] }).success).toBe(false);

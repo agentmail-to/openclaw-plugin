@@ -1,3 +1,4 @@
+import { rm } from "node:fs/promises";
 import type { AgentMail, AgentMailClient } from "agentmail";
 import { normalizeMimeType } from "openclaw/plugin-sdk/media-mime";
 import { saveMediaBuffer } from "openclaw/plugin-sdk/media-store";
@@ -58,6 +59,10 @@ export async function loadAgentMailInboundAttachments(params: {
       params.messageId,
       attachment.attachmentId,
     );
+    // Each fetch is bounded by the remaining aggregate budget. The earlier declared-size loop
+    // already enforced the per-file limit, so a max_bytes failure here is always aggregate
+    // exhaustion (actual bytes exceeding declared). This also makes a post-fetch aggregate guard
+    // unreachable, so it is intentionally omitted.
     const remaining = params.maxBytes - actualBytes;
     let loaded;
     try {
@@ -65,18 +70,13 @@ export async function loadAgentMailInboundAttachments(params: {
     } catch (error) {
       if (error instanceof MediaFetchError && error.code === "max_bytes") {
         throw new AgentMailMediaPolicyError(
-          "AgentMail attachment exceeds the configured media limit",
+          "AgentMail attachments exceed the configured aggregate media limit",
           { cause: error },
         );
       }
       throw error;
     }
     actualBytes += loaded.buffer.byteLength;
-    if (actualBytes > params.maxBytes) {
-      throw new AgentMailMediaPolicyError(
-        "AgentMail attachments exceed the configured aggregate media limit",
-      );
-    }
     downloaded.push({
       buffer: loaded.buffer,
       contentType:
@@ -86,9 +86,12 @@ export async function loadAgentMailInboundAttachments(params: {
     });
   }
 
-  const saved = await Promise.all(
-    downloaded.map(
-      async (attachment) =>
+  // Persist serially and roll back on failure. A partial Promise.all would orphan already-saved
+  // files while the durable retry re-downloads the whole set, leaking one copy per attempt.
+  const saved: Array<{ path: string; contentType?: string }> = [];
+  try {
+    for (const attachment of downloaded) {
+      saved.push(
         await saveMediaBuffer(
           attachment.buffer,
           attachment.contentType,
@@ -96,8 +99,12 @@ export async function loadAgentMailInboundAttachments(params: {
           params.maxBytes,
           attachment.filename,
         ),
-    ),
-  );
+      );
+    }
+  } catch (error) {
+    await Promise.allSettled(saved.map((item) => rm(item.path, { force: true })));
+    throw error;
+  }
   return {
     paths: saved.map((item) => item.path),
     types: saved.map((item) => item.contentType ?? "application/octet-stream"),
@@ -122,9 +129,9 @@ export async function loadAgentMailOutboundAttachments(params: {
     let loaded;
     try {
       loaded = await loadOutboundMediaFromUrl(mediaUrl, {
-        // Keep the per-file policy stable. Aggregate accounting happens after loading, so a later
-        // image is never recompressed more aggressively merely because earlier files were large.
-        maxBytes: params.maxBytes,
+        // Bound each fetch by the REMAINING aggregate budget so a multi-file reply cannot buffer up
+        // to the full per-file limit once per attachment and blow past the intended memory bound.
+        maxBytes: params.maxBytes - totalBytes,
         mediaAccess: params.mediaAccess,
         mediaLocalRoots: params.mediaLocalRoots,
         mediaReadFile: params.mediaReadFile,
@@ -140,10 +147,14 @@ export async function loadAgentMailOutboundAttachments(params: {
     }
     totalBytes += loaded.buffer.byteLength;
     if (totalBytes > params.maxBytes) {
+      // Defensive backstop: the per-fetch budget above already rejects oversize files, but a lenient
+      // loader that returns more than requested must still not push the reply past the aggregate.
       throw new AgentMailMediaPolicyError(
         "AgentMail outbound attachments exceed the configured aggregate media limit",
       );
     }
+    // Convert to base64 immediately and let the source buffer go out of scope; only the encoded
+    // representation is retained for the reply payload.
     attachments.push({
       filename: sanitizeUntrustedFileName(loaded.fileName ?? "", `attachment-${index + 1}`),
       contentType: normalizeMimeType(loaded.contentType) ?? "application/octet-stream",

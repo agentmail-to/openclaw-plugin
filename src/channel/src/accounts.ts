@@ -67,8 +67,12 @@ export function resolveAgentMailAccount(
     accounts: channel.accounts,
     accountId: id,
     // A top-level path belongs to the implicit default account. Named accounts get their own
-    // account-derived default unless they explicitly override webhookPath.
-    omitKeys: defaultAccount ? ["defaultAccount"] : ["defaultAccount", "webhookPath"],
+    // account-derived default unless they explicitly override webhookPath. They must also NOT
+    // inherit the top-level inboxId: two accounts resolving to the same mailbox would start
+    // separate consumers over separate durable journals, bypassing dedupe and double-replying.
+    omitKeys: defaultAccount
+      ? ["defaultAccount"]
+      : ["defaultAccount", "webhookPath", "inboxId"],
   });
   const fieldPath = (field: "apiKey" | "webhookSecret") =>
     defaultAccount ? `channels.agentmail.${field}` : `channels.agentmail.accounts.${id}.${field}`;

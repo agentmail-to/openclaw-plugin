@@ -34,7 +34,10 @@ export type AgentMailIngressRecord = {
   accountId: string;
   inboxId: string;
   messageId: string;
-  eventId?: string;
   transport: "webhook" | "websocket" | "rest";
+  // The email's own timestamp (provider-reported). Used for durable ordering/retention.
   receivedAt: number;
+  // Local ingestion time. The hydration retry window is measured from this so back-dated or
+  // delayed mail (whose receivedAt is old) is not discarded on its first REST-projection 404.
+  arrivedAt?: number;
 };

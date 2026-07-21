@@ -70,10 +70,25 @@ describe("AgentMail webhook", () => {
       expect.objectContaining({
         inboxId: "inbox_1",
         messageId: "message_1",
-        eventId: "event_1",
         transport: "webhook",
       }),
     );
+  });
+
+  it("acknowledges but ignores a signed event with empty identifiers", async () => {
+    const receive = vi.fn(async () => undefined);
+    const body = JSON.stringify({
+      type: "event",
+      event_type: "message.received",
+      message: { inbox_id: "inbox_1", message_id: "   " },
+    });
+    const res = response();
+    await createAgentMailWebhookHandler({ account: account(), receive })(
+      request(body, signed(body)),
+      res,
+    );
+    expect(res.statusCode).toBe(200);
+    expect(receive).not.toHaveBeenCalled();
   });
 
   it("rejects invalid signatures and wrong inboxes", async () => {

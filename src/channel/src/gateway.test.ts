@@ -1,5 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
-import { startAgentMailGatewayAccount } from "./gateway.js";
+import {
+  collectAgentMailSecurityWarnings,
+  startAgentMailGatewayAccount,
+} from "./gateway.js";
 import type { ResolvedAgentMailAccount } from "./types.js";
 
 const mocks = vi.hoisted(() => ({
@@ -159,5 +162,43 @@ describe("AgentMail gateway route ownership", () => {
     secondAbort.abort();
     thirdAbort.abort();
     await Promise.all([second, third]);
+  });
+});
+
+describe("AgentMail security warnings", () => {
+  const base = account("default", "/webhooks/agentmail");
+
+  it("warns that allowlist ignores a wildcard allowFrom", () => {
+    const warnings = collectAgentMailSecurityWarnings({
+      ...base,
+      dmPolicy: "allowlist",
+      allowFrom: ["*"],
+    });
+    expect(warnings.some((w) => w.includes('dmPolicy="allowlist" ignores allowFrom=["*"]'))).toBe(
+      true,
+    );
+  });
+
+  it("warns on an empty allowlist and an open policy without a wildcard", () => {
+    expect(
+      collectAgentMailSecurityWarnings({ ...base, dmPolicy: "allowlist", allowFrom: [] }).some((w) =>
+        w.includes("the default allowlist is empty"),
+      ),
+    ).toBe(true);
+    expect(
+      collectAgentMailSecurityWarnings({ ...base, dmPolicy: "open", allowFrom: [] }).some((w) =>
+        w.includes('dmPolicy="open" requires'),
+      ),
+    ).toBe(true);
+  });
+
+  it("emits no security warning for a populated allowlist", () => {
+    expect(
+      collectAgentMailSecurityWarnings({
+        ...base,
+        dmPolicy: "allowlist",
+        allowFrom: ["a@example.com"],
+      }),
+    ).toEqual([]);
   });
 });

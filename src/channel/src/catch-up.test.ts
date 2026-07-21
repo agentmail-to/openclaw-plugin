@@ -9,6 +9,7 @@ import {
   createAgentMailCatchUpSession,
   createAgentMailCatchUpSupervisor,
 } from "./catch-up.js";
+import { AgentMailIngressCapacityError } from "./durable-receive.js";
 import type { AgentMailIngressRecord, ResolvedAgentMailAccount } from "./types.js";
 
 const account: ResolvedAgentMailAccount = {
@@ -170,6 +171,65 @@ describe("AgentMail durable REST catch-up", () => {
     expect(receive).toHaveBeenLastCalledWith(
       expect.objectContaining({ messageId: "message_3", transport: "rest" }),
     );
+  });
+
+  it("lists from the monitoring baseline on a deep sweep", async () => {
+    const store = memoryStore<never>();
+    const list = vi.fn(async () => ({
+      count: 1,
+      messages: [message({ id: "message_1", timestamp: 5_000 })],
+    }));
+    const session = await createAgentMailCatchUpSession({
+      account,
+      client: { inboxes: { messages: { list } } } as never,
+      store: store as never,
+      now: () => 1_000,
+    });
+    const receive = vi.fn(async () => undefined);
+    // Establish the cursor; high-water advances to 5_000.
+    await session.run({ receive, abortSignal: new AbortController().signal });
+    // A normal established run would list from max(0, 5_000 - overlap) = 0; the deep sweep instead
+    // lists from the baseline (1_000) so back-dated mail below the overlap window is recovered.
+    await session.run({
+      receive,
+      abortSignal: new AbortController().signal,
+      sinceBaseline: true,
+    });
+    expect(list).toHaveBeenLastCalledWith(
+      "inbox_1",
+      expect.objectContaining({ after: new Date(1_000) }),
+      expect.any(Object),
+    );
+  });
+
+  it("pauses the pass when durable ingress reports capacity", async () => {
+    const store = memoryStore<never>();
+    const list = vi.fn(async () => ({
+      count: 2,
+      messages: [
+        message({ id: "message_1", timestamp: 1_100 }),
+        message({ id: "message_2", timestamp: 1_200 }),
+      ],
+      nextPageToken: "page_2",
+    }));
+    const session = await createAgentMailCatchUpSession({
+      account,
+      client: { inboxes: { messages: { list } } } as never,
+      store: store as never,
+      now: () => 1_000,
+    });
+    const receive = vi.fn(async (record: { messageId: string }) => {
+      if (record.messageId === "message_1") {
+        throw new AgentMailIngressCapacityError();
+      }
+    });
+    // The pass returns cleanly (no throw), so the supervisor does not enter a tight failure loop
+    // that would re-list the same pages. It stops before fetching page 2 or admitting message_2.
+    await expect(
+      session.run({ receive: receive as never, abortSignal: new AbortController().signal }),
+    ).resolves.toBeUndefined();
+    expect(list).toHaveBeenCalledTimes(1);
+    expect(receive).toHaveBeenCalledTimes(1);
   });
 
   it("does not establish the cursor past a failed durable admission", async () => {

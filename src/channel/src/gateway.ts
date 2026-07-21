@@ -21,17 +21,30 @@ type GatewayLog = {
   error?: (message: string) => void;
 };
 
+// Single source of truth for AgentMail sender-authorization warnings, shared by gateway startup
+// diagnostics and the channel security surface so the two never drift.
+export function collectAgentMailSecurityWarnings(account: ResolvedAgentMailAccount): string[] {
+  const warnings: string[] = [];
+  if (account.dmPolicy === "allowlist" && account.allowFrom.length === 0) {
+    warnings.push("- AgentMail: the default allowlist is empty, so every sender is denied.");
+  }
+  if (account.dmPolicy === "allowlist" && account.allowFrom.includes("*")) {
+    warnings.push(
+      '- AgentMail: dmPolicy="allowlist" ignores allowFrom=["*"] and still denies every sender; use dmPolicy="open" to allow all.',
+    );
+  }
+  if (account.dmPolicy === "open" && !account.allowFrom.includes("*")) {
+    warnings.push('- AgentMail: dmPolicy="open" requires allowFrom=["*"].');
+  }
+  return warnings;
+}
+
 export function collectAgentMailStartupWarnings(account: ResolvedAgentMailAccount): string[] {
   const warnings: string[] = [];
   if (!account.apiKey || !account.inboxId) {
     warnings.push("- AgentMail: apiKey and inboxId are required.");
   }
-  if (account.dmPolicy === "allowlist" && account.allowFrom.length === 0) {
-    warnings.push("- AgentMail: the default allowlist is empty, so every sender is denied.");
-  }
-  if (account.dmPolicy === "open" && !account.allowFrom.includes("*")) {
-    warnings.push('- AgentMail: dmPolicy="open" requires allowFrom=["*"].');
-  }
+  warnings.push(...collectAgentMailSecurityWarnings(account));
   return warnings;
 }
 

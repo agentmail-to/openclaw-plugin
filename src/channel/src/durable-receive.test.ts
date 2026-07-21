@@ -454,6 +454,12 @@ describe("AgentMail durable ingress", () => {
     await replayPendingAgentMailIngress({
       journal: {
         pending: async () => [{ id: "durable_1", payload: record, attempts: 2 }],
+        // Replay revalidates each row through accept(); a still-pending row re-admits as a duplicate.
+        accept: async () => ({
+          kind: "pending",
+          duplicate: true,
+          record: { id: "durable_1", payload: record, attempts: 2 },
+        }),
         complete,
         release: vi.fn(),
       } as never,
@@ -464,6 +470,24 @@ describe("AgentMail durable ingress", () => {
       record,
       expect.objectContaining({ onTurnAdopted: expect.any(Function) }),
     );
+  });
+
+  it("does not replay a row completed between the pending snapshot and revalidation", async () => {
+    const dispatch = vi.fn(async () => undefined);
+    const complete = vi.fn(async () => undefined);
+    await replayPendingAgentMailIngress({
+      journal: {
+        pending: async () => [{ id: "durable_1", payload: record, attempts: 1 }],
+        // Another worker completed the row after the snapshot; accept() reports it as settled.
+        accept: async () => ({ kind: "completed", duplicate: true, record: { id: "durable_1" } }),
+        complete,
+        release: vi.fn(),
+      } as never,
+      dispatch,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(complete).not.toHaveBeenCalled();
   });
 
   it("hands an in-flight record to a replacement journal without concurrent dispatch", async () => {
@@ -496,6 +520,11 @@ describe("AgentMail durable ingress", () => {
         pending: async () => [
           { id: createAgentMailDurableInboundId(record), payload: record, attempts: 0 },
         ],
+        accept: async () => ({
+          kind: "pending",
+          duplicate: true,
+          record: { id: createAgentMailDurableInboundId(record), payload: record, attempts: 0 },
+        }),
         complete: replacementComplete,
         release: vi.fn(),
       } as never,

@@ -46,14 +46,26 @@ export function withAgentMailIngressCapacity(
   journal: AgentMailJournal,
   maxPendingEntries: number,
 ): AgentMailJournal {
+  // Serialize check-and-enqueue. The published queue journal has no atomic admission cap, so two
+  // concurrent transports (live WebSocket + REST catch-up) could otherwise both observe free space
+  // and push past the bound. Chaining admissions makes the count-then-accept step atomic per
+  // journal; the chain never rejects so one failed admission cannot poison later ones.
+  let admissionChain: Promise<unknown> = Promise.resolve();
   return {
     ...journal,
-    accept: async (id, payload, options) => {
-      const pending = await journal.pending();
-      if (pending.length >= maxPendingEntries && !pending.some((entry) => entry.id === id)) {
-        throw new AgentMailIngressCapacityError();
-      }
-      return journal.accept(id, payload, options);
+    accept: (id, payload, options) => {
+      const admission = admissionChain.then(async () => {
+        const pending = await journal.pending();
+        if (pending.length >= maxPendingEntries && !pending.some((entry) => entry.id === id)) {
+          throw new AgentMailIngressCapacityError();
+        }
+        return journal.accept(id, payload, options);
+      });
+      admissionChain = admission.then(
+        () => undefined,
+        () => undefined,
+      );
+      return admission;
     },
   };
 }

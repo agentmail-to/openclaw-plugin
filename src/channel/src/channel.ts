@@ -9,7 +9,6 @@ import {
   type ChannelPlugin,
 } from "openclaw/plugin-sdk/channel-core";
 import { defineChannelMessageAdapter } from "openclaw/plugin-sdk/channel-outbound";
-import { createConditionalWarningCollector } from "openclaw/plugin-sdk/channel-policy";
 import { createEmptyChannelDirectoryAdapter } from "openclaw/plugin-sdk/directory-runtime";
 import {
   inspectAgentMailAccount,
@@ -19,7 +18,11 @@ import {
   resolveDefaultAgentMailAccountId,
 } from "./accounts.js";
 import { AgentMailChannelConfigSchema } from "./config-schema.js";
-import { collectAgentMailStartupWarnings, startAgentMailGatewayAccount } from "./gateway.js";
+import {
+  collectAgentMailSecurityWarnings,
+  collectAgentMailStartupWarnings,
+  startAgentMailGatewayAccount,
+} from "./gateway.js";
 import type { AgentMailChannelRuntime } from "./inbound.js";
 import { normalizeMailbox } from "./mailbox.js";
 import { collectRuntimeConfigAssignments, secretTargetRegistryEntries } from "./secret-contract.js";
@@ -61,16 +64,6 @@ const resolveDmPolicy = createScopedDmSecurityResolver<ResolvedAgentMailAccount>
   normalizeEntry: normalizeMailbox,
 });
 
-const collectSecurityWarnings = createConditionalWarningCollector<ResolvedAgentMailAccount>(
-  (account) =>
-    account.dmPolicy === "allowlist" && account.allowFrom.length === 0
-      ? "- AgentMail: empty allowFrom denies every sender."
-      : undefined,
-  (account) =>
-    account.dmPolicy === "open" && account.allowFrom.includes("*")
-      ? '- AgentMail: dmPolicy="open" allows every sender.'
-      : undefined,
-);
 
 const messageAdapter = defineChannelMessageAdapter({
   id: CHANNEL_ID,
@@ -203,7 +196,7 @@ export const agentMailPlugin: ChannelPlugin<ResolvedAgentMailAccount, AgentMailP
     },
     security: {
       resolveDmPolicy,
-      collectWarnings: ({ account }) => collectSecurityWarnings(account),
+      collectWarnings: ({ account }) => collectAgentMailSecurityWarnings(account),
     },
     outbound: {
       deliveryMode: "gateway",

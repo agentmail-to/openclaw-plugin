@@ -236,7 +236,8 @@
           },
           "mediaMaxMb": {
             "type": "number",
-            "exclusiveMinimum": 0
+            "exclusiveMinimum": 0,
+            "maximum": 100
           },
           "accounts": {
             "type": "object",
@@ -438,7 +439,8 @@
                 },
                 "mediaMaxMb": {
                   "type": "number",
-                  "exclusiveMinimum": 0
+                  "exclusiveMinimum": 0,
+                  "maximum": 100
                 }
               },
               "additionalProperties": false
