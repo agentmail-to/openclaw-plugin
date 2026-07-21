@@ -1,0 +1,45 @@
+{
+  "id": "agentmail",
+  "name": "AgentMail",
+  "description": "Create AgentMail inboxes and send, receive, search, and manage email.",
+  "version": "0.1.0",
+  "configSchema": {
+    "type": "object",
+    "properties": {
+      "baseUrl": {
+        "type": "string",
+        "description": "Optional AgentMail API base URL override.",
+        "format": "uri"
+      },
+      "timeoutSeconds": {
+        "type": "integer",
+        "description": "Maximum time to wait for an AgentMail API request.",
+        "minimum": 1,
+        "maximum": 300
+      },
+      "maxRetries": {
+        "type": "integer",
+        "description": "Number of times the AgentMail SDK retries a request.",
+        "minimum": 0,
+        "maximum": 10
+      }
+    },
+    "additionalProperties": false
+  },
+  "activation": {
+    "onStartup": true
+  },
+  "contracts": {
+    "tools": [
+      "agentmail_list_inboxes",
+      "agentmail_create_inbox",
+      "agentmail_list_messages",
+      "agentmail_search_messages",
+      "agentmail_get_message",
+      "agentmail_send_message",
+      "agentmail_reply_to_message",
+      "agentmail_forward_message",
+      "agentmail_update_message_labels"
+    ]
+  }
+}
