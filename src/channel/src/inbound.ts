@@ -10,6 +10,19 @@ import type { AgentMailIngressRecord, ResolvedAgentMailAccount } from "./types.j
 const CHANNEL_ID = "agentmail";
 export const HYDRATION_NOT_FOUND_RETRY_WINDOW_MS = 5 * 60_000;
 
+/**
+ * Thrown when a hydrated message has not yet gained its `received` label. Carries a marker the
+ * ingress retry loop recognizes so the retry stays inside the bounded hydration window (like a 404),
+ * instead of settling the durable row and dropping the message on a label-projection race.
+ */
+export class AgentMailLabelPendingError extends Error {
+  readonly hydrationPending = true;
+  constructor(messageId: string) {
+    super(`AgentMail message ${messageId} has no received label yet`);
+    this.name = "AgentMailLabelPendingError";
+  }
+}
+
 type AgentMailLog = {
   info?: (message: string) => void;
   warn?: (message: string) => void;
@@ -19,6 +32,15 @@ export type AgentMailChannelRuntime = Pick<
   PluginRuntime["channel"],
   "inbound" | "reply" | "routing" | "session"
 >;
+
+/**
+ * The per-thread conversation id used to key an agent session. Inbound turns and the outbound
+ * message-tool session route MUST derive it identically so a reply resolves the same session the
+ * inbound turn runs in.
+ */
+export function buildAgentMailConversationId(inboxId: string, threadId: string): string {
+  return `${inboxId}:thread:${threadId}`;
+}
 
 export function resolveAgentMailMessageText(message: AgentMail.Message): string {
   // AgentMail strips quoted reply/forward history in the extracted fields. Prefer those fields
@@ -103,13 +125,28 @@ export async function dispatchAgentMailInboundEvent(params: {
   if (
     message.inboxId !== params.account.inboxId ||
     message.messageId !== params.record.messageId ||
-    !hasReceivedLabel(message) ||
     hasRejectedLabel(message)
   ) {
+    // Terminal: a wrong inbox/message or an explicitly rejected (spam/blocked/unauthenticated)
+    // message will never become deliverable, so settle the durable row.
     params.log?.warn?.(
       `AgentMail rejected mismatched or unsafe hydrated message ${params.record.messageId}`,
     );
     return;
+  }
+  if (!hasReceivedLabel(message)) {
+    // The "received" label can lag the message's REST projection. Treat its absence as retryable
+    // within the bounded hydration window rather than completing the row and silently dropping mail
+    // on a timing race; settle only once the window elapses.
+    const arrivedAt = params.record.arrivedAt ?? params.record.receivedAt;
+    const ageMs = Math.max(0, (params.now?.() ?? Date.now()) - arrivedAt);
+    if (ageMs >= HYDRATION_NOT_FOUND_RETRY_WINDOW_MS) {
+      params.log?.warn?.(
+        `AgentMail settled message ${message.messageId} without a received label after the hydration retry window`,
+      );
+      return;
+    }
+    throw new AgentMailLabelPendingError(params.record.messageId);
   }
   const sender = parseSingleFromMailbox(message.from);
   if (!sender) {
@@ -161,7 +198,7 @@ export async function dispatchAgentMailInboundEvent(params: {
     params.log?.warn?.(`AgentMail ignored empty message ${message.messageId}`);
     return;
   }
-  const conversationId = `${params.account.inboxId}:thread:${message.threadId}`;
+  const conversationId = buildAgentMailConversationId(params.account.inboxId, message.threadId);
   const route = params.channelRuntime.routing.resolveAgentRoute({
     cfg: params.cfg,
     channel: CHANNEL_ID,

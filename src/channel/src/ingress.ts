@@ -1,8 +1,7 @@
-import { computeBackoff } from "openclaw/plugin-sdk/runtime-env";
 import type { createAgentMailDurableInboundReceiveJournal } from "./durable-receive.js";
 import { AgentMailIngressCapacityError, createAgentMailDurableInboundId } from "./durable-receive.js";
 import { HYDRATION_NOT_FOUND_RETRY_WINDOW_MS } from "./inbound.js";
-import { waitForRetry } from "./retry.js";
+import { createBackoff, waitForRetry } from "./retry.js";
 import type { AgentMailIngressRecord } from "./types.js";
 
 // Re-exported for transports (websocket) that catch capacity backpressure by class.
@@ -19,12 +18,22 @@ type DispatchParams = {
   retryDelay?: (attempt: number) => number;
   initialAttempts: number;
   dispatchCompleted?: boolean;
+  log?: AgentMailIngressLog;
 };
 
 export type AgentMailIngressDispatch = (
   record: AgentMailIngressRecord,
   lifecycle: { onTurnAdopted: () => Promise<void> },
 ) => Promise<void>;
+
+type AgentMailIngressLog = { warn?: (message: string) => void; error?: (message: string) => void };
+
+// Ceiling on pre-adoption dispatch attempts for a single message. A deterministically failing
+// (poison) message would otherwise retry until its ~30-day TTL, and ~450 such rows would fill the
+// pending queue and reject all new mail. On exhaustion the row is dropped (completed) so it stops
+// occupying an admission slot. The journal exposes no distinct `fail` op, so completion is the
+// terminal marker. Comfortably above the legitimate transient-retry budget the tests exercise.
+const AGENTMAIL_MAX_DISPATCH_ATTEMPTS = 50;
 
 type ActiveDispatch = {
   task: Promise<boolean>;
@@ -35,22 +44,23 @@ type ActiveDispatch = {
 // restarts that open separate journal facades over the same shared queue.
 const activeDispatches = new Map<string, ActiveDispatch>();
 
-function retryDelayMs(attempt: number): number {
-  return computeBackoff({ initialMs: 1_000, maxMs: 30 * 60_000, factor: 2, jitter: 0.2 }, attempt);
-}
+const retryDelayMs = createBackoff(30 * 60_000);
 
-function isHydrationNotFound(error: unknown): boolean {
+// True when a dispatch failure is a provider-projection race: either a 404 (message not yet
+// REST-visible) or a not-yet-projected `received` label. Both resolve on their own within seconds.
+function isHydrationRetryable(error: unknown): boolean {
+  if (typeof error !== "object" || error === null) {
+    return false;
+  }
   return (
-    typeof error === "object" &&
-    error !== null &&
-    (error as { statusCode?: unknown }).statusCode === 404
+    (error as { statusCode?: unknown }).statusCode === 404 ||
+    (error as { hydrationPending?: unknown }).hydrationPending === true
   );
 }
 
-// A 404 dispatch failure means the provider's REST projection has not yet caught up with the
-// receive event. Keep those retries inside the bounded hydration window (measured from local
-// arrival) so exponential backoff never schedules the next attempt past the deadline and silently
-// drops recoverable mail. Non-404 failures keep the full backoff for genuine outages.
+// A projection-race dispatch failure keeps its retries inside the bounded hydration window (measured
+// from local arrival) so exponential backoff never schedules the next attempt past the deadline and
+// silently drops recoverable mail. Other failures keep the full backoff for genuine outages.
 function nextDispatchDelayMs(params: {
   error: unknown;
   record: AgentMailIngressRecord;
@@ -59,7 +69,7 @@ function nextDispatchDelayMs(params: {
   now?: () => number;
 }): number {
   const base = params.retryDelay(params.attempts);
-  if (!isHydrationNotFound(params.error)) {
+  if (!isHydrationRetryable(params.error)) {
     return base;
   }
   const deadline =
@@ -77,6 +87,7 @@ export async function processAgentMailIngress(params: {
   dispatch: AgentMailIngressDispatch;
   abortSignal?: AbortSignal;
   retryDelayMs?: (attempt: number) => number;
+  log?: AgentMailIngressLog;
 }): Promise<"accepted" | "duplicate"> {
   const id = createAgentMailDurableInboundId(params.record);
   // accept() throws AgentMailIngressCapacityError directly when durable ingress is full, so
@@ -102,6 +113,7 @@ export async function processAgentMailIngress(params: {
     abortSignal: params.abortSignal,
     retryDelay: params.retryDelayMs,
     initialAttempts: accepted.kind === "pending" ? accepted.record.attempts : 0,
+    log: params.log,
   });
   return "accepted";
 }
@@ -160,6 +172,20 @@ async function dispatchAgentMailIngressUntilSettled(params: DispatchParams): Pro
           return true;
         }
         attempts += 1;
+        if (attempts >= AGENTMAIL_MAX_DISPATCH_ATTEMPTS) {
+          // Poison message: it has failed deterministically past the retry ceiling. Drop it
+          // (complete removes it from the pending set) so it stops occupying an admission slot and
+          // blocking new mail. Surface it so an operator can investigate the underlying failure.
+          params.log?.error?.(
+            `AgentMail dropping message ${params.record.messageId} after ${attempts} failed dispatch attempts: ${errorText(error)}`,
+          );
+          try {
+            await params.journal.complete(params.id);
+          } catch {
+            // Best effort: TTL pruning still reclaims the row if the terminal marker cannot persist.
+          }
+          return true;
+        }
         const lastError = errorText(error);
         while (!params.abortSignal?.aborted) {
           try {
@@ -223,6 +249,7 @@ export async function replayPendingAgentMailIngress(params: {
   dispatch: AgentMailIngressDispatch;
   abortSignal?: AbortSignal;
   retryDelayMs?: (attempt: number) => number;
+  log?: AgentMailIngressLog;
 }): Promise<void> {
   for (const pending of await params.journal.pending()) {
     if (params.abortSignal?.aborted) {
@@ -255,6 +282,7 @@ export async function replayPendingAgentMailIngress(params: {
       abortSignal: params.abortSignal,
       retryDelay: params.retryDelayMs,
       initialAttempts: accepted.kind === "pending" ? accepted.record.attempts : pending.attempts,
+      log: params.log,
     });
   }
 }

@@ -3,9 +3,10 @@ import { Readable } from "node:stream";
 import { Webhook } from "svix";
 import { describe, expect, it, vi } from "vitest";
 import type { ResolvedAgentMailAccount } from "./types.js";
-import { createAgentMailWebhookHandler } from "./webhook.js";
+import { createAgentMailWebhookHandler, createAgentMailWebhookVerifier } from "./webhook.js";
 
 const hookVal = ["wh", "sec_", Buffer.alloc(32, 7).toString("base64")].join("");
+const verifier = new Webhook(hookVal);
 
 function account(): ResolvedAgentMailAccount {
   return {
@@ -61,7 +62,7 @@ describe("AgentMail webhook", () => {
       message: { inbox_id: "inbox_1", message_id: "message_1" },
     });
     const res = response();
-    await createAgentMailWebhookHandler({ account: account(), receive })(
+    await createAgentMailWebhookHandler({ account: account(), verifier, receive })(
       request(body, signed(body)),
       res,
     );
@@ -83,7 +84,7 @@ describe("AgentMail webhook", () => {
       message: { inbox_id: "inbox_1", message_id: "   " },
     });
     const res = response();
-    await createAgentMailWebhookHandler({ account: account(), receive })(
+    await createAgentMailWebhookHandler({ account: account(), verifier, receive })(
       request(body, signed(body)),
       res,
     );
@@ -94,7 +95,7 @@ describe("AgentMail webhook", () => {
   it("rejects invalid signatures and wrong inboxes", async () => {
     const receive = vi.fn(async () => undefined);
     const badRes = response();
-    await createAgentMailWebhookHandler({ account: account(), receive })(
+    await createAgentMailWebhookHandler({ account: account(), verifier, receive })(
       request("{}", {
         "svix-id": "bad",
         "svix-timestamp": "0",
@@ -110,7 +111,7 @@ describe("AgentMail webhook", () => {
       message: { inbox_id: "inbox_other", message_id: "message_1" },
     });
     const wrongRes = response();
-    await createAgentMailWebhookHandler({ account: account(), receive })(
+    await createAgentMailWebhookHandler({ account: account(), verifier, receive })(
       request(body, signed(body)),
       wrongRes,
     );
@@ -123,7 +124,7 @@ describe("AgentMail webhook", () => {
     const methodReq = request("", {});
     methodReq.method = "GET";
     const methodRes = response();
-    await createAgentMailWebhookHandler({ account: account(), receive })(methodReq, methodRes);
+    await createAgentMailWebhookHandler({ account: account(), verifier, receive })(methodReq, methodRes);
     expect(methodRes.statusCode).toBe(405);
     expect(methodRes.setHeaderMock).toHaveBeenCalledWith("allow", "POST");
 
@@ -133,7 +134,7 @@ describe("AgentMail webhook", () => {
       message: { inbox_id: "inbox_1", message_id: "message_1" },
     });
     const unsupportedRes = response();
-    await createAgentMailWebhookHandler({ account: account(), receive })(
+    await createAgentMailWebhookHandler({ account: account(), verifier, receive })(
       request(body, signed(body)),
       unsupportedRes,
     );
@@ -145,7 +146,7 @@ describe("AgentMail webhook", () => {
     const body = JSON.stringify({ type: "event", event_type: "message.received" });
     const res = response();
     const receive = vi.fn();
-    await createAgentMailWebhookHandler({ account: account(), receive })(
+    await createAgentMailWebhookHandler({ account: account(), verifier, receive })(
       request(body, signed(body)),
       res,
     );
@@ -162,6 +163,7 @@ describe("AgentMail webhook", () => {
     const res = response();
     await createAgentMailWebhookHandler({
       account: account(),
+      verifier,
       receive: async () => {
         throw new Error("queue unavailable");
       },
@@ -173,7 +175,15 @@ describe("AgentMail webhook", () => {
     const req = request("", {});
     req.headers["content-length"] = String(1024 * 1024 + 1);
     const res = response();
-    await createAgentMailWebhookHandler({ account: account(), receive: vi.fn() })(req, res);
+    await createAgentMailWebhookHandler({ account: account(), verifier, receive: vi.fn() })(
+      req,
+      res,
+    );
     expect(res.statusCode).toBe(413);
+  });
+
+  it("returns a verifier for a valid secret and null for a malformed one", () => {
+    expect(createAgentMailWebhookVerifier(hookVal)).not.toBeNull();
+    expect(createAgentMailWebhookVerifier("not-a-valid-svix-secret")).toBeNull();
   });
 });

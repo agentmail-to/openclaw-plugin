@@ -1,5 +1,9 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { listAgentMailAccountIds, resolveAgentMailAccount } from "./accounts.js";
+import {
+  findConflictingAgentMailInboxOwner,
+  listAgentMailAccountIds,
+  resolveAgentMailAccount,
+} from "./accounts.js";
 import { AgentMailChannelConfigSchema } from "./config-schema.js";
 import type { AgentMailChannelConfig } from "./types.js";
 
@@ -92,6 +96,31 @@ describe("AgentMail account config", () => {
     expect(resolveAgentMailAccount(cfg, "billing").inboxId).toBe("inbox_billing");
     // The implicit default account still owns the top-level inboxId.
     expect(resolveAgentMailAccount(cfg, "default").inboxId).toBe("inbox_default");
+  });
+
+  it("detects a conflicting inbox owner so only the earliest account consumes it", () => {
+    const cfg = {
+      channels: {
+        agentmail: {
+          apiKey: sharedVal,
+          accounts: {
+            alpha: { inboxId: "shared@agentmail.to" },
+            beta: { inboxId: "shared@agentmail.to" },
+            gamma: { inboxId: "unique@agentmail.to" },
+          },
+        },
+      },
+    };
+    // beta shares alpha's inbox; alpha sorts earlier, so beta defers and alpha owns it.
+    expect(findConflictingAgentMailInboxOwner(cfg, resolveAgentMailAccount(cfg, "beta"))).toBe(
+      "alpha",
+    );
+    expect(
+      findConflictingAgentMailInboxOwner(cfg, resolveAgentMailAccount(cfg, "alpha")),
+    ).toBeNull();
+    expect(
+      findConflictingAgentMailInboxOwner(cfg, resolveAgentMailAccount(cfg, "gamma")),
+    ).toBeNull();
   });
 
   it("rejects an impractically large mediaMaxMb", () => {

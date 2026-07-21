@@ -23,7 +23,7 @@ import {
   collectAgentMailStartupWarnings,
   startAgentMailGatewayAccount,
 } from "./gateway.js";
-import type { AgentMailChannelRuntime } from "./inbound.js";
+import { buildAgentMailConversationId, type AgentMailChannelRuntime } from "./inbound.js";
 import { normalizeMailbox } from "./mailbox.js";
 import { collectRuntimeConfigAssignments, secretTargetRegistryEntries } from "./secret-contract.js";
 import {
@@ -134,16 +134,29 @@ export const agentMailPlugin: ChannelPlugin<ResolvedAgentMailAccount, AgentMailP
           if (!target) {
             return null;
           }
+          // Key the outbound session by inbox + thread with the same shape the inbound turn uses
+          // (see buildAgentMailConversationId in inbound.ts), so a message-tool reply resolves the
+          // SAME session the inbound turn runs in instead of a divergent per-message session. Core
+          // provides the active turn's threadId here; fall back to the message target only when no
+          // thread is known (e.g. a would-be proactive send, which the reply adapter then rejects).
+          const inboxId = resolveAgentMailAccount(params.cfg, params.accountId).inboxId;
+          const threadId =
+            params.threadId === undefined || params.threadId === null || params.threadId === ""
+              ? undefined
+              : String(params.threadId);
+          const conversationId =
+            inboxId && threadId ? buildAgentMailConversationId(inboxId, threadId) : target;
           return buildChannelOutboundSessionRoute({
             cfg: params.cfg,
             agentId: params.agentId,
             channel: CHANNEL_ID,
             accountId: params.accountId,
             recipientSessionExact: true,
-            peer: { kind: "direct", id: target },
+            peer: { kind: "direct", id: conversationId },
             chatType: "direct",
-            from: `agentmail:${target}`,
+            from: `agentmail:${conversationId}`,
             to: target,
+            ...(threadId ? { threadId } : {}),
           });
         },
         targetResolver: {

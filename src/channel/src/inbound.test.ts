@@ -1,6 +1,10 @@
 import { AgentMailError, type AgentMail } from "agentmail";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { dispatchAgentMailInboundEvent, resolveAgentMailMessageText } from "./inbound.js";
+import {
+  AgentMailLabelPendingError,
+  dispatchAgentMailInboundEvent,
+  resolveAgentMailMessageText,
+} from "./inbound.js";
 import { AgentMailMediaPolicyError } from "./media.js";
 import type { AgentMailIngressRecord, ResolvedAgentMailAccount } from "./types.js";
 
@@ -288,6 +292,41 @@ describe("AgentMail REST-authoritative inbound", () => {
         inboxes: { messages: { get: vi.fn(async () => message({ labels: ["sent"] })) } },
       } as never,
     });
+    expect(run).not.toHaveBeenCalled();
+  });
+
+  it("retries a not-yet-projected received label within the window, then settles after it", async () => {
+    const run = vi.fn();
+    const client = {
+      inboxes: { messages: { get: vi.fn(async () => message({ labels: ["sent"] })) } },
+    } as never;
+    // Within the window: retryable (throws) so the durable layer retries instead of dropping.
+    await expect(
+      dispatchAgentMailInboundEvent({
+        cfg: {},
+        account,
+        record: { ...record, receivedAt: 1_000, arrivedAt: 1_000 },
+        channelRuntime: { inbound: { run } } as never,
+        client,
+        now: () => 1_000 + 60_000,
+      }),
+    ).rejects.toBeInstanceOf(AgentMailLabelPendingError);
+    expect(run).not.toHaveBeenCalled();
+
+    // Past the window: settle (drop) with an explanatory warning.
+    const warn = vi.fn();
+    await expect(
+      dispatchAgentMailInboundEvent({
+        cfg: {},
+        account,
+        record: { ...record, receivedAt: 1_000, arrivedAt: 1_000 },
+        channelRuntime: { inbound: { run } } as never,
+        client,
+        log: { warn },
+        now: () => 1_000 + 10 * 60_000,
+      }),
+    ).resolves.toBeUndefined();
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("without a received label"));
     expect(run).not.toHaveBeenCalled();
   });
 

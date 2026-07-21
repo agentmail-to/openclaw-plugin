@@ -24,7 +24,7 @@
     "build": "tsc -p tsconfig.json",
     "plugin:build": "npm run build && node scripts/build-manifest.mjs",
     "plugin:check": "node scripts/build-manifest.mjs --check",
-    "plugin:validate": "npm run build && node scripts/build-manifest.mjs --check",
+    "plugin:validate": "npm run build && node scripts/build-manifest.mjs --check && node scripts/validate-plugin.mjs",
     "prepack": "npm run plugin:build",
     "test": "vitest run --config ./vitest.config.ts"
   },

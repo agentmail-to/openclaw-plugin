@@ -1,4 +1,3 @@
-import { createHash } from "node:crypto";
 import type { AgentMailClient } from "agentmail";
 import type {
   ChannelMessageSendPayloadContext,
@@ -9,14 +8,22 @@ import type {
 import { LocalMediaAccessError } from "openclaw/plugin-sdk/web-media";
 import { resolveAgentMailAccount } from "./accounts.js";
 import { createAgentMailClient } from "./client.js";
+import { sha256Hex } from "./digest.js";
 import { isAgentMailSenderAllowed, parseSingleFromMailbox } from "./mailbox.js";
 import { AgentMailMediaPolicyError, loadAgentMailOutboundAttachments } from "./media.js";
 
-// Recovery failures that re-running the same payload cannot repair. During unknown-send
-// reconciliation these must produce a structured verdict rather than escaping the reconciler,
-// while transient failures (network, provider 5xx) still throw so the queue keeps retrying.
-function isDeterministicRecoveryFailure(error: unknown): boolean {
-  if (error instanceof AgentMailMediaPolicyError || error instanceof LocalMediaAccessError) {
+// A media-size policy violation is genuinely terminal: the same payload will always exceed the
+// limit, so retrying the reply is pointless.
+function isTerminalMediaPolicyFailure(error: unknown): error is AgentMailMediaPolicyError {
+  return error instanceof AgentMailMediaPolicyError;
+}
+
+// Host-local attachment access failures during reconciliation are NOT terminal. The unknown-send
+// recovery context drops the mediaAccess/mediaLocalRoots/mediaReadFile handles, so a file:// URL
+// that the original (fully-provisioned) send could read now raises a local-access error. The normal
+// queue retry retains those handles, so these must be reported retryable rather than dropped.
+function isHostLocalMediaFailure(error: unknown): boolean {
+  if (error instanceof LocalMediaAccessError) {
     return true;
   }
   const code = (error as { code?: unknown } | null)?.code;
@@ -60,7 +67,7 @@ export function parseAgentMailMessageTarget(value: string): string {
 }
 
 function idempotencyKey(queueId: string): string {
-  const hash = createHash("sha256").update(`agentmail-reply\n${queueId}`).digest("hex");
+  const hash = sha256Hex(`agentmail-reply\n${queueId}`);
   return `openclaw-agentmail-${hash}`;
 }
 
@@ -260,11 +267,14 @@ export async function reconcileAgentMailUnknownSend(
       options,
     );
   } catch (error) {
-    if (isDeterministicRecoveryFailure(error)) {
+    if (isTerminalMediaPolicyFailure(error)) {
+      return { status: "unresolved", error: error.message, retryable: false };
+    }
+    if (isHostLocalMediaFailure(error)) {
       return {
         status: "unresolved",
         error: error instanceof Error ? error.message : String(error),
-        retryable: false,
+        retryable: true,
       };
     }
     throw error;

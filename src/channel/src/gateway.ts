@@ -1,13 +1,19 @@
 import { waitUntilAbort } from "openclaw/plugin-sdk/channel-outbound";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import { registerPluginHttpRoute } from "openclaw/plugin-sdk/webhook-ingress";
-import { createAgentMailCatchUpSession, createAgentMailCatchUpSupervisor } from "./catch-up.js";
+import { findConflictingAgentMailInboxOwner } from "./accounts.js";
+import {
+  createAgentMailCatchUpSession,
+  createAgentMailCatchUpSupervisor,
+  startAgentMailPeriodicCatchUp,
+} from "./catch-up.js";
 import { createAgentMailClient } from "./client.js";
+import { waitForRetry } from "./retry.js";
 import { createAgentMailDurableInboundReceiveJournal } from "./durable-receive.js";
 import { dispatchAgentMailInboundEvent, type AgentMailChannelRuntime } from "./inbound.js";
 import { processAgentMailIngress, replayPendingAgentMailIngress } from "./ingress.js";
 import type { AgentMailIngressRecord, ResolvedAgentMailAccount } from "./types.js";
-import { createAgentMailWebhookHandler } from "./webhook.js";
+import { createAgentMailWebhookHandler, createAgentMailWebhookVerifier } from "./webhook.js";
 import { startAgentMailWebSocket } from "./websocket.js";
 
 type ActiveRoute = { path: string; unregister: () => void };
@@ -65,6 +71,15 @@ export async function startAgentMailGatewayAccount(params: {
   if (!params.account.apiKey || !params.account.inboxId) {
     return await waitUntilAbort(params.abortSignal);
   }
+  const inboxOwner = findConflictingAgentMailInboxOwner(params.cfg, params.account);
+  if (inboxOwner) {
+    // Another account already owns this inbox. Do not start a second consumer over a separate
+    // durable journal — both would process and reply to the same message. Idle until reconfigured.
+    params.log?.warn?.(
+      `- AgentMail: account ${params.account.accountId} shares inbox ${params.account.inboxId} with account ${inboxOwner}; not starting a duplicate consumer.`,
+    );
+    return await waitUntilAbort(params.abortSignal);
+  }
   const client = createAgentMailClient(params.account);
 
   const journal = createAgentMailDurableInboundReceiveJournal({
@@ -90,21 +105,39 @@ export async function startAgentMailGatewayAccount(params: {
       record,
       dispatch,
       abortSignal: params.abortSignal,
+      log: params.log,
     });
   };
-  await replayPendingAgentMailIngress({ journal, dispatch, abortSignal: params.abortSignal });
+  await replayPendingAgentMailIngress({
+    journal,
+    dispatch,
+    abortSignal: params.abortSignal,
+    log: params.log,
+  });
 
-  if (!params.account.webhookSecret) {
-    params.log?.info?.(
-      `Starting AgentMail WebSocket ingress for account ${params.account.accountId}`,
-    );
-    return await startAgentMailWebSocket({
+  const startWebSocket = () =>
+    startAgentMailWebSocket({
       account: params.account,
       abortSignal: params.abortSignal,
       receive,
       log: params.log,
       client,
     });
+
+  if (!params.account.webhookSecret) {
+    params.log?.info?.(
+      `Starting AgentMail WebSocket ingress for account ${params.account.accountId}`,
+    );
+    return await startWebSocket();
+  }
+
+  const verifier = createAgentMailWebhookVerifier(params.account.webhookSecret);
+  if (!verifier) {
+    // A malformed secret would otherwise throw from new Webhook() and abort startup with no ingress.
+    params.log?.warn?.(
+      `- AgentMail: webhook secret for account ${params.account.accountId} is invalid; falling back to WebSocket ingress.`,
+    );
+    return await startWebSocket();
   }
 
   const path = params.account.webhookPath.startsWith("/")
@@ -151,6 +184,7 @@ export async function startAgentMailGatewayAccount(params: {
     accountId: params.account.accountId,
     handler: createAgentMailWebhookHandler({
       account: params.account,
+      verifier,
       receive: receiveWithRecovery,
       log: params.log,
     }),
@@ -162,6 +196,13 @@ export async function startAgentMailGatewayAccount(params: {
     `Registered AgentMail webhook route ${path} for account ${params.account.accountId}`,
   );
   catchUpSupervisor.request();
+  // Run periodic REST recovery in webhook mode too. Otherwise, once a capacity pause clears the
+  // request, mail admitted after the pause would wait for the next provider webhook (or forever, if
+  // provider retries have expired) before catch-up runs again.
+  const periodicWorkers = startAgentMailPeriodicCatchUp({
+    supervisor: catchUpSupervisor,
+    abortSignal: params.abortSignal,
+  });
   await waitUntilAbort(params.abortSignal, () => {
     // A replaced account invocation can abort later; it must not delete the newer registration.
     if (activeRoutes.get(params.account.accountId) === activeRoute) {
@@ -172,5 +213,5 @@ export async function startAgentMailGatewayAccount(params: {
       }
     }
   });
-  await catchUpSupervisor.settle();
+  await Promise.allSettled([...periodicWorkers, catchUpSupervisor.settle()]);
 }

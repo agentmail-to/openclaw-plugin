@@ -47,8 +47,10 @@ vi.mock("./catch-up.js", () => ({
   createAgentMailCatchUpSession: vi.fn(async () => ({ run: mocks.catchUpRun })),
   createAgentMailCatchUpSupervisor: vi.fn(() => ({
     request: mocks.catchUpRequest,
+    requestDeep: mocks.catchUpRequest,
     settle: mocks.catchUpSettle,
   })),
+  startAgentMailPeriodicCatchUp: vi.fn(() => []),
 }));
 
 vi.mock("./ingress.js", () => ({
@@ -57,6 +59,7 @@ vi.mock("./ingress.js", () => ({
 }));
 
 vi.mock("./webhook.js", () => ({
+  createAgentMailWebhookVerifier: (secret: string) => (secret === "invalid" ? null : {}),
   createAgentMailWebhookHandler: ({ receive }: { receive: (record: unknown) => Promise<void> }) => {
     mocks.webhookReceives.push(receive);
     return vi.fn();
@@ -93,6 +96,53 @@ describe("AgentMail gateway route ownership", () => {
       abortSignal: new AbortController().signal,
     });
     expect(mocks.startWebSocket).toHaveBeenCalledOnce();
+    expect(mocks.routes).toHaveLength(0);
+  });
+
+  it("falls back to WebSocket when the webhook secret is malformed", async () => {
+    mocks.routes.length = 0;
+    mocks.startWebSocket.mockClear();
+    const invalidSecret = { ...account("default", "/webhooks/agentmail"), webhookSecret: "invalid" };
+    await startAgentMailGatewayAccount({
+      cfg: {},
+      account: invalidSecret,
+      channelRuntime: {} as never,
+      abortSignal: new AbortController().signal,
+    });
+    expect(mocks.startWebSocket).toHaveBeenCalledOnce();
+    expect(mocks.routes).toHaveLength(0);
+  });
+
+  it("does not start a duplicate consumer for an inbox owned by an earlier account", async () => {
+    mocks.routes.length = 0;
+    mocks.startWebSocket.mockClear();
+    const cfg = {
+      channels: {
+        agentmail: {
+          apiKey: "key",
+          accounts: {
+            alpha: { inboxId: "shared@agentmail.to" },
+            beta: { inboxId: "shared@agentmail.to" },
+          },
+        },
+      },
+    };
+    const beta = {
+      ...account("beta", "/webhooks/agentmail/beta"),
+      inboxId: "shared@agentmail.to",
+      webhookSecret: "",
+    };
+    const controller = new AbortController();
+    const running = startAgentMailGatewayAccount({
+      cfg: cfg as never,
+      account: beta,
+      channelRuntime: {} as never,
+      abortSignal: controller.signal,
+    });
+    await Promise.resolve();
+    controller.abort();
+    await running;
+    expect(mocks.startWebSocket).not.toHaveBeenCalled();
     expect(mocks.routes).toHaveLength(0);
   });
 

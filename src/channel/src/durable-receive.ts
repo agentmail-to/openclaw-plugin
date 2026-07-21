@@ -1,5 +1,5 @@
-import { createHash } from "node:crypto";
 import { createDurableInboundReceiveJournalFromQueue } from "openclaw/plugin-sdk/channel-outbound";
+import { sha256Hex } from "./digest.js";
 import { getAgentMailRuntime } from "./runtime.js";
 import type { AgentMailIngressRecord } from "./types.js";
 
@@ -19,16 +19,12 @@ export class AgentMailIngressCapacityError extends Error {
   }
 }
 
-function digest(value: string): string {
-  return createHash("sha256").update(value).digest("hex");
-}
-
 export function createAgentMailDurableInboundId(params: {
   accountId: string;
   inboxId: string;
   messageId: string;
 }): string {
-  return digest(`${params.accountId}\n${params.inboxId}\n${params.messageId}`);
+  return sha256Hex(`${params.accountId}\n${params.inboxId}\n${params.messageId}`);
 }
 
 // Derive the journal type from the factory rather than a named SDK export (which is internal in
@@ -77,7 +73,7 @@ export function createAgentMailDurableInboundReceiveJournal(params: {
   const runtime = getAgentMailRuntime();
   const queue = runtime.state.openChannelIngressQueue<AgentMailIngressRecord, undefined, undefined>(
     {
-      accountId: digest(`${params.accountId}\n${params.inboxId}`).slice(0, 24),
+      accountId: sha256Hex(`${params.accountId}\n${params.inboxId}`).slice(0, 24),
       stateDir: runtime.state.resolveStateDir(),
     },
   );

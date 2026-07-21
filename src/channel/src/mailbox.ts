@@ -134,6 +134,20 @@ export function parseSingleFromMailbox(value: string): { address: string; name?:
   return name ? { address, name } : null;
 }
 
+// The resolved account reuses one stable allowFrom array for the life of an ingress worker, so the
+// normalized Set is built once per account (keyed on that array) instead of once per message on the
+// authorization hot path.
+const normalizedAllowFromCache = new WeakMap<readonly string[], Set<string>>();
+
+function normalizedAllowFromSet(allowFrom: readonly string[]): Set<string> {
+  let set = normalizedAllowFromCache.get(allowFrom);
+  if (!set) {
+    set = new Set(allowFrom.map(normalizeMailbox));
+    normalizedAllowFromCache.set(allowFrom, set);
+  }
+  return set;
+}
+
 export function isAgentMailSenderAllowed(params: {
   policy: "allowlist" | "open" | "disabled";
   allowFrom: readonly string[];
@@ -142,7 +156,7 @@ export function isAgentMailSenderAllowed(params: {
   if (params.policy === "disabled") {
     return false;
   }
-  const allowFrom = new Set(params.allowFrom.map(normalizeMailbox));
+  const allowFrom = normalizedAllowFromSet(params.allowFrom);
   if (params.policy === "open") {
     return allowFrom.has("*");
   }

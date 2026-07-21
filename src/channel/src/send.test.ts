@@ -364,7 +364,7 @@ describe("AgentMail reply-only outbound", () => {
     expect(reply).not.toHaveBeenCalled();
   });
 
-  it("maps a deterministic local-file recovery failure to an unresolved verdict", async () => {
+  it("maps a host-local media recovery failure to a retryable verdict", async () => {
     reply.mockClear();
     const enoent = Object.assign(new Error("no such file"), { code: "ENOENT" });
     loadAgentMailOutboundAttachments.mockRejectedValueOnce(enoent);
@@ -387,7 +387,7 @@ describe("AgentMail reply-only outbound", () => {
       } as never,
       { client: client(), now: () => now },
     );
-    expect(result).toEqual({ status: "unresolved", error: "no such file", retryable: false });
+    expect(result).toEqual({ status: "unresolved", error: "no such file", retryable: true });
     expect(reply).not.toHaveBeenCalled();
   });
 

@@ -1,20 +1,16 @@
 import type { AgentMail, AgentMailClient } from "agentmail";
-import { computeBackoff } from "openclaw/plugin-sdk/runtime-env";
 import {
   createAgentMailCatchUpSession,
   createAgentMailCatchUpSupervisor,
+  startAgentMailPeriodicCatchUp,
   type AgentMailCatchUpSession,
 } from "./catch-up.js";
 import { createAgentMailClient } from "./client.js";
 import { AgentMailIngressCapacityError } from "./ingress.js";
-import { waitForRetry } from "./retry.js";
+import { createBackoff, waitForRetry } from "./retry.js";
 import type { AgentMailIngressRecord, ResolvedAgentMailAccount } from "./types.js";
 
 const AGENTMAIL_WEBSOCKET_LIVE_QUEUE_MAX = 32;
-const AGENTMAIL_WEBSOCKET_CATCH_UP_INTERVAL_MS = 60_000;
-// A less frequent deep sweep lists from the monitoring baseline so mail whose timestamp fell below
-// the recent overlap window (back-dated or long-delayed, and missed by the socket) is still found.
-const AGENTMAIL_WEBSOCKET_DEEP_SWEEP_INTERVAL_MS = 15 * 60_000;
 // A single record must not pin the one bounded live worker forever. After this many failed durable
 // admissions, hand the record to REST catch-up (which retains the provider-side source) so later
 // live events keep advancing.
@@ -34,9 +30,7 @@ function isReceivedEvent(value: unknown): value is AgentMail.MessageReceivedEven
   return event.type === "event" && event.eventType === "message.received" && Boolean(event.message);
 }
 
-function websocketRetryDelayMs(attempt: number): number {
-  return computeBackoff({ initialMs: 1_000, maxMs: 30_000, factor: 2, jitter: 0.2 }, attempt);
-}
+const websocketRetryDelayMs = createBackoff(30_000);
 
 async function receiveUntilDurable(params: {
   record: AgentMailIngressRecord;
@@ -116,26 +110,14 @@ export async function startAgentMailWebSocket(params: {
     retryDelayMs: retryDelay,
     log: params.log,
   });
-  const catchUpIntervalMs = params.catchUpIntervalMs ?? AGENTMAIL_WEBSOCKET_CATCH_UP_INTERVAL_MS;
-  const periodicCatchUpWorker = (async () => {
-    while (!params.abortSignal.aborted) {
-      if (!(await waitForRetry(params.abortSignal, catchUpIntervalMs))) {
-        return;
-      }
-      // The SDK protocol has no replay cursor. Periodic REST overlap also covers half-open
-      // sockets that emit neither a close event nor new messages.
-      catchUpSupervisor.request();
-    }
-  })();
-  const deepSweepIntervalMs = params.deepSweepIntervalMs ?? AGENTMAIL_WEBSOCKET_DEEP_SWEEP_INTERVAL_MS;
-  const deepSweepWorker = (async () => {
-    while (!params.abortSignal.aborted) {
-      if (!(await waitForRetry(params.abortSignal, deepSweepIntervalMs))) {
-        return;
-      }
-      catchUpSupervisor.requestDeep();
-    }
-  })();
+  // The SDK protocol has no replay cursor; these timers also cover half-open sockets that emit
+  // neither a close event nor new messages.
+  const [periodicCatchUpWorker, deepSweepWorker] = startAgentMailPeriodicCatchUp({
+    supervisor: catchUpSupervisor,
+    abortSignal: params.abortSignal,
+    catchUpIntervalMs: params.catchUpIntervalMs,
+    deepSweepIntervalMs: params.deepSweepIntervalMs,
+  });
 
   const runLiveWorker = (): void => {
     if (liveWorker) {
@@ -203,6 +185,16 @@ export async function startAgentMailWebSocket(params: {
   // internal reconnect, and turn a later reconnect into a no-op, leaving only periodic REST polling
   // until process restart. Instead, disable the SDK reconnect and recreate the socket ourselves on
   // every close until aborted, re-subscribing and overlapping REST on each fresh connection.
+  //
+  // One shared abort promise for the whole loop: abort is terminal, so attaching a fresh listener
+  // per reconnect would leak closures on the long-lived signal (listener-limit warnings under churn).
+  const aborted = new Promise<void>((resolve) => {
+    if (params.abortSignal.aborted) {
+      resolve();
+      return;
+    }
+    params.abortSignal.addEventListener("abort", () => resolve(), { once: true });
+  });
   const connectionLoop = (async () => {
     let reconnectAttempt = 0;
     while (!params.abortSignal.aborted) {
@@ -269,13 +261,6 @@ export async function startAgentMailWebSocket(params: {
       if (socket.readyState === 1) {
         subscribe();
       }
-      const aborted = new Promise<void>((resolve) => {
-        if (params.abortSignal.aborted) {
-          resolve();
-          return;
-        }
-        params.abortSignal.addEventListener("abort", () => resolve(), { once: true });
-      });
       await Promise.race([closed, aborted]);
       socket.close();
       if (params.abortSignal.aborted) {

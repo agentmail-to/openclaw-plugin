@@ -1,10 +1,9 @@
-import { createHash } from "node:crypto";
 import type { AgentMail, AgentMailClient } from "agentmail";
 import type { PluginStateKeyedStore } from "openclaw/plugin-sdk/plugin-state-runtime";
-import { computeBackoff } from "openclaw/plugin-sdk/runtime-env";
 import { createAgentMailClient } from "./client.js";
+import { sha256Hex } from "./digest.js";
 import { AgentMailIngressCapacityError } from "./durable-receive.js";
-import { waitForRetry } from "./retry.js";
+import { createBackoff, waitForRetry } from "./retry.js";
 import { getAgentMailRuntime } from "./runtime.js";
 import type { AgentMailIngressRecord, ResolvedAgentMailAccount } from "./types.js";
 
@@ -14,6 +13,11 @@ const PAGE_LIMIT = 100;
 export const AGENTMAIL_REST_CATCH_UP_NAMESPACE = "agentmail.rest-catch-up";
 export const AGENTMAIL_REST_CATCH_UP_MAX_ACCOUNTS = 1_000;
 export const AGENTMAIL_REST_CATCH_UP_OVERLAP_MS = 5 * 60_000;
+// Periodic overlap covers half-open sockets and provider webhook gaps; the less frequent deep sweep
+// lists from the baseline so back-dated mail below the overlap window is still recovered. Both run
+// for WebSocket and webhook ingress so recovery never stalls after a capacity pause.
+export const AGENTMAIL_CATCH_UP_INTERVAL_MS = 60_000;
+export const AGENTMAIL_DEEP_SWEEP_INTERVAL_MS = 15 * 60_000;
 
 export type AgentMailCatchUpCursor = {
   version: typeof CURSOR_VERSION;
@@ -43,9 +47,7 @@ export type AgentMailCatchUpSupervisor = {
   settle(): Promise<void>;
 };
 
-function catchUpRetryDelayMs(attempt: number): number {
-  return computeBackoff({ initialMs: 1_000, maxMs: 30_000, factor: 2, jitter: 0.2 }, attempt);
-}
+const catchUpRetryDelayMs = createBackoff(30_000);
 
 export function createAgentMailCatchUpSupervisor(params: {
   session: AgentMailCatchUpSession;
@@ -111,8 +113,41 @@ export function createAgentMailCatchUpSupervisor(params: {
   };
 }
 
+/**
+ * Starts the periodic overlap and deep-sweep timers that keep REST recovery running for the life of
+ * an account, independent of live socket/webhook events. Returns the worker promises so the caller
+ * can await them on shutdown. Shared by both WebSocket and webhook ingress so a capacity pause is
+ * always followed by a later retry.
+ */
+export function startAgentMailPeriodicCatchUp(params: {
+  supervisor: AgentMailCatchUpSupervisor;
+  abortSignal: AbortSignal;
+  catchUpIntervalMs?: number;
+  deepSweepIntervalMs?: number;
+}): Promise<void>[] {
+  const catchUpIntervalMs = params.catchUpIntervalMs ?? AGENTMAIL_CATCH_UP_INTERVAL_MS;
+  const deepSweepIntervalMs = params.deepSweepIntervalMs ?? AGENTMAIL_DEEP_SWEEP_INTERVAL_MS;
+  const periodic = (async () => {
+    while (!params.abortSignal.aborted) {
+      if (!(await waitForRetry(params.abortSignal, catchUpIntervalMs))) {
+        return;
+      }
+      params.supervisor.request();
+    }
+  })();
+  const deep = (async () => {
+    while (!params.abortSignal.aborted) {
+      if (!(await waitForRetry(params.abortSignal, deepSweepIntervalMs))) {
+        return;
+      }
+      params.supervisor.requestDeep();
+    }
+  })();
+  return [periodic, deep];
+}
+
 function cursorKey(account: ResolvedAgentMailAccount): string {
-  return createHash("sha256").update(`${account.accountId}\n${account.inboxId}`).digest("hex");
+  return sha256Hex(`${account.accountId}\n${account.inboxId}`);
 }
 
 function validTimestamp(value: unknown): value is number {

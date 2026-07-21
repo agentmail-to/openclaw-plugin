@@ -47,12 +47,26 @@ function parseVerifiedEvent(payload: unknown): {
   return { inboxId, messageId };
 }
 
+/**
+ * Constructs the Svix verifier, returning null when the configured secret is malformed. A truthy
+ * but invalid secret otherwise throws synchronously from `new Webhook()`, which would abort account
+ * startup with no ingress and no fallback. The gateway inspects the null result to fall back.
+ */
+export function createAgentMailWebhookVerifier(secret: string): Webhook | null {
+  try {
+    return new Webhook(secret);
+  } catch {
+    return null;
+  }
+}
+
 export function createAgentMailWebhookHandler(params: {
   account: ResolvedAgentMailAccount;
+  verifier: Webhook;
   receive: (record: AgentMailIngressRecord) => Promise<void>;
   log?: WebhookLog;
 }) {
-  const verifier = new Webhook(params.account.webhookSecret);
+  const verifier = params.verifier;
   return async (req: IncomingMessage, res: ServerResponse) => {
     if (req.method !== "POST") {
       res.setHeader("allow", "POST");

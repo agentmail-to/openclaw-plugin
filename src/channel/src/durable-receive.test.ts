@@ -190,6 +190,33 @@ describe("AgentMail durable ingress", () => {
     expect(dispatch).toHaveBeenCalledTimes(2);
   });
 
+  it("drops a poison message after the dispatch ceiling instead of blocking the queue", async () => {
+    const complete = vi.fn(async () => undefined);
+    const release = vi.fn(async () => true);
+    const dispatch = vi.fn(async () => {
+      throw new Error("permanent parse failure");
+    });
+    const error = vi.fn();
+    await processAgentMailIngress({
+      journal: {
+        accept: async () => ({ kind: "accepted", duplicate: false, record: {} }),
+        complete,
+        release,
+      } as never,
+      record,
+      dispatch,
+      retryDelayMs: () => 0,
+      log: { error },
+    });
+    // After the ceiling, the row is completed (dropped) and retries stop.
+    await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(1));
+    expect(dispatch.mock.calls.length).toBeGreaterThanOrEqual(50);
+    expect(error).toHaveBeenCalledWith(expect.stringContaining("dropping message"));
+    const dispatchCount = dispatch.mock.calls.length;
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(dispatch.mock.calls.length).toBe(dispatchCount);
+  });
+
   it("keeps accepted ingress retryable beyond the former dispatch budget", async () => {
     const release = vi.fn(async () => true);
     let attempts = 0;

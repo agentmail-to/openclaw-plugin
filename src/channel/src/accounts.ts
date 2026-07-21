@@ -118,6 +118,31 @@ export function isAgentMailAccountConfigured(account: ResolvedAgentMailAccount):
   return Boolean(account.apiKey && account.inboxId);
 }
 
+/**
+ * Returns the id of an earlier-sorted account that also targets this account's inbox, or null when
+ * the inbox is unique. Two accounts consuming one inbox would open separate durable journals (keyed
+ * by accountId) and both process — and reply to — the same message. The earliest account owns the
+ * inbox; later duplicates defer so exactly one consumer runs.
+ */
+export function findConflictingAgentMailInboxOwner(
+  cfg: OpenClawConfig,
+  account: ResolvedAgentMailAccount,
+): string | null {
+  if (!account.inboxId) {
+    return null;
+  }
+  for (const otherId of listAgentMailAccountIds(cfg)) {
+    if (otherId === account.accountId || otherId.localeCompare(account.accountId) >= 0) {
+      continue;
+    }
+    const other = resolveAgentMailAccount(cfg, otherId);
+    if (other.enabled && other.inboxId === account.inboxId) {
+      return otherId;
+    }
+  }
+  return null;
+}
+
 export function inspectAgentMailAccount(cfg: OpenClawConfig, accountId?: string | null) {
   const account = resolveAgentMailAccount(cfg, accountId);
   return {
