@@ -1,0 +1,51 @@
+{
+  "name": "openclaw-plugin-agentmail",
+  "version": "0.1.0",
+  "description": "AgentMail inbox and email tools for OpenClaw agents.",
+  "type": "module",
+  "private": false,
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/agentmail-to/openclaw-plugin.git"
+  },
+  "homepage": "https://github.com/agentmail-to/openclaw-plugin#readme",
+  "keywords": [
+    "agentmail",
+    "openclaw",
+    "email",
+    "ai-agent"
+  ],
+  "engines": {
+    "node": ">=22.22.3 <23 || >=24.15.0 <25 || >=25.9.0"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "plugin:build": "npm run build && openclaw plugins build --entry ./dist/index.js",
+    "plugin:validate": "npm run build && openclaw plugins validate --entry ./dist/index.js",
+    "prepack": "npm run plugin:build",
+    "test": "vitest run --config ./vitest.config.ts"
+  },
+  "files": [
+    "dist",
+    "openclaw.plugin.json",
+    "README.md"
+  ],
+  "peerDependencies": {
+    "openclaw": ">=2026.5.17"
+  },
+  "dependencies": {
+    "agentmail": "^0.5.16",
+    "typebox": "^1.1.38"
+  },
+  "devDependencies": {
+    "openclaw": "latest",
+    "typescript": "^5.9.0",
+    "vitest": "^3.2.0"
+  },
+  "openclaw": {
+    "extensions": [
+      "./dist/index.js"
+    ]
+  }
+}
