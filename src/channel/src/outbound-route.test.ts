@@ -102,6 +102,30 @@ describe("resolveAgentMailOutboundSessionRoute", () => {
     expect(route?.to).toBe("message:resolved");
   });
 
+  it("uses the resolved account id for a single named account when accountId is omitted", () => {
+    const namedCfg = {
+      channels: {
+        agentmail: { accounts: { support: { apiKey: "key", inboxId: "support@agentmail.to" } } },
+      },
+    } as never;
+    const route = resolveAgentMailOutboundSessionRoute({
+      cfg: namedCfg,
+      agentId: "agent-1",
+      accountId: undefined,
+      target: "message:m",
+      threadId: "t1",
+    });
+    // Matches the key the inbound turn for account "support" derives — not one keyed by a raw/
+    // undefined accountId.
+    expect(route?.sessionKey).toBe(
+      buildAgentMailSessionKey({
+        agentId: "agent-1",
+        accountId: "support",
+        conversationId: buildAgentMailConversationId("support@agentmail.to", "t1"),
+      }),
+    );
+  });
+
   it("returns null for a non-AgentMail target", () => {
     expect(
       resolveAgentMailOutboundSessionRoute({

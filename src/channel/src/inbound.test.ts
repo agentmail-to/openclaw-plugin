@@ -194,14 +194,18 @@ describe("AgentMail REST-authoritative inbound", () => {
         run: async ({
           raw,
           adapter,
-          onTurnAdopted: receivedOnTurnAdopted,
+          turnAdoptionLifecycle,
         }: {
           raw: AgentMail.Message;
           adapter: Record<string, Function>;
-          onTurnAdopted?: () => Promise<void>;
+          turnAdoptionLifecycle?: {
+            admission?: string;
+            onAdopted: () => Promise<void>;
+          };
         }) => {
-          // The hook is wrapped (to track adoption for media cleanup) but must forward to ours.
-          await receivedOnTurnAdopted?.();
+          // The SDK contract is turnAdoptionLifecycle.onAdopted, not a bare onTurnAdopted.
+          expect(turnAdoptionLifecycle?.admission).toBe("exclusive");
+          await turnAdoptionLifecycle?.onAdopted();
           expect(onTurnAdopted).toHaveBeenCalledOnce();
           const ingested = adapter.ingest!(raw);
           turn = await adapter.resolveTurn!(ingested);
@@ -278,6 +282,44 @@ describe("AgentMail REST-authoritative inbound", () => {
       }),
     ).rejects.toThrow("dispatch failed before adoption");
     expect(rm).toHaveBeenCalledWith("/tmp/a.bin", { force: true });
+  });
+
+  it("cleans up attachments when the adoption hook itself fails", async () => {
+    rm.mockClear();
+    loadAgentMailInboundAttachments.mockResolvedValueOnce({
+      paths: ["/tmp/b.bin"],
+      types: ["application/octet-stream"],
+    });
+    const onTurnAdopted = vi.fn(async () => {
+      throw new Error("journal.complete failed");
+    });
+    await expect(
+      dispatchAgentMailInboundEvent({
+        cfg: {},
+        account,
+        record,
+        channelRuntime: {
+          routing: { resolveAgentRoute: () => ({ agentId: "agent-1" }) },
+          inbound: {
+            buildContext: (ctx: Record<string, unknown>) => ctx,
+            run: async ({
+              turnAdoptionLifecycle,
+            }: {
+              turnAdoptionLifecycle: { onAdopted: () => Promise<void> };
+            }) => {
+              // Core surfaces an adoption-hook failure by rejecting the run.
+              await turnAdoptionLifecycle.onAdopted();
+            },
+          },
+          session: { resolveStorePath: () => "/tmp/s.json", recordInboundSession: vi.fn() },
+          reply: { dispatchReplyWithBufferedBlockDispatcher: vi.fn() },
+        } as never,
+        client: { inboxes: { messages: { get: vi.fn(async () => message()) } } } as never,
+        onTurnAdopted,
+      }),
+    ).rejects.toThrow("journal.complete failed");
+    // The flag is set only after the hook resolves, so a failed completion still cleans up media.
+    expect(rm).toHaveBeenCalledWith("/tmp/b.bin", { force: true });
   });
 
   it("denies an unauthorized hydrated sender without dispatch", async () => {

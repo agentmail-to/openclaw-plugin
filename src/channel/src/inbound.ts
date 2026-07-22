@@ -127,6 +127,7 @@ export async function dispatchAgentMailInboundEvent(params: {
   client?: AgentMailClient;
   log?: AgentMailLog;
   onTurnAdopted?: () => void | Promise<void>;
+  abortSignal?: AbortSignal;
   now?: () => number;
 }): Promise<void> {
   const client = params.client ?? createAgentMailClient(params.account);
@@ -248,24 +249,33 @@ export async function dispatchAgentMailInboundEvent(params: {
   });
 
   let turnAdopted = false;
-  // Wrap the lifecycle hook so we can observe adoption locally (for media cleanup) while still
-  // forwarding to the ingress lifecycle. onTurnAdopted is read by core but absent from the SDK's
-  // param type, so it is spread in the same way the surrounding code passes it.
-  const lifecycle = {
-    onTurnAdopted: async () => {
-      turnAdopted = true;
+  // Adoption fires when core has made recovery-relevant session/run state durable. The ingress row
+  // is completed here (via params.onTurnAdopted), closing the crash window before agent tools run;
+  // exclusive admission isolates the reply lane per turn, and the abort signal cancels a pre-adoption
+  // turn on shutdown. The local `turnAdopted` flag is set only AFTER the hook resolves so a failed
+  // journal.complete still triggers media cleanup below.
+  const turnAdoptionLifecycle = {
+    admission: "exclusive" as const,
+    onAdopted: async () => {
       await params.onTurnAdopted?.();
+      turnAdopted = true;
     },
+    ...(params.abortSignal ? { abortSignal: params.abortSignal } : {}),
   };
   const runPromise = params.channelRuntime.inbound.run({
     channel: CHANNEL_ID,
     accountId: params.account.accountId,
     raw: message,
-    ...lifecycle,
+    turnAdoptionLifecycle,
     adapter: {
       ingest: (raw) => ({
         id: raw.messageId,
-        timestamp: raw.timestamp.getTime(),
+        // Hydrated SDK objects may bypass Date validation; fall back to the durable record's arrival
+        // time rather than throwing on an invalid timestamp.
+        timestamp:
+          raw.timestamp instanceof Date && !Number.isNaN(raw.timestamp.getTime())
+            ? raw.timestamp.getTime()
+            : (params.record.arrivedAt ?? params.record.receivedAt),
         rawText: body,
         textForAgent: body,
         textForCommands: body,

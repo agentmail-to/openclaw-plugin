@@ -3,14 +3,41 @@
 // manifest/contract/schema shapes that a pure staleness check cannot — they would otherwise only
 // surface at user startup. Kept separate from `plugin:check` (manifest staleness).
 import { execFileSync } from "node:child_process";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const root = fileURLToPath(new URL("..", import.meta.url));
 const openclaw = fileURLToPath(new URL("../node_modules/.bin/openclaw", import.meta.url));
 
+// Run against an isolated, disposable state dir so validation (invoked from prepack during
+// `npm pack`/`npm publish`) never touches the maintainer's real OpenClaw installation or its
+// persistent plugin state.
+const stateDir = mkdtempSync(join(tmpdir(), "agentmail-plugin-validate-"));
+const childEnv = {
+  ...process.env,
+  OPENCLAW_STATE_DIR: stateDir,
+  OPENCLAW_CONFIG_DIR: stateDir,
+  OPENCLAW_HOME: stateDir,
+};
+
 function run(args) {
-  return execFileSync(openclaw, args, { cwd: root, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+  return execFileSync(openclaw, args, {
+    cwd: root,
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+    env: childEnv,
+  });
 }
+
+process.on("exit", () => {
+  try {
+    rmSync(stateDir, { recursive: true, force: true });
+  } catch {
+    // best effort
+  }
+});
 
 function fail(message, detail) {
   console.error(`\nplugin:validate FAILED — ${message}`);

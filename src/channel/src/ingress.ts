@@ -24,7 +24,7 @@ type DispatchParams = {
 
 export type AgentMailIngressDispatch = (
   record: AgentMailIngressRecord,
-  lifecycle: { onTurnAdopted: () => Promise<void> },
+  lifecycle: { onTurnAdopted: () => Promise<void>; abortSignal?: AbortSignal },
 ) => Promise<void>;
 
 // Ceiling on pre-adoption dispatch attempts for a single message. A deterministically failing
@@ -73,7 +73,14 @@ function nextDispatchDelayMs(params: {
   }
   const deadline =
     (params.record.arrivedAt ?? params.record.receivedAt) + HYDRATION_NOT_FOUND_RETRY_WINDOW_MS;
-  return Math.max(0, Math.min(base, deadline - (params.now?.() ?? Date.now())));
+  const remaining = deadline - (params.now?.() ?? Date.now());
+  if (remaining <= 0) {
+    // Past the hydration deadline the 404 is no longer a projection race (e.g. a persistently
+    // missing attachment). Fall back to the full backoff instead of collapsing to a zero-delay loop
+    // that would hammer the provider until the poison-drop ceiling.
+    return base;
+  }
+  return Math.min(base, remaining);
 }
 
 export async function processAgentMailIngress(params: {
@@ -155,7 +162,7 @@ async function dispatchAgentMailIngressUntilSettled(params: DispatchParams): Pro
         params.dispatchCompleted = true;
       };
       try {
-        await params.dispatch(params.record, { onTurnAdopted });
+        await params.dispatch(params.record, { onTurnAdopted, abortSignal: params.abortSignal });
         if (turnAdopted) {
           return true;
         }

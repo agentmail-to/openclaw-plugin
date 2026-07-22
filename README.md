@@ -55,6 +55,11 @@ openclaw plugins inspect agentmail --runtime
 
 ### Tool config (optional SDK settings)
 
+> **Credentials:** the email **tools** authenticate only with the `AGENTMAIL_API_KEY` environment
+> variable, while the **channel** can also take an inline or resolved `apiKey` in `channels.agentmail`.
+> Always set `AGENTMAIL_API_KEY` in the Gateway environment so both surfaces are configured; a
+> channel-only inline key leaves the tools reporting AgentMail as unconfigured.
+
 Optional AgentMail SDK settings for the **tools** belong under `plugins.entries.agentmail.config`:
 
 ```json5

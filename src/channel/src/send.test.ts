@@ -452,6 +452,42 @@ describe("AgentMail reply-only outbound", () => {
     expect(reply).not.toHaveBeenCalled();
   });
 
+  it("fails fast (non-retryable) when the triggering message was deleted (404)", async () => {
+    reply.mockClear();
+    const deletedClient = () =>
+      ({
+        inboxes: {
+          messages: {
+            get: vi.fn(async () => {
+              throw new AgentMailError({ message: "gone", statusCode: 404 });
+            }),
+            reply,
+          },
+        },
+      }) as never;
+    const now = 10_000;
+    const result = await reconcileAgentMailUnknownSend(
+      {
+        cfg: {
+          channels: {
+            agentmail: { apiKey: "key", inboxId: "inbox_1", allowFrom: ["sender@example.com"] },
+          },
+        },
+        queueId: "queue_1",
+        channel: "agentmail",
+        to: "message:msg_1",
+        accountId: "default",
+        enqueuedAt: now - 1_000,
+        retryCount: 1,
+        effectiveReplyToId: "msg_1",
+        payloads: [{ text: "Hello" }],
+      } as never,
+      { client: deletedClient(), now: () => now },
+    );
+    expect(result).toMatchObject({ status: "unresolved", retryable: false });
+    expect(reply).not.toHaveBeenCalled();
+  });
+
   it("refuses recovery when the persisted reply target differs", async () => {
     const now = 10_000;
     const result = await reconcileAgentMailUnknownSend(

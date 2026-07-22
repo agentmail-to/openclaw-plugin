@@ -28,9 +28,10 @@ function getChannelConfig(cfg: OpenClawConfig): AgentMailChannelConfig | undefin
 }
 
 function hasBaseAccount(channel: AgentMailChannelConfig | undefined): boolean {
-  return Boolean(
-    channel?.inboxId || hasConfiguredSecretInput(channel?.apiKey) || process.env.AGENTMAIL_API_KEY,
-  );
+  // Do NOT treat a bare AGENTMAIL_API_KEY env (which also configures the tools) as a channel
+  // account: without channel config it would surface a phantom, unconfigured default account. The
+  // default account still resolves its key from the env fallback once an inboxId is configured.
+  return Boolean(channel?.inboxId || hasConfiguredSecretInput(channel?.apiKey));
 }
 
 export function listAgentMailAccountIds(cfg: OpenClawConfig): string[] {

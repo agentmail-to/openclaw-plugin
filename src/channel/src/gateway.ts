@@ -89,7 +89,7 @@ export async function startAgentMailGatewayAccount(params: {
   });
   const dispatch = async (
     record: AgentMailIngressRecord,
-    lifecycle: { onTurnAdopted: () => Promise<void> },
+    lifecycle: { onTurnAdopted: () => Promise<void>; abortSignal?: AbortSignal },
   ) =>
     await dispatchAgentMailInboundEvent({
       cfg: params.cfg,
@@ -99,6 +99,7 @@ export async function startAgentMailGatewayAccount(params: {
       client,
       log: params.log,
       onTurnAdopted: lifecycle.onTurnAdopted,
+      abortSignal: lifecycle.abortSignal,
     });
   const receive = async (record: AgentMailIngressRecord) => {
     await processAgentMailIngress({
@@ -157,6 +158,9 @@ export async function startAgentMailGatewayAccount(params: {
       routeOwners.delete(previousRoute.path);
     }
   }
+  // Claim ownership synchronously here, before the first await, so the check-and-claim is atomic:
+  // two concurrent startups for the same path can no longer both observe it as free.
+  routeOwners.set(path, params.account.accountId);
   const catchUpSession = await createAgentMailCatchUpSession({
     account: params.account,
     client,
@@ -192,7 +196,7 @@ export async function startAgentMailGatewayAccount(params: {
   });
   const activeRoute = { path, unregister };
   activeRoutes.set(params.account.accountId, activeRoute);
-  routeOwners.set(path, params.account.accountId);
+  // Ownership was already claimed synchronously above.
   params.log?.info?.(
     `Registered AgentMail webhook route ${path} for account ${params.account.accountId}`,
   );

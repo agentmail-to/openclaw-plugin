@@ -80,7 +80,8 @@ export async function loadAgentMailInboundAttachments(params: {
     downloaded.push({
       buffer: loaded.buffer,
       contentType:
-        normalizeMimeType(metadata.contentType ?? loaded.contentType) ?? "application/octet-stream",
+        // Use || not ??: an empty-string provider contentType must not win over the sniffed type.
+        normalizeMimeType(metadata.contentType || loaded.contentType) ?? "application/octet-stream",
       // saveMediaBuffer owns inbound filename sanitization at the persistence boundary.
       filename: metadata.filename || `attachment-${attachment.attachmentId}`,
     });

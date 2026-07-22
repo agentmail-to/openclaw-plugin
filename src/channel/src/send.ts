@@ -31,15 +31,20 @@ function isHostLocalMediaFailure(error: unknown): boolean {
   return code === "ENOENT" || code === "EACCES" || code === "EISDIR" || code === "ENOTDIR";
 }
 
-// Transient failures during reconciliation (re-hydrating the triggering message or the provider
-// reply) resolve on their own; report them retryable so the durable queue keeps trying instead of
-// escaping the reconciler as an unhandled throw.
+// A 404 while re-hydrating the triggering message means it was deleted; the reply can never be sent,
+// so fail fast instead of consuming the bounded retry budget before dead-lettering.
+function isDeletedTriggerFailure(error: unknown): boolean {
+  return error instanceof AgentMailError && error.statusCode === 404;
+}
+
+// Transient failures during reconciliation (provider 5xx/throttling or network) resolve on their
+// own; report them retryable so the durable queue keeps trying instead of escaping the reconciler as
+// an unhandled throw. 404 is intentionally excluded (handled as a terminal deletion above).
 function isTransientReplyFailure(error: unknown): boolean {
   if (error instanceof AgentMailError) {
     const status = error.statusCode;
     return (
       status === undefined ||
-      status === 404 ||
       status === 408 ||
       status === 429 ||
       (typeof status === "number" && status >= 500)
@@ -300,6 +305,10 @@ export async function reconcileAgentMailUnknownSend(
   } catch (error) {
     if (isTerminalMediaPolicyFailure(error)) {
       return { status: "unresolved", error: error.message, retryable: false };
+    }
+    if (isDeletedTriggerFailure(error)) {
+      // The triggering message is gone; retrying cannot succeed. Fail fast.
+      return { status: "unresolved", error: errorText(error), retryable: false };
     }
     // Host-local media access (dropped recovery handles) and transient hydration/provider failures
     // both resolve on a later attempt, so keep the queue retrying rather than throwing out.

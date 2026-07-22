@@ -225,6 +225,30 @@ describe("AgentMail durable REST catch-up", () => {
     );
   });
 
+  it("floors an idle high-water sweep at the dedupe horizon", async () => {
+    const store = memoryStore<never>();
+    const list = vi.fn(async () => ({ count: 0, messages: [] }));
+    let nowMs = 1_000;
+    const session = await createAgentMailCatchUpSession({
+      account,
+      client: { inboxes: { messages: { list } } } as never,
+      store: store as never,
+      now: () => nowMs,
+    });
+    const receive = vi.fn(async () => undefined);
+    await session.run({ receive, abortSignal: new AbortController().signal }); // establish, highWater≈1_000
+    nowMs = 1_000 + 8 * 24 * 60 * 60 * 1000; // 8 days later, inbox stayed idle
+    await session.run({ receive, abortSignal: new AbortController().signal }); // normal high-water sweep
+    // The high-water cursor never advanced, so without a floor the sweep would re-scan pre-horizon
+    // mail; it must instead query from now - 7d.
+    const expectedFloor = nowMs - 7 * 24 * 60 * 60 * 1000;
+    expect(list).toHaveBeenLastCalledWith(
+      "inbox_1",
+      expect.objectContaining({ after: new Date(expectedFloor) }),
+      expect.any(Object),
+    );
+  });
+
   it("pauses the pass when durable ingress reports capacity", async () => {
     const store = memoryStore<never>();
     const list = vi.fn(async () => ({

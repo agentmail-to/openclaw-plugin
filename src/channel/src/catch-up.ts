@@ -245,15 +245,21 @@ export async function createAgentMailCatchUpSession(params: {
       if (!storedCursor) {
         throw new Error("AgentMail WebSocket catch-up cursor is unavailable");
       }
-      // Never scan below the dedupe horizon. Completed-message tombstones expire after
-      // AGENTMAIL_DURABLE_COMPLETED_TTL_MS, so a baseline/deep sweep reaching older mail would
-      // re-admit it and generate a duplicate agent turn. Recent (high-water) sweeps are always well
-      // within the horizon and are not floored.
+      // Never scan below the dedupe horizon on ANY sweep. Completed-message tombstones expire after
+      // AGENTMAIL_DURABLE_COMPLETED_TTL_MS; once they do, a message still in scan range would be
+      // re-admitted as a duplicate turn. The floor is applied to the normal high-water sweep too:
+      // an idle inbox's high-water stops advancing, so without it the same pre-horizon messages
+      // would become eligible again after their tombstones expire.
+      //
+      // The deep sweep lists from max(baseline, dedupeFloor): it recovers back-dated mail within the
+      // dedupe window and since monitoring began, but deliberately does not scan before the baseline,
+      // which would re-inject pre-monitoring history that has no tombstone protection.
       const dedupeFloorMs = now() - AGENTMAIL_DURABLE_COMPLETED_TTL_MS;
-      const afterMs =
+      const baseAfterMs =
         sinceBaseline || !storedCursor.established
-          ? Math.max(storedCursor.baselineAtMs, dedupeFloorMs)
-          : Math.max(0, storedCursor.highWaterAtMs - AGENTMAIL_REST_CATCH_UP_OVERLAP_MS);
+          ? storedCursor.baselineAtMs
+          : storedCursor.highWaterAtMs - AGENTMAIL_REST_CATCH_UP_OVERLAP_MS;
+      const afterMs = Math.max(0, baseAfterMs, dedupeFloorMs);
       let highWaterAtMs = storedCursor.highWaterAtMs;
       let pageCursor: string | undefined;
       let admitted = 0;

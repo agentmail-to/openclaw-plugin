@@ -40,14 +40,15 @@ export function resolveAgentMailOutboundSessionRoute(params: {
   if (!target) {
     return null;
   }
-  // Only resolve an inbox-scoped conversation when the account is unambiguous: an explicit accountId,
-  // or a single configured account. With multiple accounts and no accountId, resolving would silently
-  // pick the default account's inbox and route to the wrong session — fall back to the message target.
+  // Resolve the account so the session key uses the same canonical accountId the inbound turn uses
+  // (a raw or undefined params.accountId would otherwise diverge, breaking continuity for a single
+  // named account). Only inbox-scope the conversation when the account is unambiguous: an explicit
+  // accountId or a single configured account. With multiple accounts and no accountId, resolving
+  // would silently pick the default account's inbox — fall back to the message target instead.
   const hasExplicitAccount = params.accountId != null && String(params.accountId).trim() !== "";
+  const resolved = resolveAgentMailAccount(params.cfg, params.accountId);
   const inboxId =
-    hasExplicitAccount || listAgentMailAccountIds(params.cfg).length <= 1
-      ? resolveAgentMailAccount(params.cfg, params.accountId).inboxId
-      : "";
+    hasExplicitAccount || listAgentMailAccountIds(params.cfg).length <= 1 ? resolved.inboxId : "";
   const threadId =
     params.threadId === undefined || params.threadId === null || params.threadId === ""
       ? undefined
@@ -58,7 +59,7 @@ export function resolveAgentMailOutboundSessionRoute(params: {
     inboxId && threadId ? buildAgentMailConversationId(inboxId, threadId) : target;
   const sessionKey = buildAgentMailSessionKey({
     agentId: params.agentId,
-    accountId: params.accountId,
+    accountId: resolved.accountId,
     conversationId,
   });
   return {
