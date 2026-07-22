@@ -1,5 +1,5 @@
 {
-  "name": "@openclaw/agentmail",
+  "name": "@haakam21/agentmail",
   "version": "0.1.0",
   "description": "AgentMail for OpenClaw: email tools plus a durable, allowlisted, reply-only email channel.",
   "type": "module",
@@ -72,7 +72,7 @@
       "pluginSdkVersion": "2026.7.2-beta.3"
     },
     "install": {
-      "npmSpec": "@openclaw/agentmail",
+      "npmSpec": "@haakam21/agentmail",
       "defaultChoice": "npm",
       "minHostVersion": ">=2026.7.2-beta.3",
       "allowInvalidConfigRecovery": true
