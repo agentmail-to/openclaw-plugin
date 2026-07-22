@@ -25,7 +25,7 @@
     "plugin:build": "npm run build && node scripts/build-manifest.mjs",
     "plugin:check": "node scripts/build-manifest.mjs --check",
     "plugin:validate": "npm run build && node scripts/build-manifest.mjs --check && node scripts/validate-plugin.mjs",
-    "prepack": "npm run plugin:build",
+    "prepack": "npm run plugin:validate",
     "test": "vitest run --config ./vitest.config.ts"
   },
   "files": [

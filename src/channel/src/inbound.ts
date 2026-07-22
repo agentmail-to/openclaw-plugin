@@ -1,3 +1,4 @@
+import { rm } from "node:fs/promises";
 import { AgentMailError, type AgentMail, type AgentMailClient } from "agentmail";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import type { PluginRuntime } from "openclaw/plugin-sdk/plugin-runtime";
@@ -11,6 +12,11 @@ import type { AgentMailIngressRecord, ResolvedAgentMailAccount } from "./types.j
 
 const CHANNEL_ID = "agentmail";
 export const HYDRATION_NOT_FOUND_RETRY_WINDOW_MS = 5 * 60_000;
+
+// AgentMail message labels the channel gates on. "received" marks authentic inbound mail; the
+// rejected set marks provider-flagged mail that must never reach the agent.
+export const AGENTMAIL_RECEIVED_LABEL = "received";
+const AGENTMAIL_REJECTED_LABELS = ["spam", "blocked", "unauthenticated"];
 
 /**
  * Thrown when a hydrated message has not yet gained its `received` label. Carries a marker the
@@ -85,13 +91,20 @@ export function resolveAgentMailMessageText(message: AgentMail.Message): string 
   return htmlText || message.subject?.trim() || "";
 }
 
+function messageLabels(message: AgentMail.Message): string[] {
+  // Guard against a malformed hydrated payload: a missing/non-array `labels` would otherwise throw
+  // in .map/.some, fail every dispatch attempt, and eventually poison-drop a valid message.
+  return Array.isArray(message.labels)
+    ? message.labels.map((label) => String(label).toLocaleLowerCase("en-US"))
+    : [];
+}
+
 function hasRejectedLabel(message: AgentMail.Message): boolean {
-  const labels = message.labels.map((label) => label.toLocaleLowerCase("en-US"));
-  return labels.some((label) => ["spam", "blocked", "unauthenticated"].includes(label));
+  return messageLabels(message).some((label) => AGENTMAIL_REJECTED_LABELS.includes(label));
 }
 
 function hasReceivedLabel(message: AgentMail.Message): boolean {
-  return message.labels.some((label) => label.toLocaleLowerCase("en-US") === "received");
+  return messageLabels(message).includes(AGENTMAIL_RECEIVED_LABEL);
 }
 
 async function hydrateMessage(params: {
@@ -175,6 +188,9 @@ export async function dispatchAgentMailInboundEvent(params: {
     );
     return;
   }
+  // Authoritative sender authorization: a default-deny allowlist (dmPolicy defaults to "allowlist",
+  // empty allowFrom denies everyone). The rejected-label check above is anti-spoofing defense in
+  // depth (SPF/DKIM/DMARC failures land as "unauthenticated"); it never widens authorization.
   if (
     !isAgentMailSenderAllowed({
       policy: params.account.dmPolicy,
@@ -231,11 +247,21 @@ export async function dispatchAgentMailInboundEvent(params: {
     conversationId,
   });
 
-  await params.channelRuntime.inbound.run({
+  let turnAdopted = false;
+  // Wrap the lifecycle hook so we can observe adoption locally (for media cleanup) while still
+  // forwarding to the ingress lifecycle. onTurnAdopted is read by core but absent from the SDK's
+  // param type, so it is spread in the same way the surrounding code passes it.
+  const lifecycle = {
+    onTurnAdopted: async () => {
+      turnAdopted = true;
+      await params.onTurnAdopted?.();
+    },
+  };
+  const runPromise = params.channelRuntime.inbound.run({
     channel: CHANNEL_ID,
     accountId: params.account.accountId,
     raw: message,
-    ...(params.onTurnAdopted ? { onTurnAdopted: params.onTurnAdopted } : {}),
+    ...lifecycle,
     adapter: {
       ingest: (raw) => ({
         id: raw.messageId,
@@ -322,4 +348,15 @@ export async function dispatchAgentMailInboundEvent(params: {
       },
     },
   });
+  try {
+    await runPromise;
+  } catch (error) {
+    if (!turnAdopted && inboundMedia.paths.length > 0) {
+      // The turn never adopted, so core did not take ownership of these freshly-saved attachment
+      // files. Remove them so a durable retry (which re-downloads a clean set) does not leak one
+      // copy per attempt.
+      await Promise.allSettled(inboundMedia.paths.map((path) => rm(path, { force: true })));
+    }
+    throw error;
+  }
 }

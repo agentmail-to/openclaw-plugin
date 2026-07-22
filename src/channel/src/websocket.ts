@@ -22,7 +22,20 @@ function isReceivedEvent(value: unknown): value is AgentMail.MessageReceivedEven
     return false;
   }
   const event = value as Partial<AgentMail.MessageReceivedEvent>;
-  return event.type === "event" && event.eventType === "message.received" && Boolean(event.message);
+  if (event.type !== "event" || event.eventType !== "message.received") {
+    return false;
+  }
+  // Fully validate the message shape here so downstream field access (inboxId, messageId,
+  // timestamp.getTime()) cannot throw on a malformed frame. A malformed live event is ignored; REST
+  // catch-up still recovers the message from the provider.
+  const message = event.message as Partial<AgentMail.Message> | undefined;
+  return Boolean(
+    message &&
+      typeof message.inboxId === "string" &&
+      typeof message.messageId === "string" &&
+      message.timestamp instanceof Date &&
+      !Number.isNaN(message.timestamp.getTime()),
+  );
 }
 
 const websocketRetryDelayMs = createBackoff(30_000);

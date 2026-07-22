@@ -1,5 +1,5 @@
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
-import { resolveAgentMailAccount } from "./accounts.js";
+import { listAgentMailAccountIds, resolveAgentMailAccount } from "./accounts.js";
 import { buildAgentMailConversationId, buildAgentMailSessionKey } from "./inbound.js";
 import { normalizeAgentMailTarget } from "./send.js";
 
@@ -40,7 +40,14 @@ export function resolveAgentMailOutboundSessionRoute(params: {
   if (!target) {
     return null;
   }
-  const inboxId = resolveAgentMailAccount(params.cfg, params.accountId).inboxId;
+  // Only resolve an inbox-scoped conversation when the account is unambiguous: an explicit accountId,
+  // or a single configured account. With multiple accounts and no accountId, resolving would silently
+  // pick the default account's inbox and route to the wrong session — fall back to the message target.
+  const hasExplicitAccount = params.accountId != null && String(params.accountId).trim() !== "";
+  const inboxId =
+    hasExplicitAccount || listAgentMailAccountIds(params.cfg).length <= 1
+      ? resolveAgentMailAccount(params.cfg, params.accountId).inboxId
+      : "";
   const threadId =
     params.threadId === undefined || params.threadId === null || params.threadId === ""
       ? undefined

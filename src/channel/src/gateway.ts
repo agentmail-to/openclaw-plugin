@@ -2,7 +2,10 @@ import { waitUntilAbort } from "openclaw/plugin-sdk/channel-outbound";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import { registerPluginHttpRoute } from "openclaw/plugin-sdk/webhook-ingress";
 import type { AgentMailLog } from "./log.js";
-import { findConflictingAgentMailInboxOwner } from "./accounts.js";
+import {
+  collectAgentMailAccountIdWarnings,
+  findConflictingAgentMailInboxOwner,
+} from "./accounts.js";
 import {
   createAgentMailCatchUpSession,
   createAgentMailCatchUpSupervisor,
@@ -59,7 +62,10 @@ export async function startAgentMailGatewayAccount(params: {
   if (!params.account.enabled) {
     return await waitUntilAbort(params.abortSignal);
   }
-  const warnings = collectAgentMailStartupWarnings(params.account);
+  const warnings = [
+    ...collectAgentMailStartupWarnings(params.account),
+    ...collectAgentMailAccountIdWarnings(params.cfg),
+  ];
   for (const warning of warnings) {
     params.log?.warn?.(warning);
   }

@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 import {
+  collectAgentMailAccountIdWarnings,
   findConflictingAgentMailInboxOwner,
   listAgentMailAccountIds,
   resolveAgentMailAccount,
@@ -130,6 +131,44 @@ describe("AgentMail account config", () => {
     expect(
       findConflictingAgentMailInboxOwner(cfg, resolveAgentMailAccount(cfg, "gamma")),
     ).toBeNull();
+  });
+
+  it("does not let an unconfigured account own an inbox", () => {
+    const cfg = {
+      channels: {
+        agentmail: {
+          accounts: {
+            alpha: { inboxId: "shared@agentmail.to" }, // enabled but no apiKey → unconfigured
+            beta: { apiKey: sharedVal, inboxId: "shared@agentmail.to" },
+          },
+        },
+      },
+    };
+    // alpha sorts earlier but is unconfigured, so it must not block beta.
+    expect(findConflictingAgentMailInboxOwner(cfg, resolveAgentMailAccount(cfg, "beta"))).toBeNull();
+  });
+
+  it("warns about non-canonical and colliding account ids", () => {
+    const warnings = collectAgentMailAccountIdWarnings({
+      channels: {
+        agentmail: {
+          accounts: {
+            "sales/us": { inboxId: "a@agentmail.to" },
+            "sales-us": { inboxId: "b@agentmail.to" },
+          },
+        },
+      },
+    });
+    expect(warnings.some((w) => w.includes('"sales/us"') && w.includes("not canonical"))).toBe(true);
+    expect(warnings.some((w) => w.includes("normalize to"))).toBe(true);
+  });
+
+  it("lists account ids in canonical form", () => {
+    const ids = listAgentMailAccountIds({
+      channels: { agentmail: { accounts: { "Sales-US": { inboxId: "a@agentmail.to" } } } },
+    });
+    expect(ids).toContain("sales-us");
+    expect(ids).not.toContain("Sales-US");
   });
 
   it("rejects an impractically large mediaMaxMb", () => {

@@ -10,6 +10,8 @@ import { AgentMailMediaPolicyError } from "./media.js";
 import type { AgentMailIngressRecord, ResolvedAgentMailAccount } from "./types.js";
 
 const loadAgentMailInboundAttachments = vi.hoisted(() => vi.fn());
+const rm = vi.hoisted(() => vi.fn(async () => undefined));
+vi.mock("node:fs/promises", () => ({ rm }));
 
 vi.mock("./media.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("./media.js")>()),
@@ -198,7 +200,9 @@ describe("AgentMail REST-authoritative inbound", () => {
           adapter: Record<string, Function>;
           onTurnAdopted?: () => Promise<void>;
         }) => {
-          expect(receivedOnTurnAdopted).toBe(onTurnAdopted);
+          // The hook is wrapped (to track adoption for media cleanup) but must forward to ours.
+          await receivedOnTurnAdopted?.();
+          expect(onTurnAdopted).toHaveBeenCalledOnce();
           const ingested = adapter.ingest!(raw);
           turn = await adapter.resolveTurn!(ingested);
         },
@@ -246,6 +250,34 @@ describe("AgentMail REST-authoritative inbound", () => {
       disableBlockStreaming: true,
       sourceReplyDeliveryMode: "automatic",
     });
+  });
+
+  it("removes freshly-saved attachments when the turn fails before adoption", async () => {
+    rm.mockClear();
+    loadAgentMailInboundAttachments.mockResolvedValueOnce({
+      paths: ["/tmp/a.bin"],
+      types: ["application/octet-stream"],
+    });
+    await expect(
+      dispatchAgentMailInboundEvent({
+        cfg: {},
+        account,
+        record,
+        channelRuntime: {
+          routing: { resolveAgentRoute: () => ({ agentId: "agent-1" }) },
+          inbound: {
+            buildContext: (ctx: Record<string, unknown>) => ctx,
+            run: async () => {
+              throw new Error("dispatch failed before adoption");
+            },
+          },
+          session: { resolveStorePath: () => "/tmp/s.json", recordInboundSession: vi.fn() },
+          reply: { dispatchReplyWithBufferedBlockDispatcher: vi.fn() },
+        } as never,
+        client: { inboxes: { messages: { get: vi.fn(async () => message()) } } } as never,
+      }),
+    ).rejects.toThrow("dispatch failed before adoption");
+    expect(rm).toHaveBeenCalledWith("/tmp/a.bin", { force: true });
   });
 
   it("denies an unauthorized hydrated sender without dispatch", async () => {

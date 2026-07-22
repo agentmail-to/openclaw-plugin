@@ -3,7 +3,11 @@ import type { PluginStateKeyedStore } from "openclaw/plugin-sdk/plugin-state-run
 import { type AgentMailLog, errorText } from "./log.js";
 import { createAgentMailClient } from "./client.js";
 import { sha256Hex } from "./digest.js";
-import { AgentMailIngressCapacityError } from "./durable-receive.js";
+import {
+  AGENTMAIL_DURABLE_COMPLETED_TTL_MS,
+  AgentMailIngressCapacityError,
+} from "./durable-receive.js";
+import { AGENTMAIL_RECEIVED_LABEL } from "./inbound.js";
 import { createBackoff, waitForRetry } from "./retry.js";
 import { getAgentMailRuntime } from "./runtime.js";
 import type { AgentMailIngressRecord, ResolvedAgentMailAccount } from "./types.js";
@@ -174,7 +178,9 @@ function normalizeCursor(value: unknown): AgentMailCatchUpCursor | null {
 function isReceivedMessage(message: AgentMail.MessageItem, inboxId: string): boolean {
   return (
     message.inboxId === inboxId &&
-    message.labels.some((label) => label.toLocaleLowerCase("en-US") === "received")
+    (Array.isArray(message.labels) ? message.labels : []).some(
+      (label) => String(label).toLocaleLowerCase("en-US") === AGENTMAIL_RECEIVED_LABEL,
+    )
   );
 }
 
@@ -239,9 +245,14 @@ export async function createAgentMailCatchUpSession(params: {
       if (!storedCursor) {
         throw new Error("AgentMail WebSocket catch-up cursor is unavailable");
       }
+      // Never scan below the dedupe horizon. Completed-message tombstones expire after
+      // AGENTMAIL_DURABLE_COMPLETED_TTL_MS, so a baseline/deep sweep reaching older mail would
+      // re-admit it and generate a duplicate agent turn. Recent (high-water) sweeps are always well
+      // within the horizon and are not floored.
+      const dedupeFloorMs = now() - AGENTMAIL_DURABLE_COMPLETED_TTL_MS;
       const afterMs =
         sinceBaseline || !storedCursor.established
-          ? storedCursor.baselineAtMs
+          ? Math.max(storedCursor.baselineAtMs, dedupeFloorMs)
           : Math.max(0, storedCursor.highWaterAtMs - AGENTMAIL_REST_CATCH_UP_OVERLAP_MS);
       let highWaterAtMs = storedCursor.highWaterAtMs;
       let pageCursor: string | undefined;
@@ -252,7 +263,7 @@ export async function createAgentMailCatchUpSession(params: {
           {
             limit: PAGE_LIMIT,
             ...(pageCursor ? { pageToken: pageCursor } : {}),
-            labels: ["received"],
+            labels: [AGENTMAIL_RECEIVED_LABEL],
             after: new Date(afterMs),
             ascending: true,
             includeSpam: false,

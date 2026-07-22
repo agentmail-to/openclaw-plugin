@@ -47,15 +47,26 @@ export function withAgentMailIngressCapacity(
   // and push past the bound. Chaining admissions makes the count-then-accept step atomic per
   // journal; the chain never rejects so one failed admission cannot poison later ones.
   let admissionChain: Promise<unknown> = Promise.resolve();
+  // Upper-bound estimate of the pending count. It only increases on new admissions (never on
+  // completion/retention pruning), so the O(pending) scan is skipped on the common below-cap path
+  // and only runs to re-sync from the source of truth when the estimate first reaches the cap.
+  let pendingEstimate: number | null = null;
   return {
     ...journal,
     accept: (id, payload, options) => {
       const admission = admissionChain.then(async () => {
-        const pending = await journal.pending();
-        if (pending.length >= maxPendingEntries && !pending.some((entry) => entry.id === id)) {
-          throw new AgentMailIngressCapacityError();
+        if (pendingEstimate === null || pendingEstimate >= maxPendingEntries) {
+          const pending = await journal.pending();
+          pendingEstimate = pending.length;
+          if (pendingEstimate >= maxPendingEntries && !pending.some((entry) => entry.id === id)) {
+            throw new AgentMailIngressCapacityError();
+          }
         }
-        return journal.accept(id, payload, options);
+        const accepted = await journal.accept(id, payload, options);
+        if (accepted.kind === "accepted") {
+          pendingEstimate += 1;
+        }
+        return accepted;
       });
       admissionChain = admission.then(
         () => undefined,

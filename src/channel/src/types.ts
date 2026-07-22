@@ -30,6 +30,15 @@ export interface ResolvedAgentMailAccount {
   mediaMaxBytes: number;
 }
 
+export type AgentMailIngressMode = "webhook" | "websocket";
+
+/** A webhook secret selects verified webhook ingress; its absence falls back to WebSocket. */
+export function resolveAgentMailIngressMode(account: {
+  webhookSecret: string;
+}): AgentMailIngressMode {
+  return account.webhookSecret ? "webhook" : "websocket";
+}
+
 export type AgentMailIngressRecord = {
   accountId: string;
   inboxId: string;
