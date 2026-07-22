@@ -391,6 +391,31 @@ describe("AgentMail reply-only outbound", () => {
     expect(reply).not.toHaveBeenCalled();
   });
 
+  it("returns not_sent instead of throwing when the recovered reply has no content", async () => {
+    reply.mockClear();
+    const now = 10_000;
+    const result = await reconcileAgentMailUnknownSend(
+      {
+        cfg: {
+          channels: {
+            agentmail: { apiKey: "key", inboxId: "inbox_1", allowFrom: ["sender@example.com"] },
+          },
+        },
+        queueId: "queue_1",
+        channel: "agentmail",
+        to: "message:msg_1",
+        accountId: "default",
+        enqueuedAt: now - 1_000,
+        retryCount: 1,
+        effectiveReplyToId: "msg_1",
+        payloads: [{ text: "   " }],
+      } as never,
+      { client: client(), now: () => now },
+    );
+    expect(result).toEqual({ status: "not_sent" });
+    expect(reply).not.toHaveBeenCalled();
+  });
+
   it("refuses recovery when the persisted reply target differs", async () => {
     const now = 10_000;
     const result = await reconcileAgentMailUnknownSend(

@@ -4,14 +4,10 @@ import {
   readRequestBodyWithLimit,
 } from "openclaw/plugin-sdk/webhook-ingress";
 import { Webhook } from "svix";
+import { type AgentMailLog, errorText } from "./log.js";
 import type { AgentMailIngressRecord, ResolvedAgentMailAccount } from "./types.js";
 
 const MAX_WEBHOOK_BODY_BYTES = 1024 * 1024;
-
-type WebhookLog = {
-  warn?: (message: string) => void;
-  error?: (message: string) => void;
-};
 
 function header(req: IncomingMessage, name: string): string | undefined {
   const value = req.headers[name];
@@ -64,7 +60,7 @@ export function createAgentMailWebhookHandler(params: {
   account: ResolvedAgentMailAccount;
   verifier: Webhook;
   receive: (record: AgentMailIngressRecord) => Promise<void>;
-  log?: WebhookLog;
+  log?: AgentMailLog;
 }) {
   const verifier = params.verifier;
   return async (req: IncomingMessage, res: ServerResponse) => {
@@ -129,7 +125,7 @@ export function createAgentMailWebhookHandler(params: {
       return respond(res, 200);
     } catch (error) {
       params.log?.error?.(
-        `AgentMail durable webhook commit failed: ${error instanceof Error ? error.message : String(error)}`,
+        `AgentMail durable webhook commit failed: ${errorText(error)}`,
       );
       return respond(res, 503, "Retry later");
     }

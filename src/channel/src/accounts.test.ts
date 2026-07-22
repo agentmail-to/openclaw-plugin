@@ -77,6 +77,15 @@ describe("AgentMail account config", () => {
     expect(resolveAgentMailAccount(cfg, "billing").webhookPath).toBe("/mail/billing");
   });
 
+  it("falls back to the env secret when the configured apiKey is empty", () => {
+    process.env.AGENTMAIL_API_KEY = "am_env_key";
+    const account = resolveAgentMailAccount({
+      channels: { agentmail: { apiKey: "  ", inboxId: "inbox_1" } },
+    });
+    // An empty/whitespace configured apiKey must not suppress the env fallback.
+    expect(account.apiKey).toBe("am_env_key");
+  });
+
   it("does not let named accounts inherit the top-level inboxId", () => {
     const cfg = {
       channels: {

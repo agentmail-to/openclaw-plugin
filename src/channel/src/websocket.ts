@@ -5,6 +5,7 @@ import {
   startAgentMailPeriodicCatchUp,
   type AgentMailCatchUpSession,
 } from "./catch-up.js";
+import { type AgentMailLog, errorText } from "./log.js";
 import { createAgentMailClient } from "./client.js";
 import { AgentMailIngressCapacityError } from "./ingress.js";
 import { createBackoff, waitForRetry } from "./retry.js";
@@ -15,12 +16,6 @@ const AGENTMAIL_WEBSOCKET_LIVE_QUEUE_MAX = 32;
 // admissions, hand the record to REST catch-up (which retains the provider-side source) so later
 // live events keep advancing.
 const AGENTMAIL_WEBSOCKET_MAX_RECORD_ATTEMPTS = 8;
-
-type WebSocketLog = {
-  info?: (message: string) => void;
-  warn?: (message: string) => void;
-  error?: (message: string) => void;
-};
 
 function isReceivedEvent(value: unknown): value is AgentMail.MessageReceivedEvent {
   if (!value || typeof value !== "object") {
@@ -39,7 +34,7 @@ async function receiveUntilDurable(params: {
   retryDelay: (attempt: number) => number;
   deferToRestRecovery: () => void;
   maxAttempts: number;
-  log?: WebSocketLog;
+  log?: AgentMailLog;
 }): Promise<void> {
   let attempts = 0;
   while (!params.abortSignal.aborted) {
@@ -58,7 +53,7 @@ async function receiveUntilDurable(params: {
       }
       attempts += 1;
       params.log?.error?.(
-        `AgentMail WebSocket durable ingress failed; retrying: ${error instanceof Error ? error.message : String(error)}`,
+        `AgentMail WebSocket durable ingress failed; retrying: ${errorText(error)}`,
       );
       if (attempts >= params.maxAttempts) {
         // A persistent storage/serialization fault would otherwise block every later live event
@@ -80,7 +75,7 @@ export async function startAgentMailWebSocket(params: {
   account: ResolvedAgentMailAccount;
   abortSignal: AbortSignal;
   receive: (record: AgentMailIngressRecord) => Promise<void>;
-  log?: WebSocketLog;
+  log?: AgentMailLog;
   retryDelayMs?: (attempt: number) => number;
   reconnectDelayMs?: (attempt: number) => number;
   catchUpSession?: AgentMailCatchUpSession;
@@ -210,7 +205,7 @@ export async function startAgentMailWebSocket(params: {
         });
       } catch (error) {
         params.log?.error?.(
-          `AgentMail WebSocket connect failed for account ${params.account.accountId}: ${error instanceof Error ? error.message : String(error)}`,
+          `AgentMail WebSocket connect failed for account ${params.account.accountId}: ${errorText(error)}`,
         );
         // REST catch-up remains the authoritative recovery source while the socket is down.
         catchUpSupervisor.request();
@@ -248,7 +243,7 @@ export async function startAgentMailWebSocket(params: {
         });
         socket.on("error", (error) => {
           params.log?.error?.(
-            `AgentMail WebSocket error for account ${params.account.accountId}: ${error instanceof Error ? error.message : String(error)}`,
+            `AgentMail WebSocket error for account ${params.account.accountId}: ${errorText(error)}`,
           );
           // Parsing/transport errors may not close the socket. Recover authoritative events even
           // when the socket stays connected and emits no close.

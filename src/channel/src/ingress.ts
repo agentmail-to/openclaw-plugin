@@ -1,3 +1,4 @@
+import { type AgentMailLog, errorText } from "./log.js";
 import type { createAgentMailDurableInboundReceiveJournal } from "./durable-receive.js";
 import { AgentMailIngressCapacityError, createAgentMailDurableInboundId } from "./durable-receive.js";
 import { HYDRATION_NOT_FOUND_RETRY_WINDOW_MS } from "./inbound.js";
@@ -18,15 +19,13 @@ type DispatchParams = {
   retryDelay?: (attempt: number) => number;
   initialAttempts: number;
   dispatchCompleted?: boolean;
-  log?: AgentMailIngressLog;
+  log?: AgentMailLog;
 };
 
 export type AgentMailIngressDispatch = (
   record: AgentMailIngressRecord,
   lifecycle: { onTurnAdopted: () => Promise<void> },
 ) => Promise<void>;
-
-type AgentMailIngressLog = { warn?: (message: string) => void; error?: (message: string) => void };
 
 // Ceiling on pre-adoption dispatch attempts for a single message. A deterministically failing
 // (poison) message would otherwise retry until its ~30-day TTL, and ~450 such rows would fill the
@@ -77,17 +76,13 @@ function nextDispatchDelayMs(params: {
   return Math.max(0, Math.min(base, deadline - (params.now?.() ?? Date.now())));
 }
 
-function errorText(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
-}
-
 export async function processAgentMailIngress(params: {
   journal: AgentMailJournal;
   record: AgentMailIngressRecord;
   dispatch: AgentMailIngressDispatch;
   abortSignal?: AbortSignal;
   retryDelayMs?: (attempt: number) => number;
-  log?: AgentMailIngressLog;
+  log?: AgentMailLog;
 }): Promise<"accepted" | "duplicate"> {
   const id = createAgentMailDurableInboundId(params.record);
   // accept() throws AgentMailIngressCapacityError directly when durable ingress is full, so
@@ -249,7 +244,7 @@ export async function replayPendingAgentMailIngress(params: {
   dispatch: AgentMailIngressDispatch;
   abortSignal?: AbortSignal;
   retryDelayMs?: (attempt: number) => number;
-  log?: AgentMailIngressLog;
+  log?: AgentMailLog;
 }): Promise<void> {
   for (const pending of await params.journal.pending()) {
     if (params.abortSignal?.aborted) {

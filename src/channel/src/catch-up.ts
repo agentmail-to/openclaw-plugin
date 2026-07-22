@@ -1,5 +1,6 @@
 import type { AgentMail, AgentMailClient } from "agentmail";
 import type { PluginStateKeyedStore } from "openclaw/plugin-sdk/plugin-state-runtime";
+import { type AgentMailLog, errorText } from "./log.js";
 import { createAgentMailClient } from "./client.js";
 import { sha256Hex } from "./digest.js";
 import { AgentMailIngressCapacityError } from "./durable-receive.js";
@@ -26,11 +27,6 @@ export type AgentMailCatchUpCursor = {
   established: boolean;
 };
 
-type AgentMailCatchUpLog = {
-  info?: (message: string) => void;
-  error?: (message: string) => void;
-};
-
 export type AgentMailCatchUpSession = {
   run(params: {
     receive: (record: AgentMailIngressRecord) => Promise<void>;
@@ -54,7 +50,7 @@ export function createAgentMailCatchUpSupervisor(params: {
   receive: (record: AgentMailIngressRecord) => Promise<void>;
   abortSignal: AbortSignal;
   retryDelayMs?: (attempt: number) => number;
-  log?: AgentMailCatchUpLog;
+  log?: AgentMailLog;
 }): AgentMailCatchUpSupervisor {
   let requested = false;
   let deepRequested = false;
@@ -86,7 +82,7 @@ export function createAgentMailCatchUpSupervisor(params: {
           requested = true;
           deepRequested ||= sinceBaseline;
           params.log?.error?.(
-            `AgentMail REST catch-up failed; retrying: ${error instanceof Error ? error.message : String(error)}`,
+            `AgentMail REST catch-up failed; retrying: ${errorText(error)}`,
           );
           if (!(await waitForRetry(params.abortSignal, retryDelay(attempts)))) {
             return;
@@ -216,7 +212,7 @@ export async function createAgentMailCatchUpSession(params: {
   client?: AgentMailClient;
   store?: PluginStateKeyedStore<AgentMailCatchUpCursor>;
   now?: () => number;
-  log?: AgentMailCatchUpLog;
+  log?: AgentMailLog;
 }): Promise<AgentMailCatchUpSession> {
   const now = params.now ?? Date.now;
   const store =

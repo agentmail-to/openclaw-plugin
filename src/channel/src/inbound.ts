@@ -1,7 +1,9 @@
 import { AgentMailError, type AgentMail, type AgentMailClient } from "agentmail";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import type { PluginRuntime } from "openclaw/plugin-sdk/plugin-runtime";
+import { buildAgentSessionKey } from "openclaw/plugin-sdk/routing";
 import { htmlToMarkdown, markdownToText } from "openclaw/plugin-sdk/web-content-extractor";
+import type { AgentMailLog } from "./log.js";
 import { createAgentMailClient } from "./client.js";
 import { isAgentMailSenderAllowed, parseSingleFromMailbox } from "./mailbox.js";
 import { AgentMailMediaPolicyError, loadAgentMailInboundAttachments } from "./media.js";
@@ -23,11 +25,6 @@ export class AgentMailLabelPendingError extends Error {
   }
 }
 
-type AgentMailLog = {
-  info?: (message: string) => void;
-  warn?: (message: string) => void;
-};
-
 export type AgentMailChannelRuntime = Pick<
   PluginRuntime["channel"],
   "inbound" | "reply" | "routing" | "session"
@@ -40,6 +37,29 @@ export type AgentMailChannelRuntime = Pick<
  */
 export function buildAgentMailConversationId(inboxId: string, threadId: string): string {
   return `${inboxId}:thread:${threadId}`;
+}
+
+/**
+ * The agent session key for an AgentMail conversation. Both the inbound turn and the outbound
+ * message-tool route derive it through this one function so they resolve the SAME session.
+ *
+ * dmScope is FORCED to per-account-channel-peer: email threads must stay isolated even under the
+ * default global scope ("main"), which would otherwise collapse every direct peer to
+ * `agent:<id>:main`. This matches the runtime's own buildAgentSessionKey (the same pure function),
+ * so inbound and outbound produce identical keys.
+ */
+export function buildAgentMailSessionKey(params: {
+  agentId: string;
+  accountId?: string | null;
+  conversationId: string;
+}): string {
+  return buildAgentSessionKey({
+    agentId: params.agentId,
+    channel: CHANNEL_ID,
+    accountId: params.accountId,
+    peer: { kind: "direct", id: params.conversationId },
+    dmScope: "per-account-channel-peer",
+  });
 }
 
 export function resolveAgentMailMessageText(message: AgentMail.Message): string {
@@ -205,13 +225,10 @@ export async function dispatchAgentMailInboundEvent(params: {
     accountId: params.account.accountId,
     peer: { kind: "direct", id: conversationId },
   });
-  const sessionKey = params.channelRuntime.routing.buildAgentSessionKey({
+  const sessionKey = buildAgentMailSessionKey({
     agentId: route.agentId,
-    channel: CHANNEL_ID,
     accountId: params.account.accountId,
-    peer: { kind: "direct", id: conversationId },
-    // Email threads must remain isolated even when the global DM scope collapses direct chats.
-    dmScope: "per-account-channel-peer",
+    conversationId,
   });
 
   await params.channelRuntime.inbound.run({

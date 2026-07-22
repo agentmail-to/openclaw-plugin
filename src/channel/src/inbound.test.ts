@@ -2,6 +2,7 @@ import { AgentMailError, type AgentMail } from "agentmail";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   AgentMailLabelPendingError,
+  buildAgentMailSessionKey,
   dispatchAgentMailInboundEvent,
   resolveAgentMailMessageText,
 } from "./inbound.js";
@@ -182,11 +183,10 @@ describe("AgentMail REST-authoritative inbound", () => {
   it("hydrates positionally, keys sessions by inbox and thread, and fixes the reply target", async () => {
     const get = vi.fn(async () => message());
     const resolveAgentRoute = vi.fn(() => ({ agentId: "main", sessionKey: "session-thread-1" }));
-    const buildAgentSessionKey = vi.fn(() => "session-thread-1");
     const onTurnAdopted = vi.fn(async () => undefined);
     let turn: Record<string, unknown> | undefined;
     const channelRuntime = {
-      routing: { resolveAgentRoute, buildAgentSessionKey },
+      routing: { resolveAgentRoute },
       inbound: {
         buildContext: (ctx: Record<string, unknown>) => ctx,
         run: async ({
@@ -226,13 +226,15 @@ describe("AgentMail REST-authoritative inbound", () => {
         peer: { kind: "direct", id: "inbox_1:thread:thread_1" },
       }),
     );
-    expect(buildAgentSessionKey).toHaveBeenCalledWith({
-      agentId: "main",
-      channel: "agentmail",
-      accountId: "default",
-      peer: { kind: "direct", id: "inbox_1:thread:thread_1" },
-      dmScope: "per-account-channel-peer",
-    });
+    // The session is keyed by the shared per-thread helper — the SAME derivation the outbound
+    // message-tool route uses, so a reply resolves this exact session.
+    expect(turn?.routeSessionKey).toBe(
+      buildAgentMailSessionKey({
+        agentId: "main",
+        accountId: "default",
+        conversationId: "inbox_1:thread:thread_1",
+      }),
+    );
     const delivery = turn?.delivery as { durable: () => Record<string, unknown> };
     expect(delivery.durable()).toMatchObject({
       to: "message:message_1",

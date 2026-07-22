@@ -1,6 +1,7 @@
 import { waitUntilAbort } from "openclaw/plugin-sdk/channel-outbound";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import { registerPluginHttpRoute } from "openclaw/plugin-sdk/webhook-ingress";
+import type { AgentMailLog } from "./log.js";
 import { findConflictingAgentMailInboxOwner } from "./accounts.js";
 import {
   createAgentMailCatchUpSession,
@@ -20,12 +21,6 @@ type ActiveRoute = { path: string; unregister: () => void };
 
 const activeRoutes = new Map<string, ActiveRoute>();
 const routeOwners = new Map<string, string>();
-
-type GatewayLog = {
-  info?: (message: string) => void;
-  warn?: (message: string) => void;
-  error?: (message: string) => void;
-};
 
 // Single source of truth for AgentMail sender-authorization warnings, shared by gateway startup
 // diagnostics and the channel security surface so the two never drift.
@@ -59,7 +54,7 @@ export async function startAgentMailGatewayAccount(params: {
   account: ResolvedAgentMailAccount;
   channelRuntime: AgentMailChannelRuntime;
   abortSignal: AbortSignal;
-  log?: GatewayLog;
+  log?: AgentMailLog;
 }): Promise<void> {
   if (!params.account.enabled) {
     return await waitUntilAbort(params.abortSignal);

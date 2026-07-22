@@ -12,12 +12,12 @@ import {
   normalizeResolvedSecretInputString,
 } from "openclaw/plugin-sdk/secret-input";
 import { normalizeStringEntries } from "openclaw/plugin-sdk/string-coerce-runtime";
+import { AGENTMAIL_MEDIA_DEFAULT_MB } from "./config-schema.js";
 import { normalizeMailbox } from "./mailbox.js";
 import type { AgentMailChannelConfig, ResolvedAgentMailAccount } from "./types.js";
 
 const CHANNEL_ID = "agentmail";
 const DEFAULT_WEBHOOK_PATH = "/webhooks/agentmail";
-const DEFAULT_MEDIA_MAX_BYTES = 20 * 1024 * 1024;
 
 function getChannelConfig(cfg: OpenClawConfig): AgentMailChannelConfig | undefined {
   return cfg.channels?.[CHANNEL_ID] as AgentMailChannelConfig | undefined;
@@ -46,9 +46,15 @@ export function resolveDefaultAgentMailAccountId(cfg: OpenClawConfig): string {
 }
 
 function resolveSecret(params: { value: unknown; path: string; fallback?: string }): string {
+  // `??` only catches null/undefined, so a configured empty/whitespace string (e.g. apiKey: "")
+  // would suppress the env fallback and make the account look unconfigured. Treat it as absent.
+  const hasValue =
+    params.value !== undefined &&
+    params.value !== null &&
+    !(typeof params.value === "string" && params.value.trim() === "");
   return (
     normalizeResolvedSecretInputString({
-      value: params.value ?? params.fallback,
+      value: hasValue ? params.value : params.fallback,
       path: params.path,
     }) ?? ""
   );
@@ -87,7 +93,7 @@ export function resolveAgentMailAccount(
   const mediaMaxMb =
     typeof merged.mediaMaxMb === "number" && Number.isFinite(merged.mediaMaxMb)
       ? merged.mediaMaxMb
-      : DEFAULT_MEDIA_MAX_BYTES / (1024 * 1024);
+      : AGENTMAIL_MEDIA_DEFAULT_MB;
   const configuredPath = merged.webhookPath?.trim();
   const apiVal = resolveSecret({
     value: merged.apiKey,

@@ -6,6 +6,7 @@ import type {
   ChannelMessageUnknownSendReconciliationResult,
 } from "openclaw/plugin-sdk/channel-outbound";
 import { LocalMediaAccessError } from "openclaw/plugin-sdk/web-media";
+import { errorText } from "./log.js";
 import { resolveAgentMailAccount } from "./accounts.js";
 import { createAgentMailClient } from "./client.js";
 import { sha256Hex } from "./digest.js";
@@ -250,6 +251,12 @@ export async function reconcileAgentMailUnknownSend(
   if (mediaUrls.length > 0) {
     recoveredPayload.mediaUrls = mediaUrls;
   }
+  if (!text.trim() && mediaUrls.length === 0) {
+    // The recovered reply has neither text nor media. sendBoundAgentMailReply would reject this as a
+    // hard error; during reconciliation it simply means nothing was ever sendable, so report a
+    // structured verdict instead of letting the guard throw out of the reconciler.
+    return { status: "not_sent" };
+  }
   let result;
   try {
     result = await sendBoundAgentMailReply(
@@ -273,7 +280,7 @@ export async function reconcileAgentMailUnknownSend(
     if (isHostLocalMediaFailure(error)) {
       return {
         status: "unresolved",
-        error: error instanceof Error ? error.message : String(error),
+        error: errorText(error),
         retryable: true,
       };
     }

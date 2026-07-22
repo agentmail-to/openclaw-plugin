@@ -1,18 +1,30 @@
-import { buildChannelOutboundSessionRoute } from "openclaw/plugin-sdk/channel-core";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import { resolveAgentMailAccount } from "./accounts.js";
-import { buildAgentMailConversationId } from "./inbound.js";
+import { buildAgentMailConversationId, buildAgentMailSessionKey } from "./inbound.js";
 import { normalizeAgentMailTarget } from "./send.js";
 
-const CHANNEL_ID = "agentmail";
+type AgentMailOutboundSessionRoute = {
+  sessionKey: string;
+  baseSessionKey: string;
+  recipientSessionExact: boolean;
+  peer: { kind: "direct"; id: string };
+  chatType: "direct";
+  from: string;
+  to: string;
+};
 
 /**
- * Resolves the session route for an outbound message-tool reply. Keys the session by inbox + thread
- * with the same shape the inbound turn uses (see buildAgentMailConversationId), so a message-tool
- * reply resolves the SAME session the inbound turn runs in instead of a divergent per-message
- * session. Core supplies the active turn's threadId; when none is known the message target is used
- * as a fallback (a would-be proactive send, which the reply adapter then rejects). Returns null for
- * a non-AgentMail target so core can fall back to its default routing.
+ * Resolves the session route for an outbound message-tool reply. Keys the session by the SAME
+ * inbox:thread conversation id and forced dmScope the inbound turn uses (see buildAgentMailSessionKey),
+ * so a reply resolves the isolated per-thread session the inbound turn runs in.
+ *
+ * The route is built directly rather than through the SDK's buildChannelOutboundSessionRoute, whose
+ * base key applies `cfg.session.dmScope ?? "main"` — under the default scope that would collapse the
+ * conversation to `agent:<id>:main`, discarding the per-thread isolation.
+ *
+ * Core supplies the active turn's threadId; when none is known the message target is used as the
+ * conversation id (a would-be proactive send, which the reply adapter then rejects). Returns null
+ * for a non-AgentMail target so core falls back to its default routing.
  *
  * Extracted from the channel definition so it can be unit-tested directly.
  */
@@ -23,7 +35,7 @@ export function resolveAgentMailOutboundSessionRoute(params: {
   target?: string;
   resolvedTarget?: { to: string };
   threadId?: string | number | null;
-}): ReturnType<typeof buildChannelOutboundSessionRoute> | null {
+}): AgentMailOutboundSessionRoute | null {
   const target = normalizeAgentMailTarget(params.resolvedTarget?.to ?? params.target);
   if (!target) {
     return null;
@@ -33,18 +45,22 @@ export function resolveAgentMailOutboundSessionRoute(params: {
     params.threadId === undefined || params.threadId === null || params.threadId === ""
       ? undefined
       : String(params.threadId);
+  // Thread is encoded in the conversation id (matching inbound), so the session key stays flat — no
+  // separate route threadId that could add a divergent thread suffix.
   const conversationId =
     inboxId && threadId ? buildAgentMailConversationId(inboxId, threadId) : target;
-  return buildChannelOutboundSessionRoute({
-    cfg: params.cfg,
+  const sessionKey = buildAgentMailSessionKey({
     agentId: params.agentId,
-    channel: CHANNEL_ID,
     accountId: params.accountId,
+    conversationId,
+  });
+  return {
+    sessionKey,
+    baseSessionKey: sessionKey,
     recipientSessionExact: true,
     peer: { kind: "direct", id: conversationId },
     chatType: "direct",
     from: `agentmail:${conversationId}`,
     to: target,
-    ...(threadId ? { threadId } : {}),
-  });
+  };
 }

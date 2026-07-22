@@ -1,3 +1,4 @@
+import { errorText } from "./log.js";
 import { createAgentMailClient } from "./client.js";
 import type { ResolvedAgentMailAccount } from "./types.js";
 
@@ -23,7 +24,7 @@ export async function probeAgentMailAccount(params: {
       ok: false,
       inboxId: params.account.inboxId,
       ingressMode: params.account.webhookSecret ? "webhook" : "websocket",
-      error: error instanceof Error ? error.message : String(error),
+      error: errorText(error),
     };
   }
 }

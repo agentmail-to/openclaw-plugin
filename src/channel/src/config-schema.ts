@@ -7,7 +7,9 @@ import { buildSecretInputSchema } from "openclaw/plugin-sdk/secret-input";
 // (buildChannelConfigSchema); mixing a second zod copy triggers structural type mismatches.
 import { z } from "openclaw/plugin-sdk/zod";
 
-// Documented upper bound for the per-message media buffer (MiB).
+// Per-message media buffer limits (MiB), co-located: the default applied when unset, and the
+// documented upper bound the schema enforces.
+export const AGENTMAIL_MEDIA_DEFAULT_MB = 20;
 export const AGENTMAIL_MEDIA_MAX_MB = 100;
 
 const SecretInputSchema = buildSecretInputSchema();
