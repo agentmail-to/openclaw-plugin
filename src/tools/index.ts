@@ -65,7 +65,16 @@ const messageLocationFields = {
 };
 
 function parseDate(value: string | undefined): Date | undefined {
-  return value ? new Date(value) : undefined;
+  if (!value) {
+    return undefined;
+  }
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    // Fail fast with a clear message instead of passing an Invalid Date into the SDK, which would
+    // otherwise surface later as an opaque RangeError.
+    throw new Error(`Invalid ISO 8601 timestamp: ${JSON.stringify(value)}`);
+  }
+  return date;
 }
 
 export default defineToolPlugin({

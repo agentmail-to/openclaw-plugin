@@ -1,7 +1,7 @@
 {
-  "name": "openclaw-plugin-agentmail",
+  "name": "@openclaw/agentmail",
   "version": "0.1.0",
-  "description": "AgentMail inbox and email tools for OpenClaw agents.",
+  "description": "AgentMail for OpenClaw: email tools plus a durable, allowlisted, reply-only email channel.",
   "type": "module",
   "private": false,
   "license": "MIT",
@@ -14,17 +14,18 @@
     "agentmail",
     "openclaw",
     "email",
-    "ai-agent"
+    "ai-agent",
+    "channel"
   ],
   "engines": {
     "node": ">=22.22.3 <23 || >=24.15.0 <25 || >=25.9.0"
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "plugin:build": "npm run build && openclaw plugins build --entry ./dist/index.js",
-    "plugin:check": "openclaw plugins build --entry ./dist/index.js --check",
-    "plugin:validate": "npm run build && openclaw plugins validate --entry ./dist/index.js",
-    "prepack": "npm run plugin:build",
+    "plugin:build": "npm run build && node scripts/build-manifest.mjs",
+    "plugin:check": "node scripts/build-manifest.mjs --check",
+    "plugin:validate": "npm run build && node scripts/build-manifest.mjs --check && node scripts/validate-plugin.mjs",
+    "prepack": "npm run plugin:validate",
     "test": "vitest run --config ./vitest.config.ts"
   },
   "files": [
@@ -33,20 +34,43 @@
     "README.md"
   ],
   "peerDependencies": {
-    "openclaw": ">=2026.5.17"
+    "openclaw": ">=2026.7.2-beta.3"
   },
   "dependencies": {
     "agentmail": "^0.5.16",
-    "typebox": "^1.1.38"
+    "svix": "^1.96.1",
+    "typebox": "^1.1.38",
+    "zod": "^4.4.3"
   },
   "devDependencies": {
-    "openclaw": "latest",
+    "openclaw": "2026.7.2-beta.3",
     "typescript": "^5.9.0",
     "vitest": "^3.2.0"
   },
   "openclaw": {
     "extensions": [
-      "./dist/index.js"
-    ]
+      "./dist/tools/index.js",
+      "./dist/channel/index.js"
+    ],
+    "channel": {
+      "id": "agentmail",
+      "label": "AgentMail",
+      "selectionLabel": "AgentMail (Email)",
+      "detailLabel": "AgentMail Email",
+      "docsPath": "/channels/agentmail",
+      "docsLabel": "agentmail",
+      "blurb": "Durable, allowlisted, reply-only email conversations through AgentMail.",
+      "order": 89,
+      "quickstartAllowFrom": true
+    },
+    "compat": {
+      "pluginApi": ">=2026.7.2-beta.3"
+    },
+    "install": {
+      "npmSpec": "@openclaw/agentmail",
+      "defaultChoice": "npm",
+      "minHostVersion": ">=2026.7.2-beta.3",
+      "allowInvalidConfigRecovery": true
+    }
   }
 }

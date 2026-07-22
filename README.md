@@ -1,11 +1,14 @@
 # AgentMail for OpenClaw
 
-Give an OpenClaw agent an email address with [AgentMail](https://www.agentmail.to/). This native tool plugin can create inboxes, read and search messages, send new email, reply and forward within threads, and manage message labels.
+Give an OpenClaw agent an email address with [AgentMail](https://www.agentmail.to/). This package ships **two capabilities in one plugin**:
+
+- **Email tools** — the agent can create inboxes and read, search, send, reply, forward, and label email on demand.
+- **An email channel** — a durable, allowlisted, **reply-only** email channel. Inbound email drives agent turns; the agent replies within the AgentMail thread. Ingress is committed durably before acknowledgement, senders are authorized against a default-deny allowlist, and replies stay bound to the triggering message (`replyAll: false`, no proactive threads, no arbitrary recipients).
 
 ## Requirements
 
 - Node.js 22.22.3+, 24.15+, or 25.9+
-- OpenClaw 2026.5.17 or newer
+- OpenClaw 2026.7.2 (beta) or newer
 - An AgentMail API key from the [AgentMail console](https://console.agentmail.to/)
 
 ## Install
@@ -23,7 +26,9 @@ For development, use `openclaw plugins install --link .` so OpenClaw loads this 
 
 ## Configure
 
-Set `AGENTMAIL_API_KEY` in the environment that runs the OpenClaw Gateway. OpenClaw can scope it to this plugin in `~/.openclaw/openclaw.json`:
+Set `AGENTMAIL_API_KEY` in the environment that runs the OpenClaw Gateway. To enable **webhook** ingress for the channel, also set `AGENTMAIL_WEBHOOK_SECRET` (Svix-signed); without it the channel falls back to WebSocket ingress.
+
+OpenClaw can scope the secrets to this plugin in `~/.openclaw/openclaw.json`:
 
 ```json5
 {
@@ -33,6 +38,7 @@ Set `AGENTMAIL_API_KEY` in the environment that runs the OpenClaw Gateway. OpenC
         enabled: true,
         env: {
           AGENTMAIL_API_KEY: "am_...",
+          AGENTMAIL_WEBHOOK_SECRET: "whsec_...", // optional; enables webhook ingress
         },
       },
     },
@@ -40,14 +46,21 @@ Set `AGENTMAIL_API_KEY` in the environment that runs the OpenClaw Gateway. OpenC
 }
 ```
 
-Keep the key out of source control. Restart the Gateway after installing or changing configuration:
+Keep keys out of source control. Restart the Gateway after installing or changing configuration:
 
 ```bash
 openclaw gateway restart
 openclaw plugins inspect agentmail --runtime
 ```
 
-Optional SDK settings belong under `plugins.entries.agentmail.config`:
+### Tool config (optional SDK settings)
+
+> **Credentials:** the email **tools** authenticate only with the `AGENTMAIL_API_KEY` environment
+> variable, while the **channel** can also take an inline or resolved `apiKey` in `channels.agentmail`.
+> Always set `AGENTMAIL_API_KEY` in the Gateway environment so both surfaces are configured; a
+> channel-only inline key leaves the tools reporting AgentMail as unconfigured.
+
+Optional AgentMail SDK settings for the **tools** belong under `plugins.entries.agentmail.config`:
 
 ```json5
 {
@@ -64,6 +77,31 @@ Optional SDK settings belong under `plugins.entries.agentmail.config`:
   },
 }
 ```
+
+### Channel config
+
+The **channel** is configured under `channels.agentmail` (single inbox) or `channels.agentmail.accounts.<id>` (multiple):
+
+```json5
+{
+  channels: {
+    agentmail: {
+      apiKey: { source: "env", provider: "agentmail", id: "AGENTMAIL_API_KEY" },
+      inboxId: "agent@agentmail.to",
+      webhookSecret: { source: "env", provider: "agentmail", id: "AGENTMAIL_WEBHOOK_SECRET" },
+      dmPolicy: "allowlist",       // default; an empty allowFrom denies every sender
+      allowFrom: ["person@example.com"],
+      mediaMaxMb: 20,
+    },
+  },
+}
+```
+
+Security defaults worth knowing:
+
+- `dmPolicy` defaults to `allowlist`. With an empty `allowFrom`, **every sender is denied**.
+- `dmPolicy: "open"` requires `allowFrom` to include `"*"`.
+- Every reply re-hydrates the triggering message and re-authorizes its `From`, so an untrusted `Reply-To` cannot redirect delivery.
 
 ## Tools
 
@@ -85,12 +123,13 @@ Send, reply, and forward accept an optional `idempotencyKey` to make retries saf
 
 ```bash
 npm install
-npm run plugin:build
-npm run plugin:validate
-npm test
+npm run build          # tsc
+npm run plugin:build   # build + regenerate openclaw.plugin.json
+npm run plugin:check   # fail if the manifest is stale
+npm test               # vitest
 ```
 
-`plugin:build` compiles TypeScript and regenerates `openclaw.plugin.json`. Commit manifest changes whenever tool metadata or plugin configuration changes.
+`plugin:build` compiles TypeScript and regenerates `openclaw.plugin.json` (tool metadata + channel declarations) via `scripts/build-manifest.mjs`. Commit manifest changes whenever tool metadata or the channel config schema changes.
 
 ## License
 

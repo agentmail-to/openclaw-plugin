@@ -1,7 +1,7 @@
 {
   "id": "agentmail",
   "name": "AgentMail",
-  "description": "Create AgentMail inboxes and send, receive, search, and manage email.",
+  "description": "AgentMail for OpenClaw: email tools plus a durable, allowlisted, reply-only email channel.",
   "version": "0.1.0",
   "configSchema": {
     "type": "object",
@@ -28,6 +28,465 @@
   },
   "activation": {
     "onStartup": true
+  },
+  "channels": [
+    "agentmail"
+  ],
+  "channelEnvVars": {
+    "agentmail": [
+      "AGENTMAIL_API_KEY",
+      "AGENTMAIL_WEBHOOK_SECRET"
+    ]
+  },
+  "channelConfigs": {
+    "agentmail": {
+      "schema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "apiKey": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "oneOf": [
+                  {
+                    "type": "object",
+                    "properties": {
+                      "source": {
+                        "type": "string",
+                        "const": "env"
+                      },
+                      "provider": {
+                        "type": "string",
+                        "pattern": "^[a-z][a-z0-9_-]{0,63}$"
+                      },
+                      "id": {
+                        "type": "string",
+                        "pattern": "^[A-Z][A-Z0-9_]{0,127}$"
+                      }
+                    },
+                    "required": [
+                      "source",
+                      "provider",
+                      "id"
+                    ],
+                    "additionalProperties": false
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "source": {
+                        "type": "string",
+                        "const": "file"
+                      },
+                      "provider": {
+                        "type": "string",
+                        "pattern": "^[a-z][a-z0-9_-]{0,63}$"
+                      },
+                      "id": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "source",
+                      "provider",
+                      "id"
+                    ],
+                    "additionalProperties": false
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "source": {
+                        "type": "string",
+                        "const": "exec"
+                      },
+                      "provider": {
+                        "type": "string",
+                        "pattern": "^[a-z][a-z0-9_-]{0,63}$"
+                      },
+                      "id": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "source",
+                      "provider",
+                      "id"
+                    ],
+                    "additionalProperties": false
+                  }
+                ]
+              }
+            ]
+          },
+          "inboxId": {
+            "type": "string",
+            "minLength": 1
+          },
+          "webhookSecret": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "oneOf": [
+                  {
+                    "type": "object",
+                    "properties": {
+                      "source": {
+                        "type": "string",
+                        "const": "env"
+                      },
+                      "provider": {
+                        "type": "string",
+                        "pattern": "^[a-z][a-z0-9_-]{0,63}$"
+                      },
+                      "id": {
+                        "type": "string",
+                        "pattern": "^[A-Z][A-Z0-9_]{0,127}$"
+                      }
+                    },
+                    "required": [
+                      "source",
+                      "provider",
+                      "id"
+                    ],
+                    "additionalProperties": false
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "source": {
+                        "type": "string",
+                        "const": "file"
+                      },
+                      "provider": {
+                        "type": "string",
+                        "pattern": "^[a-z][a-z0-9_-]{0,63}$"
+                      },
+                      "id": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "source",
+                      "provider",
+                      "id"
+                    ],
+                    "additionalProperties": false
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "source": {
+                        "type": "string",
+                        "const": "exec"
+                      },
+                      "provider": {
+                        "type": "string",
+                        "pattern": "^[a-z][a-z0-9_-]{0,63}$"
+                      },
+                      "id": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "source",
+                      "provider",
+                      "id"
+                    ],
+                    "additionalProperties": false
+                  }
+                ]
+              }
+            ]
+          },
+          "webhookPath": {
+            "type": "string"
+          },
+          "dmPolicy": {
+            "type": "string",
+            "enum": [
+              "allowlist",
+              "open",
+              "disabled"
+            ]
+          },
+          "allowFrom": {
+            "type": "array",
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "number"
+                }
+              ]
+            }
+          },
+          "mediaMaxMb": {
+            "type": "number",
+            "exclusiveMinimum": 0,
+            "maximum": 100
+          },
+          "accounts": {
+            "type": "object",
+            "propertyNames": {
+              "type": "string"
+            },
+            "additionalProperties": {
+              "type": "object",
+              "properties": {
+                "name": {
+                  "type": "string"
+                },
+                "enabled": {
+                  "type": "boolean"
+                },
+                "apiKey": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "oneOf": [
+                        {
+                          "type": "object",
+                          "properties": {
+                            "source": {
+                              "type": "string",
+                              "const": "env"
+                            },
+                            "provider": {
+                              "type": "string",
+                              "pattern": "^[a-z][a-z0-9_-]{0,63}$"
+                            },
+                            "id": {
+                              "type": "string",
+                              "pattern": "^[A-Z][A-Z0-9_]{0,127}$"
+                            }
+                          },
+                          "required": [
+                            "source",
+                            "provider",
+                            "id"
+                          ],
+                          "additionalProperties": false
+                        },
+                        {
+                          "type": "object",
+                          "properties": {
+                            "source": {
+                              "type": "string",
+                              "const": "file"
+                            },
+                            "provider": {
+                              "type": "string",
+                              "pattern": "^[a-z][a-z0-9_-]{0,63}$"
+                            },
+                            "id": {
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "source",
+                            "provider",
+                            "id"
+                          ],
+                          "additionalProperties": false
+                        },
+                        {
+                          "type": "object",
+                          "properties": {
+                            "source": {
+                              "type": "string",
+                              "const": "exec"
+                            },
+                            "provider": {
+                              "type": "string",
+                              "pattern": "^[a-z][a-z0-9_-]{0,63}$"
+                            },
+                            "id": {
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "source",
+                            "provider",
+                            "id"
+                          ],
+                          "additionalProperties": false
+                        }
+                      ]
+                    }
+                  ]
+                },
+                "inboxId": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "webhookSecret": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "oneOf": [
+                        {
+                          "type": "object",
+                          "properties": {
+                            "source": {
+                              "type": "string",
+                              "const": "env"
+                            },
+                            "provider": {
+                              "type": "string",
+                              "pattern": "^[a-z][a-z0-9_-]{0,63}$"
+                            },
+                            "id": {
+                              "type": "string",
+                              "pattern": "^[A-Z][A-Z0-9_]{0,127}$"
+                            }
+                          },
+                          "required": [
+                            "source",
+                            "provider",
+                            "id"
+                          ],
+                          "additionalProperties": false
+                        },
+                        {
+                          "type": "object",
+                          "properties": {
+                            "source": {
+                              "type": "string",
+                              "const": "file"
+                            },
+                            "provider": {
+                              "type": "string",
+                              "pattern": "^[a-z][a-z0-9_-]{0,63}$"
+                            },
+                            "id": {
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "source",
+                            "provider",
+                            "id"
+                          ],
+                          "additionalProperties": false
+                        },
+                        {
+                          "type": "object",
+                          "properties": {
+                            "source": {
+                              "type": "string",
+                              "const": "exec"
+                            },
+                            "provider": {
+                              "type": "string",
+                              "pattern": "^[a-z][a-z0-9_-]{0,63}$"
+                            },
+                            "id": {
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "source",
+                            "provider",
+                            "id"
+                          ],
+                          "additionalProperties": false
+                        }
+                      ]
+                    }
+                  ]
+                },
+                "webhookPath": {
+                  "type": "string"
+                },
+                "dmPolicy": {
+                  "type": "string",
+                  "enum": [
+                    "allowlist",
+                    "open",
+                    "disabled"
+                  ]
+                },
+                "allowFrom": {
+                  "type": "array",
+                  "items": {
+                    "anyOf": [
+                      {
+                        "type": "string"
+                      },
+                      {
+                        "type": "number"
+                      }
+                    ]
+                  }
+                },
+                "mediaMaxMb": {
+                  "type": "number",
+                  "exclusiveMinimum": 0,
+                  "maximum": 100
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          "defaultAccount": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
+      },
+      "label": "AgentMail",
+      "description": "AgentMail for OpenClaw: email tools plus a durable, allowlisted, reply-only email channel.",
+      "uiHints": {
+        "": {
+          "label": "AgentMail",
+          "help": "Durable AgentMail channel with verified webhook or WebSocket ingress and reply-only delivery."
+        },
+        "apiKey": {
+          "label": "AgentMail API Key",
+          "sensitive": true
+        },
+        "inboxId": {
+          "label": "AgentMail Inbox ID"
+        },
+        "webhookSecret": {
+          "label": "AgentMail Webhook Secret",
+          "help": "When present, enables webhook ingress. Omit it to use WebSocket ingress.",
+          "sensitive": true
+        },
+        "webhookPath": {
+          "label": "AgentMail Webhook Path"
+        },
+        "dmPolicy": {
+          "label": "AgentMail DM Policy",
+          "help": "Defaults to \"allowlist\". Empty allowFrom denies every sender."
+        },
+        "allowFrom": {
+          "label": "AgentMail Allow From",
+          "help": "Exact normalized mailbox addresses, or \"*\" only with dmPolicy=\"open\"."
+        },
+        "mediaMaxMb": {
+          "label": "AgentMail Media Limit (MiB)"
+        }
+      }
+    }
   },
   "contracts": {
     "tools": [
