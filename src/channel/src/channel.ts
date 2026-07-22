@@ -3,11 +3,7 @@ import {
   createHybridChannelConfigAdapter,
   createScopedDmSecurityResolver,
 } from "openclaw/plugin-sdk/channel-config-helpers";
-import {
-  buildChannelOutboundSessionRoute,
-  createChatChannelPlugin,
-  type ChannelPlugin,
-} from "openclaw/plugin-sdk/channel-core";
+import { createChatChannelPlugin, type ChannelPlugin } from "openclaw/plugin-sdk/channel-core";
 import { defineChannelMessageAdapter } from "openclaw/plugin-sdk/channel-outbound";
 import { createEmptyChannelDirectoryAdapter } from "openclaw/plugin-sdk/directory-runtime";
 import {
@@ -23,8 +19,9 @@ import {
   collectAgentMailStartupWarnings,
   startAgentMailGatewayAccount,
 } from "./gateway.js";
-import { buildAgentMailConversationId, type AgentMailChannelRuntime } from "./inbound.js";
+import type { AgentMailChannelRuntime } from "./inbound.js";
 import { normalizeMailbox } from "./mailbox.js";
+import { resolveAgentMailOutboundSessionRoute } from "./outbound-route.js";
 import { collectRuntimeConfigAssignments, secretTargetRegistryEntries } from "./secret-contract.js";
 import {
   normalizeAgentMailTarget,
@@ -129,36 +126,7 @@ export const agentMailPlugin: ChannelPlugin<ResolvedAgentMailAccount, AgentMailP
       messaging: {
         targetPrefixes: ["message"],
         normalizeTarget: (raw) => normalizeAgentMailTarget(raw) ?? undefined,
-        resolveOutboundSessionRoute: (params) => {
-          const target = normalizeAgentMailTarget(params.resolvedTarget?.to ?? params.target);
-          if (!target) {
-            return null;
-          }
-          // Key the outbound session by inbox + thread with the same shape the inbound turn uses
-          // (see buildAgentMailConversationId in inbound.ts), so a message-tool reply resolves the
-          // SAME session the inbound turn runs in instead of a divergent per-message session. Core
-          // provides the active turn's threadId here; fall back to the message target only when no
-          // thread is known (e.g. a would-be proactive send, which the reply adapter then rejects).
-          const inboxId = resolveAgentMailAccount(params.cfg, params.accountId).inboxId;
-          const threadId =
-            params.threadId === undefined || params.threadId === null || params.threadId === ""
-              ? undefined
-              : String(params.threadId);
-          const conversationId =
-            inboxId && threadId ? buildAgentMailConversationId(inboxId, threadId) : target;
-          return buildChannelOutboundSessionRoute({
-            cfg: params.cfg,
-            agentId: params.agentId,
-            channel: CHANNEL_ID,
-            accountId: params.accountId,
-            recipientSessionExact: true,
-            peer: { kind: "direct", id: conversationId },
-            chatType: "direct",
-            from: `agentmail:${conversationId}`,
-            to: target,
-            ...(threadId ? { threadId } : {}),
-          });
-        },
+        resolveOutboundSessionRoute: (params) => resolveAgentMailOutboundSessionRoute(params),
         targetResolver: {
           looksLikeId: (value) => normalizeAgentMailTarget(value) !== null,
           hint: "message:<messageId>",
