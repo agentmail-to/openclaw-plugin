@@ -32,6 +32,12 @@
   "channels": [
     "agentmail"
   ],
+  "channelEnvVars": {
+    "agentmail": [
+      "AGENTMAIL_API_KEY",
+      "AGENTMAIL_WEBHOOK_SECRET"
+    ]
+  },
   "channelConfigs": {
     "agentmail": {
       "schema": {

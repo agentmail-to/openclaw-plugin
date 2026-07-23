@@ -1,5 +1,5 @@
 {
-  "name": "@openclaw/agentmail",
+  "name": "@agentmail/agentmail",
   "version": "0.1.0",
   "description": "AgentMail for OpenClaw: email tools plus a durable, allowlisted, reply-only email channel.",
   "type": "module",
@@ -63,10 +63,15 @@
       "quickstartAllowFrom": true
     },
     "compat": {
-      "pluginApi": ">=2026.7.2-beta.3"
+      "pluginApi": ">=2026.7.2-beta.3",
+      "minGatewayVersion": "2026.7.2-beta.3"
+    },
+    "build": {
+      "openclawVersion": "2026.7.2-beta.3",
+      "pluginSdkVersion": "2026.7.2-beta.3"
     },
     "install": {
-      "npmSpec": "@openclaw/agentmail",
+      "npmSpec": "@agentmail/agentmail",
       "defaultChoice": "npm",
       "minHostVersion": ">=2026.7.2-beta.3",
       "allowInvalidConfigRecovery": true
