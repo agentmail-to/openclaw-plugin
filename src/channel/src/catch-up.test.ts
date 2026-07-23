@@ -263,6 +263,35 @@ describe("AgentMail durable REST catch-up", () => {
     );
   });
 
+  it("does not invert baseline catch-up bounds when the clock moves backward", async () => {
+    const store = memoryStore<never>();
+    const list = vi.fn(async () => ({ count: 0, messages: [] }));
+    let nowMs = 2_000_000;
+    const session = await createAgentMailCatchUpSession({
+      account,
+      client: { inboxes: { messages: { list } } } as never,
+      store: store as never,
+      now: () => nowMs,
+    });
+    nowMs = 1_000_000;
+
+    await session.run({ receive: vi.fn(), abortSignal: new AbortController().signal });
+    await session.run({
+      receive: vi.fn(),
+      abortSignal: new AbortController().signal,
+      sinceBaseline: true,
+    });
+
+    for (const [, query] of list.mock.calls) {
+      expect(query).toEqual(
+        expect.objectContaining({
+          after: new Date(nowMs),
+          before: new Date(nowMs + 1),
+        }),
+      );
+    }
+  });
+
   it("clamps a future message timestamp before advancing the high-water cursor", async () => {
     const store = memoryStore<never>();
     const nowMs = 1_000_000;

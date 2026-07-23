@@ -108,6 +108,56 @@ describe("AgentMail durable ingress", () => {
     expect(pendingRows).toHaveLength(3);
   });
 
+  it("resynchronizes capacity after accept persists a row and then throws", async () => {
+    const pendingRows = new Map<string, { id: string; payload: AgentMailIngressRecord }>();
+    let failAfterPersist = true;
+    const journal = withAgentMailIngressCapacity(
+      {
+        accept: vi.fn(async (id: string, payload: AgentMailIngressRecord) => {
+          const existing = pendingRows.get(id);
+          if (existing) {
+            return {
+              kind: "pending",
+              duplicate: true,
+              record: { ...existing, attempts: 0 },
+            };
+          }
+          const accepted = { id, payload };
+          pendingRows.set(id, accepted);
+          if (id === "message_3" && failAfterPersist) {
+            failAfterPersist = false;
+            throw new Error("post-enqueue prune failed");
+          }
+          return { kind: "accepted", duplicate: false, record: accepted };
+        }),
+        pending: vi.fn(async () =>
+          [...pendingRows.values()].map((item) => ({ ...item, attempts: 0 })),
+        ),
+        complete: vi.fn(),
+        release: vi.fn(),
+        deletePending: vi.fn(async (id: string) => pendingRows.delete(id)),
+      } as never,
+      3,
+      `partial-admission-test-${crypto.randomUUID()}`,
+    );
+
+    await journal.accept("message_1", record);
+    await journal.accept("message_2", record);
+    await expect(journal.accept("message_3", record)).rejects.toThrow(
+      "post-enqueue prune failed",
+    );
+    // Duplicate redelivery does not consume capacity and must remain dispatchable.
+    await expect(journal.accept("message_3", record)).resolves.toMatchObject({
+      kind: "pending",
+    });
+    // The next new row forces a durable recount, rolls itself back, and preserves the cap.
+    await expect(journal.accept("message_4", record)).rejects.toBeInstanceOf(
+      AgentMailIngressCapacityError,
+    );
+    expect(pendingRows).toHaveLength(3);
+    expect(pendingRows.has("message_4")).toBe(false);
+  });
+
   it("keeps an overflow row retryable when rollback deletion fails", async () => {
     const id = createAgentMailDurableInboundId(record);
     const fail = vi.fn(async () => true);

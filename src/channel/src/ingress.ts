@@ -307,6 +307,11 @@ async function dispatchAgentMailIngressUntilSettled(params: DispatchParams): Pro
           return false;
         }
         if (outcome === "completion-failed") {
+          // Core may already have adopted the turn, but neither the completion marker nor the
+          // terminal failure marker could be written. Leaving the row pending preserves recovery;
+          // without any durable marker, a restart cannot distinguish adoption from non-adoption
+          // and may replay the turn. That duplicate window is unavoidable during a total marker
+          // store outage.
           return false;
         }
         turnAbandoned = true;

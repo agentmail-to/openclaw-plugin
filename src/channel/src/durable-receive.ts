@@ -48,6 +48,21 @@ type AgentMailCapacityAdmissionState = {
 // storage identity, rather than coordinating only calls made through one facade.
 const capacityAdmissionStates = new Map<string, AgentMailCapacityAdmissionState>();
 
+function resolveCapacityAdmissionState(
+  coordinationKey: string | undefined,
+): AgentMailCapacityAdmissionState {
+  if (!coordinationKey) {
+    return { admissionChain: Promise.resolve(), pendingEstimate: null };
+  }
+  const existing = capacityAdmissionStates.get(coordinationKey);
+  if (existing) {
+    return existing;
+  }
+  const created = { admissionChain: Promise.resolve(), pendingEstimate: null };
+  capacityAdmissionStates.set(coordinationKey, created);
+  return created;
+}
+
 /**
  * Wraps the store-backed journal with an admission cap. The published SDK's queue journal only
  * evicts on capacity; durable email must instead reject NEW mail while keeping already-accepted
@@ -64,18 +79,7 @@ export function withAgentMailIngressCapacity(
   // every facade for the queue; the chain never rejects so one failed admission cannot poison
   // later ones. This intentionally introduces brief head-of-line coupling for facades sharing one
   // queue; each critical section contains only the queue admission and occasional capacity scan.
-  const state = coordinationKey
-    ? (capacityAdmissionStates.get(coordinationKey) ?? {
-        admissionChain: Promise.resolve(),
-        pendingEstimate: null,
-      })
-    : {
-        admissionChain: Promise.resolve(),
-        pendingEstimate: null,
-      };
-  if (coordinationKey && !capacityAdmissionStates.has(coordinationKey)) {
-    capacityAdmissionStates.set(coordinationKey, state);
-  }
+  const state = resolveCapacityAdmissionState(coordinationKey);
   // Upper-bound estimate of the pending count. It only increases on new admissions (never on
   // completion/retention pruning), so the O(pending) scan is skipped on the common below-cap path
   // and only runs to re-sync from the source of truth when the estimate first reaches the cap.
@@ -83,34 +87,44 @@ export function withAgentMailIngressCapacity(
     ...journal,
     accept: (id, payload, options) => {
       const admission = state.admissionChain.then(async () => {
-        const accepted = await journal.accept(id, payload, options);
-        // Let the queue perform its atomic id lookup first. Completed tombstones and pending
-        // duplicates consume no new capacity and must remain harmless even while the queue is full.
-        if (accepted.kind !== "accepted") {
-          return accepted;
-        }
-        if (
-          state.pendingEstimate === null ||
-          state.pendingEstimate >= maxPendingEntries
-        ) {
-          const pending = await journal.pending();
-          state.pendingEstimate = pending.length;
-          if (state.pendingEstimate > maxPendingEntries) {
-            try {
-              if (await journal.deletePending(id)) {
-                state.pendingEstimate -= 1;
-              }
-            } catch {
-              // Never turn a capacity rejection into a terminal tombstone. If rollback deletion is
-              // temporarily unavailable, preserve the accepted pending row: provider redelivery or
-              // REST catch-up re-admits that duplicate and dispatches it once capacity recovers.
-            }
-            throw new AgentMailIngressCapacityError();
+        try {
+          const accepted = await journal.accept(id, payload, options);
+          // Let the queue perform its atomic id lookup first. Completed tombstones and pending
+          // duplicates consume no new capacity and must remain harmless even while the queue is
+          // full.
+          if (accepted.kind !== "accepted") {
+            return accepted;
           }
-        } else {
-          state.pendingEstimate += 1;
+          if (
+            state.pendingEstimate === null ||
+            state.pendingEstimate >= maxPendingEntries
+          ) {
+            const pending = await journal.pending();
+            state.pendingEstimate = pending.length;
+            if (state.pendingEstimate > maxPendingEntries) {
+              try {
+                if (await journal.deletePending(id)) {
+                  state.pendingEstimate -= 1;
+                }
+              } catch {
+                // Never turn a capacity rejection into a terminal tombstone. If rollback deletion
+                // is temporarily unavailable, preserve the accepted pending row: provider
+                // redelivery or REST catch-up re-admits that duplicate and dispatches it once
+                // capacity recovers.
+              }
+              throw new AgentMailIngressCapacityError();
+            }
+          } else {
+            state.pendingEstimate += 1;
+          }
+          return accepted;
+        } catch (error) {
+          // accept() may persist the row and then fail during its post-enqueue retention prune.
+          // Any failure after entering the critical section makes the cached count uncertain; force
+          // the next new admission to resynchronize from durable storage.
+          state.pendingEstimate = null;
+          throw error;
         }
-        return accepted;
       });
       state.admissionChain = admission.then(
         () => undefined,

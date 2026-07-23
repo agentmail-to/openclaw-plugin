@@ -261,7 +261,12 @@ export async function createAgentMailCatchUpSession(params: {
         sinceBaseline || !storedCursor.established
           ? storedCursor.baselineAtMs
           : effectiveHighWaterAtMs - AGENTMAIL_REST_CATCH_UP_OVERLAP_MS;
-      const afterMs = Math.max(0, baseAfterMs, dedupeFloorMs);
+      // A backward clock can put a persisted baseline ahead of this run. Keep the stored baseline
+      // unchanged for cursor state, but never send the provider an inverted after/before range.
+      const afterMs = Math.min(
+        scanUpperBoundAtMs,
+        Math.max(0, baseAfterMs, dedupeFloorMs),
+      );
       let highWaterAtMs = effectiveHighWaterAtMs;
       let pageCursor: string | undefined;
       let admitted = 0;
