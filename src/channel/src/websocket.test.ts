@@ -74,8 +74,9 @@ describe("AgentMail WebSocket ingress", () => {
       eventType: "message.received",
       eventId: "event_1",
       message: {
-        inboxId: "inbox_1",
+        inboxId: "INBOX_1",
         messageId: "message_1",
+        labels: ["received"],
         timestamp: new Date(1_234),
       },
     });
@@ -111,6 +112,40 @@ describe("AgentMail WebSocket ingress", () => {
     expect(waitForOpen).not.toHaveBeenCalled();
   });
 
+  it("durably admits message.received frames before the received label projects", async () => {
+    handlers.clear();
+    const receive = vi.fn(async () => undefined);
+    const controller = new AbortController();
+    const running = startAgentMailWebSocket({
+      account,
+      abortSignal: controller.signal,
+      receive,
+      catchUpSession: { run: catchUpRun },
+    });
+    await vi.waitFor(() => expect(handlers.has("message")).toBe(true));
+    handlers.get("message")?.({
+      type: "event",
+      eventType: "message.received",
+      message: {
+        inboxId: "inbox_1",
+        messageId: "message_label_pending",
+        labels: [],
+        timestamp: new Date(1_234),
+      },
+    });
+
+    await vi.waitFor(() => expect(receive).toHaveBeenCalledOnce());
+    expect(receive).toHaveBeenCalledWith(
+      expect.objectContaining({
+        messageId: "message_label_pending",
+        transport: "websocket",
+        receivedAt: 1_234,
+      }),
+    );
+    controller.abort();
+    await running;
+  });
+
   it("retries until a WebSocket event is durably admitted", async () => {
     handlers.clear();
     const receive = vi
@@ -132,6 +167,7 @@ describe("AgentMail WebSocket ingress", () => {
       message: {
         inboxId: "inbox_1",
         messageId: "message_retry",
+        labels: ["received"],
         timestamp: new Date(1_234),
       },
     });
@@ -162,13 +198,23 @@ describe("AgentMail WebSocket ingress", () => {
     handlers.get("message")?.({
       type: "event",
       eventType: "message.received",
-      message: { inboxId: "inbox_1", messageId: "message_1", timestamp: new Date(1_234) },
+      message: {
+        inboxId: "inbox_1",
+        messageId: "message_1",
+        labels: ["received"],
+        timestamp: new Date(1_234),
+      },
     });
     await vi.waitFor(() => expect(receive).toHaveBeenCalledOnce());
     handlers.get("message")?.({
       type: "event",
       eventType: "message.received",
-      message: { inboxId: "inbox_1", messageId: "message_2", timestamp: new Date(1_235) },
+      message: {
+        inboxId: "inbox_1",
+        messageId: "message_2",
+        labels: ["received"],
+        timestamp: new Date(1_235),
+      },
     });
     await vi.waitFor(() => expect(catchUpRun).toHaveBeenCalledOnce());
     expect(receive).toHaveBeenCalledOnce();
@@ -198,12 +244,22 @@ describe("AgentMail WebSocket ingress", () => {
     handlers.get("message")?.({
       type: "event",
       eventType: "message.received",
-      message: { inboxId: "inbox_1", messageId: "message_full", timestamp: new Date(1_234) },
+      message: {
+        inboxId: "inbox_1",
+        messageId: "message_full",
+        labels: ["received"],
+        timestamp: new Date(1_234),
+      },
     });
     handlers.get("message")?.({
       type: "event",
       eventType: "message.received",
-      message: { inboxId: "inbox_1", messageId: "message_next", timestamp: new Date(1_235) },
+      message: {
+        inboxId: "inbox_1",
+        messageId: "message_next",
+        labels: ["received"],
+        timestamp: new Date(1_235),
+      },
     });
 
     await vi.waitFor(() => expect(receive).toHaveBeenCalledTimes(2));
@@ -228,9 +284,11 @@ describe("AgentMail WebSocket ingress", () => {
     await running;
   });
 
-  it("reports SDK errors and schedules authoritative catch-up", async () => {
+  it("reconnects after an SDK error even when no close event follows", async () => {
     handlers.clear();
     catchUpRun.mockClear();
+    connect.mockClear();
+    close.mockClear();
     const error = vi.fn();
     const controller = new AbortController();
     const running = startAgentMailWebSocket({
@@ -238,6 +296,7 @@ describe("AgentMail WebSocket ingress", () => {
       abortSignal: controller.signal,
       receive: vi.fn(async () => undefined),
       catchUpSession: { run: catchUpRun },
+      reconnectDelayMs: () => 0,
       log: { error },
     });
     await vi.waitFor(() => expect(handlers.has("error")).toBe(true));
@@ -245,6 +304,7 @@ describe("AgentMail WebSocket ingress", () => {
     handlers.get("error")?.(new Error("frame parse failed"));
 
     await vi.waitFor(() => expect(catchUpRun).toHaveBeenCalledOnce());
+    await vi.waitFor(() => expect(connect).toHaveBeenCalledTimes(2));
     expect(error).toHaveBeenCalledWith(
       "AgentMail WebSocket error for account default: frame parse failed",
     );

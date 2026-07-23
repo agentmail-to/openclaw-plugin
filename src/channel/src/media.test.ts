@@ -67,19 +67,16 @@ describe("AgentMail inbound attachments", () => {
     expect(saveMediaBuffer).not.toHaveBeenCalled();
   });
 
-  it("skips inline CID parts and keeps explicitly downloadable CID attachments", async () => {
-    loadWebMediaRaw.mockResolvedValueOnce({
-      buffer: Buffer.from("download"),
-      contentType: "application/octet-stream",
-    });
-    saveMediaBuffer.mockResolvedValueOnce({
-      path: "/tmp/download.bin",
-      contentType: "application/octet-stream",
-    });
+  it("skips explicit inline parts but retains attachment parts with a Content-ID", async () => {
     const getAttachment = vi.fn(async () => ({
       downloadUrl: "https://download.example/cid",
-      filename: "download.bin",
+      filename: "cid.png",
     }));
+    loadWebMediaRaw.mockResolvedValueOnce({
+      buffer: Buffer.from("x"),
+      contentType: "image/png",
+    });
+    saveMediaBuffer.mockResolvedValueOnce({ path: "/tmp/cid.png", contentType: "image/png" });
     await expect(
       loadAgentMailInboundAttachments({
         client: { inboxes: { messages: { getAttachment } } } as never,
@@ -87,22 +84,20 @@ describe("AgentMail inbound attachments", () => {
         messageId: "message_1",
         attachments: [
           { attachmentId: "inline", size: 1, contentDisposition: "inline" },
-          { attachmentId: "implicit-inline", size: 1, contentId: "logo@cid" },
+          // Bare Content-ID parts are embedded HTML media and must not consume the attachment
+          // budget. If accepted, this declared size would reject the whole set.
+          { attachmentId: "embedded-cid", size: 1_000, contentId: "logo@cid" },
           {
             attachmentId: "cid",
-            size: 8,
-            contentId: "download@cid",
+            size: 1,
+            contentId: "image@cid",
             contentDisposition: "attachment",
           },
         ],
         maxBytes: 100,
       }),
-    ).resolves.toEqual({
-      paths: ["/tmp/download.bin"],
-      types: ["application/octet-stream"],
-    });
+    ).resolves.toEqual({ paths: ["/tmp/cid.png"], types: ["image/png"] });
     expect(getAttachment).toHaveBeenCalledOnce();
-    expect(getAttachment).toHaveBeenCalledWith("inbox_1", "message_1", "cid");
   });
 
   it("rejects excessive attachment counts before downloading", async () => {
@@ -121,6 +116,23 @@ describe("AgentMail inbound attachments", () => {
     ).rejects.toThrow("attachment limit");
     expect(getAttachment).not.toHaveBeenCalled();
   });
+
+  it.each([undefined, Number.NaN, -1, 1.5])(
+    "rejects malformed declared attachment size %s before downloading",
+    async (size) => {
+      const getAttachment = vi.fn();
+      await expect(
+        loadAgentMailInboundAttachments({
+          client: { inboxes: { messages: { getAttachment } } } as never,
+          inboxId: "inbox_1",
+          messageId: "message_1",
+          attachments: [{ attachmentId: "bad-size", size } as never],
+          maxBytes: 100,
+        }),
+      ).rejects.toThrow("invalid declared size");
+      expect(getAttachment).not.toHaveBeenCalled();
+    },
+  );
 
   it("classifies static attachment size violations as terminal policy rejections", async () => {
     await expect(

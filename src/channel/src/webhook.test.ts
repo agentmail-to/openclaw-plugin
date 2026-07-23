@@ -7,8 +7,6 @@ import { createAgentMailWebhookHandler, createAgentMailWebhookVerifier } from ".
 
 const hookVal = ["wh", "sec_", Buffer.alloc(32, 7).toString("base64")].join("");
 const verifier = new Webhook(hookVal);
-const providerTimestamp = "2026-07-15T12:34:56.000Z";
-const providerTimestampMs = Date.parse(providerTimestamp);
 
 function account(): ResolvedAgentMailAccount {
   return {
@@ -62,18 +60,13 @@ describe("AgentMail webhook", () => {
       event_type: "message.received",
       event_id: "event_1",
       message: {
-        inbox_id: "inbox_1",
+        inbox_id: "INBOX_1",
         message_id: "message_1",
-        timestamp: providerTimestamp,
+        timestamp: "2026-07-15T12:34:56.000Z",
       },
     });
     const res = response();
-    await createAgentMailWebhookHandler({
-      account: account(),
-      verifier,
-      receive,
-      now: () => 999,
-    })(
+    await createAgentMailWebhookHandler({ account: account(), verifier, receive })(
       request(body, signed(body)),
       res,
     );
@@ -83,8 +76,7 @@ describe("AgentMail webhook", () => {
         inboxId: "inbox_1",
         messageId: "message_1",
         transport: "webhook",
-        receivedAt: providerTimestampMs,
-        arrivedAt: 999,
+        receivedAt: Date.parse("2026-07-15T12:34:56.000Z"),
       }),
     );
   });
@@ -94,11 +86,7 @@ describe("AgentMail webhook", () => {
     const body = JSON.stringify({
       type: "event",
       event_type: "message.received",
-      message: {
-        inbox_id: "inbox_1",
-        message_id: "   ",
-        timestamp: providerTimestamp,
-      },
+      message: { inbox_id: "inbox_1", message_id: "   " },
     });
     const res = response();
     await createAgentMailWebhookHandler({ account: account(), verifier, receive })(
@@ -125,11 +113,7 @@ describe("AgentMail webhook", () => {
     const body = JSON.stringify({
       type: "event",
       event_type: "message.received",
-      message: {
-        inbox_id: "inbox_other",
-        message_id: "message_1",
-        timestamp: providerTimestamp,
-      },
+      message: { inbox_id: "inbox_other", message_id: "message_1" },
     });
     const wrongRes = response();
     await createAgentMailWebhookHandler({ account: account(), verifier, receive })(
@@ -175,65 +159,11 @@ describe("AgentMail webhook", () => {
     expect(receive).not.toHaveBeenCalled();
   });
 
-  it("falls back to arrival time for an invalid provider timestamp", async () => {
-    const body = JSON.stringify({
-      type: "event",
-      event_type: "message.received",
-      message: {
-        inbox_id: "inbox_1",
-        message_id: "message_1",
-        timestamp: "not-a-date",
-      },
-    });
-    const res = response();
-    const receive = vi.fn(async () => undefined);
-    const warn = vi.fn();
-    await createAgentMailWebhookHandler({
-      account: account(),
-      verifier,
-      receive,
-      log: { warn },
-      now: () => 1_234,
-    })(
-      request(body, signed(body)),
-      res,
-    );
-    expect(res.statusCode).toBe(200);
-    expect(receive).toHaveBeenCalledWith(
-      expect.objectContaining({ receivedAt: 1_234, arrivedAt: 1_234 }),
-    );
-    expect(warn).toHaveBeenCalledWith(expect.stringContaining("using arrival time"));
-  });
-
-  it("falls back to arrival time when the provider timestamp is missing", async () => {
-    const body = JSON.stringify({
-      type: "event",
-      event_type: "message.received",
-      message: { inbox_id: "inbox_1", message_id: "message_1" },
-    });
-    const res = response();
-    const receive = vi.fn(async () => undefined);
-    await createAgentMailWebhookHandler({
-      account: account(),
-      verifier,
-      receive,
-      now: () => 2_345,
-    })(request(body, signed(body)), res);
-    expect(res.statusCode).toBe(200);
-    expect(receive).toHaveBeenCalledWith(
-      expect.objectContaining({ receivedAt: 2_345, arrivedAt: 2_345 }),
-    );
-  });
-
   it("returns retryable failure when durable receipt fails", async () => {
     const body = JSON.stringify({
       type: "event",
       event_type: "message.received",
-      message: {
-        inbox_id: "inbox_1",
-        message_id: "message_1",
-        timestamp: providerTimestamp,
-      },
+      message: { inbox_id: "inbox_1", message_id: "message_1" },
     });
     const res = response();
     await createAgentMailWebhookHandler({

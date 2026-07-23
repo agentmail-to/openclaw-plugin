@@ -1,4 +1,4 @@
-import type { AgentMail, AgentMailClient } from "agentmail";
+import type { AgentMailClient } from "agentmail";
 import type { PluginStateKeyedStore } from "openclaw/plugin-sdk/plugin-state-runtime";
 import { type AgentMailLog, errorText } from "./log.js";
 import { createAgentMailClient } from "./client.js";
@@ -7,7 +7,11 @@ import {
   AGENTMAIL_DURABLE_PENDING_TTL_MS,
   AgentMailIngressCapacityError,
 } from "./durable-receive.js";
-import { AGENTMAIL_RECEIVED_LABEL } from "./inbound.js";
+import {
+  AGENTMAIL_RECEIVED_LABEL,
+  isReceivedAgentMailMessage,
+  resolveReceivedAgentMailMessageTimestampMs,
+} from "./received-message.js";
 import { createBackoff, waitForRetry } from "./retry.js";
 import { getAgentMailRuntime } from "./runtime.js";
 import type { AgentMailIngressRecord, ResolvedAgentMailAccount } from "./types.js";
@@ -196,15 +200,6 @@ function mergeCursor(
   };
 }
 
-function isReceivedMessage(message: AgentMail.MessageItem, inboxId: string): boolean {
-  return (
-    message.inboxId === inboxId &&
-    (Array.isArray(message.labels) ? message.labels : []).some(
-      (label) => String(label).toLocaleLowerCase("en-US") === AGENTMAIL_RECEIVED_LABEL,
-    )
-  );
-}
-
 async function persistCursor(params: {
   store: PluginStateKeyedStore<AgentMailCatchUpCursor>;
   key: string;
@@ -304,7 +299,7 @@ export async function createAgentMailCatchUpSession(params: {
       // before the baseline, which would re-inject pre-monitoring history.
       const sweepAtMs = now();
       const recoveryFloorMs = sweepAtMs - AGENTMAIL_DURABLE_PENDING_TTL_MS;
-      const beforeMs = sweepAtMs + AGENTMAIL_REST_CATCH_UP_OVERLAP_MS;
+      const beforeMs = sweepAtMs + 1;
       const baseAfterMs =
         sinceBaseline || !storedCursor.established
           ? storedCursor.baselineAtMs
@@ -337,26 +332,27 @@ export async function createAgentMailCatchUpSession(params: {
           if (abortSignal.aborted) {
             return;
           }
-          if (!isReceivedMessage(message, params.account.inboxId)) {
+          if (!isReceivedAgentMailMessage(message, params.account.inboxId)) {
             continue;
           }
-          const providerReceivedAt =
-            message.timestamp instanceof Date ? message.timestamp.getTime() : Number.NaN;
+          const providerReceivedAt = resolveReceivedAgentMailMessageTimestampMs(
+            message,
+            params.account.inboxId,
+          );
           const arrivedAt = now();
-          const latestSafeReceivedAt = arrivedAt + AGENTMAIL_REST_CATCH_UP_OVERLAP_MS;
-          const receivedAt = validTimestamp(providerReceivedAt)
-            ? Math.min(providerReceivedAt, latestSafeReceivedAt)
-            : arrivedAt;
-          if (!validTimestamp(providerReceivedAt)) {
+          const receivedAt = providerReceivedAt !== null
+            ? Math.min(providerReceivedAt, sweepAtMs)
+            : sweepAtMs;
+          if (providerReceivedAt === null) {
             // Use local arrival time so a malformed newest row is admitted once and advances the
             // cursor instead of being re-listed and warned about forever.
             params.log?.warn?.(
               `AgentMail catch-up used arrival time for message ${message.messageId} with an invalid timestamp`,
             );
-          } else if (providerReceivedAt > latestSafeReceivedAt) {
+          } else if (providerReceivedAt > sweepAtMs) {
             // Provider clock skew must not push the cursor into the far future and disable periodic
-            // overlap recovery. Preserve the row while clamping its ordering timestamp to the
-            // largest value whose overlap still reaches the current wall clock.
+            // overlap recovery. Preserve the row while clamping its ordering timestamp to this
+            // sweep's fixed wall-clock bound.
             params.log?.warn?.(
               `AgentMail catch-up clamped future timestamp for message ${message.messageId}`,
             );

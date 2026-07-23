@@ -5,6 +5,7 @@ import {
 } from "openclaw/plugin-sdk/webhook-ingress";
 import { Webhook } from "svix";
 import { type AgentMailLog, errorText } from "./log.js";
+import { agentMailInboxIdsEqual, resolveAgentMailTimestampMs } from "./received-message.js";
 import type { AgentMailIngressRecord, ResolvedAgentMailAccount } from "./types.js";
 
 const MAX_WEBHOOK_BODY_BYTES = 1024 * 1024;
@@ -37,18 +38,12 @@ function parseVerifiedEvent(payload: unknown): {
   const mail = message as Record<string, unknown>;
   const inboxId = typeof mail.inbox_id === "string" ? mail.inbox_id.trim() : "";
   const messageId = typeof mail.message_id === "string" ? mail.message_id.trim() : "";
-  const receivedAt =
-    typeof mail.timestamp === "string" ? Date.parse(mail.timestamp) : Number.NaN;
-  // Identifiers are required for durable dedupe and hydration. A malformed timestamp is recoverable
-  // because local arrival time provides a safe ordering/retention fallback.
+  // Require both identifiers to be present and non-empty; an empty id cannot address a message.
   if (!inboxId || !messageId) {
     return null;
   }
-  return {
-    inboxId,
-    messageId,
-    ...(Number.isFinite(receivedAt) && receivedAt >= 0 ? { receivedAt } : {}),
-  };
+  const receivedAt = resolveAgentMailTimestampMs(mail.timestamp);
+  return { inboxId, messageId, ...(receivedAt === null ? {} : { receivedAt }) };
 }
 
 /**
@@ -69,7 +64,6 @@ export function createAgentMailWebhookHandler(params: {
   verifier: Webhook;
   receive: (record: AgentMailIngressRecord) => Promise<void>;
   log?: AgentMailLog;
-  now?: () => number;
 }) {
   const verifier = params.verifier;
   return async (req: IncomingMessage, res: ServerResponse) => {
@@ -115,22 +109,17 @@ export function createAgentMailWebhookHandler(params: {
       params.log?.warn?.("AgentMail webhook ignored a malformed signed received event");
       return respond(res, 200);
     }
-    if (event.inboxId !== params.account.inboxId) {
+    if (!agentMailInboxIdsEqual(event.inboxId, params.account.inboxId)) {
       // The signature is valid but this route cannot ever own the inbox. Acknowledge permanently
       // so provider retries cannot amplify a routing/configuration error.
       params.log?.warn?.("AgentMail webhook ignored an event for the wrong inbox");
       return respond(res, 200);
     }
     try {
-      const nowMs = params.now?.() ?? Date.now();
-      if (event.receivedAt === undefined) {
-        params.log?.warn?.(
-          `AgentMail webhook message ${event.messageId} has no valid provider timestamp; using arrival time`,
-        );
-      }
+      const nowMs = Date.now();
       await params.receive({
         accountId: params.account.accountId,
-        inboxId: event.inboxId,
+        inboxId: params.account.inboxId,
         messageId: event.messageId,
         transport: "webhook",
         receivedAt: event.receivedAt ?? nowMs,

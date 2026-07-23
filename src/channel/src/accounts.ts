@@ -14,6 +14,7 @@ import {
 import { normalizeStringEntries } from "openclaw/plugin-sdk/string-coerce-runtime";
 import { AGENTMAIL_MEDIA_DEFAULT_MB } from "./config-schema.js";
 import { normalizeMailbox } from "./mailbox.js";
+import { normalizeAgentMailInboxId } from "./received-message.js";
 import {
   type AgentMailChannelConfig,
   type ResolvedAgentMailAccount,
@@ -147,7 +148,10 @@ export function resolveAgentMailAccount(
     accountId: id,
     enabled: channel.enabled !== false && account?.enabled !== false,
     apiKey: apiVal,
-    inboxId: merged.inboxId?.trim() ?? "",
+    // Preserve configured spelling as the durable identity. Queue namespaces, catch-up cursor keys,
+    // and conversation ids include this value, so lowercasing it during resolution would strand
+    // persisted state after an upgrade. Normalize provider values only where ids are compared.
+    inboxId: (merged.inboxId ?? "").trim(),
     webhookSecret: hookVal,
     webhookPath:
       configuredPath ||
@@ -187,7 +191,7 @@ export function findConflictingAgentMailInboxOwner(
     if (
       other.enabled &&
       isAgentMailAccountConfigured(other) &&
-      other.inboxId === account.inboxId
+      normalizeAgentMailInboxId(other.inboxId) === normalizeAgentMailInboxId(account.inboxId)
     ) {
       return other.accountId;
     }

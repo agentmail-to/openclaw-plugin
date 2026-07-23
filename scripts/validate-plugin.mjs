@@ -23,6 +23,8 @@ const childEnv = {
   OPENCLAW_CONFIG_DIR: stateDir,
   OPENCLAW_HOME: stateDir,
   PATH: `${dirname(openclaw)}${delimiter}${process.env.PATH || ""}`,
+  NO_COLOR: "1",
+  FORCE_COLOR: "0",
 };
 
 function run(args) {

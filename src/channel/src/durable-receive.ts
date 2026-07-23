@@ -44,7 +44,12 @@ export function createAgentMailDurableInboundId(params: {
 // some published releases), so the wrapper stays portable across SDK versions.
 type AgentMailJournal = ReturnType<
   typeof createDurableInboundReceiveJournalFromQueue<AgentMailIngressRecord, undefined, undefined>
->;
+> & {
+  fail?: (
+    id: string,
+    options: { reason: string; message?: string; failedAt?: number },
+  ) => Promise<boolean>;
+};
 
 /**
  * Wraps the store-backed journal with an admission cap. The published SDK's queue journal only
@@ -68,15 +73,28 @@ export function withAgentMailIngressCapacity(
     ...journal,
     accept: (id, payload, options) => {
       const admission = admissionChain.then(async () => {
+        const accepted = await journal.accept(id, payload, options);
+        // Let the queue perform its atomic id lookup first. Completed tombstones and pending
+        // duplicates consume no new capacity and must remain harmless even while the queue is full.
+        if (accepted.kind !== "accepted") {
+          return accepted;
+        }
         if (pendingEstimate === null || pendingEstimate >= maxPendingEntries) {
           const pending = await journal.pending();
           pendingEstimate = pending.length;
-          if (pendingEstimate >= maxPendingEntries && !pending.some((entry) => entry.id === id)) {
+          if (pendingEstimate > maxPendingEntries) {
+            try {
+              if (await journal.deletePending(id)) {
+                pendingEstimate -= 1;
+              }
+            } catch {
+              // Never turn a capacity rejection into a terminal tombstone. If rollback deletion is
+              // temporarily unavailable, preserve the accepted pending row: provider redelivery or
+              // REST catch-up re-admits that duplicate and dispatches it once capacity recovers.
+            }
             throw new AgentMailIngressCapacityError();
           }
-        }
-        const accepted = await journal.accept(id, payload, options);
-        if (accepted.kind === "accepted") {
+        } else {
           pendingEstimate += 1;
         }
         return accepted;
@@ -101,9 +119,64 @@ export function createAgentMailDurableInboundReceiveJournal(params: {
       stateDir: runtime.state.resolveStateDir(),
     },
   );
-  const journal = createDurableInboundReceiveJournalFromQueue({
-    queue,
-    retention: AGENTMAIL_DURABLE_RETENTION,
-  });
-  return withAgentMailIngressCapacity(journal, AGENTMAIL_DURABLE_PENDING_MAX_ENTRIES);
+  const prune = async (protectId?: string) => {
+    await queue.prune({
+      ...AGENTMAIL_DURABLE_RETENTION,
+      ...(protectId ? { protectIds: [protectId] } : {}),
+    });
+  };
+  // Keep failed tombstones terminal. The SDK facade currently projects queue `failed` results as
+  // pending records for compatibility, which would redispatch an already-produced turn after a
+  // completion-marker failure. This small facade maps them to the existing terminal `completed`
+  // journal result while retaining the failed record in the underlying queue for diagnostics.
+  const extendedJournal: AgentMailJournal = {
+    accept: async (id, payload, options) => {
+      await prune();
+      const result = await queue.enqueue(id.trim(), payload, options);
+      await prune(id);
+      if (result.kind === "accepted") {
+        return { kind: "accepted", duplicate: false, record: result.record };
+      }
+      if (result.kind === "pending" || result.kind === "claimed") {
+        return { kind: "pending", duplicate: true, record: result.record };
+      }
+      if (result.kind === "completed") {
+        return { kind: "completed", duplicate: true, record: result.record };
+      }
+      return {
+        kind: "completed",
+        duplicate: true,
+        record: {
+          id: result.record.id,
+          channelId: result.record.channelId,
+          accountId: result.record.accountId,
+          queueName: result.record.queueName,
+          completedAt: result.record.failedAt,
+        },
+      };
+    },
+    pending: async () => {
+      await prune();
+      return await queue.listPending({ limit: "all" });
+    },
+    complete: async (id, options) => {
+      await queue.complete(id, options);
+      await prune(id);
+    },
+    release: async (id, options) => {
+      const released = await queue.release(id, options);
+      await prune(id);
+      return released;
+    },
+    deletePending: async (id) => await queue.delete(id),
+    fail: async (id, options) => {
+      const failed = await queue.fail(id, options);
+      await prune(id);
+      return failed;
+    },
+  };
+  return withAgentMailIngressCapacity(
+    extendedJournal,
+    AGENTMAIL_DURABLE_PENDING_MAX_ENTRIES,
+  );
 }

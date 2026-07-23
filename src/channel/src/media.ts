@@ -20,13 +20,31 @@ export class AgentMailMediaPolicyError extends Error {}
 export const AGENTMAIL_INBOUND_MAX_ATTACHMENTS = 25;
 
 function isAcceptedAttachment(attachment: AgentMail.Attachment): boolean {
-  // A CID with no explicit disposition is conventionally an embedded body part (logos, signatures,
-  // tracking pixels). Preserve CID-bearing downloads only when the provider explicitly labels them
-  // as attachments.
-  return (
-    attachment.contentDisposition === "attachment" ||
-    (attachment.contentDisposition !== "inline" && !attachment.contentId)
-  );
+  const disposition = attachment.contentDisposition?.toLocaleLowerCase("en-US");
+  // An explicit attachment disposition wins even when the part also has a Content-ID. A bare
+  // Content-ID is how embedded HTML images are commonly represented, so exclude those from the
+  // user's attachment set and aggregate budget.
+  return disposition === "attachment" || (disposition !== "inline" && !attachment.contentId);
+}
+
+function addAttachmentBytesToBudget(params: {
+  currentBytes: number;
+  attachmentBytes: number;
+  maxBytes: number;
+  errorMessage: string;
+}): number {
+  const nextBytes = params.currentBytes + params.attachmentBytes;
+  if (!Number.isSafeInteger(nextBytes) || nextBytes > params.maxBytes) {
+    throw new AgentMailMediaPolicyError(params.errorMessage);
+  }
+  return nextBytes;
+}
+
+function rethrowMediaFetchAsPolicy(error: unknown, message: string): never {
+  if (error instanceof MediaFetchError && error.code === "max_bytes") {
+    throw new AgentMailMediaPolicyError(message, { cause: error });
+  }
+  throw error;
 }
 
 export async function loadAgentMailInboundAttachments(params: {
@@ -44,17 +62,25 @@ export async function loadAgentMailInboundAttachments(params: {
   }
   let declaredBytes = 0;
   for (const attachment of accepted) {
-    if (attachment.size > params.maxBytes) {
+    const declaredSize: unknown = attachment.size;
+    if (
+      typeof declaredSize !== "number" ||
+      !Number.isSafeInteger(declaredSize) ||
+      declaredSize < 0
+    ) {
+      throw new AgentMailMediaPolicyError("AgentMail attachment has an invalid declared size");
+    }
+    if (declaredSize > params.maxBytes) {
       throw new AgentMailMediaPolicyError(
         "AgentMail attachment exceeds the configured per-file media limit",
       );
     }
-    declaredBytes += attachment.size;
-    if (declaredBytes > params.maxBytes) {
-      throw new AgentMailMediaPolicyError(
-        "AgentMail attachments exceed the configured aggregate media limit",
-      );
-    }
+    declaredBytes = addAttachmentBytesToBudget({
+      currentBytes: declaredBytes,
+      attachmentBytes: declaredSize,
+      maxBytes: params.maxBytes,
+      errorMessage: "AgentMail attachments exceed the configured aggregate media limit",
+    });
   }
 
   // Download every part before persisting any of them so a failed signed URL never dispatches a
@@ -81,15 +107,17 @@ export async function loadAgentMailInboundAttachments(params: {
     try {
       loaded = await loadWebMediaRaw(metadata.downloadUrl, { maxBytes: remaining });
     } catch (error) {
-      if (error instanceof MediaFetchError && error.code === "max_bytes") {
-        throw new AgentMailMediaPolicyError(
-          "AgentMail attachments exceed the configured aggregate media limit",
-          { cause: error },
-        );
-      }
-      throw error;
+      rethrowMediaFetchAsPolicy(
+        error,
+        "AgentMail attachments exceed the configured aggregate media limit",
+      );
     }
-    actualBytes += loaded.buffer.byteLength;
+    actualBytes = addAttachmentBytesToBudget({
+      currentBytes: actualBytes,
+      attachmentBytes: loaded.buffer.byteLength,
+      maxBytes: params.maxBytes,
+      errorMessage: "AgentMail attachments exceed the configured aggregate media limit",
+    });
     downloaded.push({
       buffer: loaded.buffer,
       contentType:
@@ -151,22 +179,17 @@ export async function loadAgentMailOutboundAttachments(params: {
         mediaReadFile: params.mediaReadFile,
       });
     } catch (error) {
-      if (error instanceof MediaFetchError && error.code === "max_bytes") {
-        throw new AgentMailMediaPolicyError(
-          "AgentMail outbound attachments exceed the configured aggregate media limit",
-          { cause: error },
-        );
-      }
-      throw error;
-    }
-    totalBytes += loaded.buffer.byteLength;
-    if (totalBytes > params.maxBytes) {
-      // Defensive backstop: the per-fetch budget above already rejects oversize files, but a lenient
-      // loader that returns more than requested must still not push the reply past the aggregate.
-      throw new AgentMailMediaPolicyError(
+      rethrowMediaFetchAsPolicy(
+        error,
         "AgentMail outbound attachments exceed the configured aggregate media limit",
       );
     }
+    totalBytes = addAttachmentBytesToBudget({
+      currentBytes: totalBytes,
+      attachmentBytes: loaded.buffer.byteLength,
+      maxBytes: params.maxBytes,
+      errorMessage: "AgentMail outbound attachments exceed the configured aggregate media limit",
+    });
     // Convert to base64 immediately and let the source buffer go out of scope; only the encoded
     // representation is retained for the reply payload.
     attachments.push({

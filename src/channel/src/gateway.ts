@@ -21,10 +21,36 @@ import type { AgentMailIngressRecord, ResolvedAgentMailAccount } from "./types.j
 import { createAgentMailWebhookHandler, createAgentMailWebhookVerifier } from "./webhook.js";
 import { startAgentMailWebSocket } from "./websocket.js";
 
-type ActiveRoute = { path: string; unregister: () => void };
+type RouteClaim = { accountId: string; generation: symbol };
+type ActiveRoute = { path: string; unregister: () => void; claim: RouteClaim };
 
 const activeRoutes = new Map<string, ActiveRoute>();
-const routeOwners = new Map<string, string>();
+const routeOwners = new Map<string, RouteClaim>();
+const routeStartupTails = new Map<string, Promise<void>>();
+
+async function withSerializedRouteStartup<T>(
+  accountId: string,
+  task: () => Promise<T>,
+): Promise<T> {
+  const predecessor = routeStartupTails.get(accountId) ?? Promise.resolve();
+  let release!: () => void;
+  const hold = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const tail = predecessor.catch(() => undefined).then(() => hold);
+  routeStartupTails.set(accountId, tail);
+  await predecessor.catch(() => undefined);
+  try {
+    return await task();
+  } finally {
+    release();
+    void tail.finally(() => {
+      if (routeStartupTails.get(accountId) === tail) {
+        routeStartupTails.delete(accountId);
+      }
+    });
+  }
+}
 
 // Single source of truth for AgentMail sender-authorization warnings, shared by gateway startup
 // diagnostics and the channel security surface so the two never drift.
@@ -90,7 +116,12 @@ export async function startAgentMailGatewayAccount(params: {
   });
   const dispatch = async (
     record: AgentMailIngressRecord,
-    lifecycle: { onTurnAdopted: () => Promise<void>; abortSignal?: AbortSignal },
+    lifecycle: {
+      onTurnAdopted: () => Promise<void>;
+      onTurnDeferred: () => void;
+      onTurnAbandoned: () => Promise<void>;
+      abortSignal?: AbortSignal;
+    },
   ) =>
     await dispatchAgentMailInboundEvent({
       cfg: params.cfg,
@@ -100,6 +131,8 @@ export async function startAgentMailGatewayAccount(params: {
       client,
       log: params.log,
       onTurnAdopted: lifecycle.onTurnAdopted,
+      onTurnDeferred: lifecycle.onTurnDeferred,
+      onTurnAbandoned: lifecycle.onTurnAbandoned,
       abortSignal: lifecycle.abortSignal,
     });
   const receive = async (record: AgentMailIngressRecord) => {
@@ -146,58 +179,86 @@ export async function startAgentMailGatewayAccount(params: {
   const path = params.account.webhookPath.startsWith("/")
     ? params.account.webhookPath
     : `/${params.account.webhookPath}`;
-  const owner = routeOwners.get(path);
-  if (owner && owner !== params.account.accountId) {
-    throw new Error(
-      `AgentMail webhook path ${path} is already registered by account ${owner}; configure a distinct webhookPath.`,
-    );
-  }
-  const previousRoute = activeRoutes.get(params.account.accountId);
-  if (previousRoute) {
-    previousRoute.unregister();
-    if (routeOwners.get(previousRoute.path) === params.account.accountId) {
-      routeOwners.delete(previousRoute.path);
+  const setup = await withSerializedRouteStartup(params.account.accountId, async () => {
+    if (params.abortSignal.aborted) {
+      return null;
     }
-  }
-  // Claim ownership synchronously here, before the first await, so the check-and-claim is atomic:
-  // two concurrent startups for the same path can no longer both observe it as free.
-  routeOwners.set(path, params.account.accountId);
-  const catchUpSession = await createAgentMailCatchUpSession({
-    account: params.account,
-    client,
-    log: params.log,
-  });
-  const catchUpSupervisor = createAgentMailCatchUpSupervisor({
-    session: catchUpSession,
-    receive,
-    abortSignal: params.abortSignal,
-    log: params.log,
-  });
-  const receiveWithRecovery = async (record: AgentMailIngressRecord) => {
+    const owner = routeOwners.get(path);
+    if (owner && owner.accountId !== params.account.accountId) {
+      throw new Error(
+        `AgentMail webhook path ${path} is already registered by account ${owner.accountId}; configure a distinct webhookPath.`,
+      );
+    }
+    const previousRoute = activeRoutes.get(params.account.accountId);
+    const claim: RouteClaim = {
+      accountId: params.account.accountId,
+      generation: Symbol(params.account.accountId),
+    };
+    // Claim before initialization so a different account cannot race onto this path. Same-account
+    // startup is serialized above, so rollback always has one well-defined predecessor.
+    routeOwners.set(path, claim);
+    let unregister: (() => void) | undefined;
     try {
-      await receive(record);
+      const catchUpSession = await createAgentMailCatchUpSession({
+        account: params.account,
+        client,
+        log: params.log,
+      });
+      const catchUpSupervisor = createAgentMailCatchUpSupervisor({
+        session: catchUpSession,
+        receive,
+        abortSignal: params.abortSignal,
+        log: params.log,
+      });
+      const receiveWithRecovery = async (record: AgentMailIngressRecord) => {
+        try {
+          await receive(record);
+        } catch (error) {
+          // Provider retries remain useful, but REST recovery is the durable fallback if the
+          // provider exhausts them while local admission is temporarily unavailable.
+          catchUpSupervisor.request();
+          throw error;
+        }
+      };
+      unregister = registerPluginHttpRoute({
+        path,
+        auth: "plugin",
+        pluginId: "agentmail",
+        accountId: params.account.accountId,
+        handler: createAgentMailWebhookHandler({
+          account: params.account,
+          verifier,
+          receive: receiveWithRecovery,
+          log: params.log,
+        }),
+        // OpenClaw atomically replaces the predecessor and makes its stale unregister a no-op.
+        replaceExisting: true,
+      });
+      const activeRoute = { path, unregister, claim };
+      activeRoutes.set(params.account.accountId, activeRoute);
+      if (previousRoute) {
+        previousRoute.unregister();
+        if (routeOwners.get(previousRoute.path) === previousRoute.claim) {
+          routeOwners.delete(previousRoute.path);
+        }
+      }
+      return { activeRoute, catchUpSupervisor, claim, unregister };
     } catch (error) {
-      // Provider retries remain useful, but REST recovery is the durable fallback if the provider
-      // exhausts them while local admission is full or temporarily unavailable.
-      catchUpSupervisor.request();
+      unregister?.();
+      if (routeOwners.get(path) === claim) {
+        if (previousRoute?.path === path) {
+          routeOwners.set(path, previousRoute.claim);
+        } else {
+          routeOwners.delete(path);
+        }
+      }
       throw error;
     }
-  };
-  const unregister = registerPluginHttpRoute({
-    path,
-    auth: "plugin",
-    pluginId: "agentmail",
-    accountId: params.account.accountId,
-    handler: createAgentMailWebhookHandler({
-      account: params.account,
-      verifier,
-      receive: receiveWithRecovery,
-      log: params.log,
-    }),
   });
-  const activeRoute = { path, unregister };
-  activeRoutes.set(params.account.accountId, activeRoute);
-  // Ownership was already claimed synchronously above.
+  if (!setup) {
+    return;
+  }
+  const { activeRoute, catchUpSupervisor, claim, unregister } = setup;
   params.log?.info?.(
     `Registered AgentMail webhook route ${path} for account ${params.account.accountId}`,
   );
@@ -214,7 +275,7 @@ export async function startAgentMailGatewayAccount(params: {
     if (activeRoutes.get(params.account.accountId) === activeRoute) {
       unregister();
       activeRoutes.delete(params.account.accountId);
-      if (routeOwners.get(path) === params.account.accountId) {
+      if (routeOwners.get(path) === claim) {
         routeOwners.delete(path);
       }
     }
