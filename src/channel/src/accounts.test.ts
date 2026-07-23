@@ -6,6 +6,7 @@ import {
   resolveAgentMailAccount,
 } from "./accounts.js";
 import { AgentMailChannelConfigSchema } from "./config-schema.js";
+import { AGENTMAIL_MEDIA_MIN_MB } from "./config-schema.js";
 import type { AgentMailChannelConfig } from "./types.js";
 
 const paddedApi = " api-key ";
@@ -175,6 +176,8 @@ describe("AgentMail account config", () => {
     const runtime = AgentMailChannelConfigSchema.runtime;
     expect(runtime?.safeParse({ mediaMaxMb: 25 }).success).toBe(true);
     expect(runtime?.safeParse({ mediaMaxMb: 0.5 }).success).toBe(true);
+    expect(runtime?.safeParse({ mediaMaxMb: AGENTMAIL_MEDIA_MIN_MB }).success).toBe(true);
+    expect(runtime?.safeParse({ mediaMaxMb: AGENTMAIL_MEDIA_MIN_MB / 2 }).success).toBe(false);
     expect(runtime?.safeParse({ mediaMaxMb: 0 }).success).toBe(false);
     expect(runtime?.safeParse({ mediaMaxMb: 100_000 }).success).toBe(false);
   });

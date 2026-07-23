@@ -188,10 +188,17 @@ export async function dispatchAgentMailInboundEvent(params: {
     }
     throw new AgentMailLabelPendingError(params.record.messageId);
   }
-  const sender = parseSingleFromMailbox(message.from);
+  const sender =
+    typeof message.from === "string" ? parseSingleFromMailbox(message.from) : null;
   if (!sender) {
     params.log?.warn?.(
       `AgentMail rejected message ${message.messageId} with an ambiguous From mailbox`,
+    );
+    return;
+  }
+  if (typeof message.threadId !== "string" || !message.threadId.trim()) {
+    params.log?.warn?.(
+      `AgentMail rejected message ${message.messageId} with an invalid thread id`,
     );
     return;
   }

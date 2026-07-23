@@ -453,6 +453,33 @@ describe("AgentMail REST-authoritative inbound", () => {
     expect(run).not.toHaveBeenCalled();
   });
 
+  it.each([
+    ["non-string sender", { from: ["sender@example.com"] }],
+    ["missing thread id", { threadId: undefined }],
+    ["empty thread id", { threadId: "   " }],
+  ])("settles a hydrated message with %s", async (_name, overrides) => {
+    const run = vi.fn();
+    const warn = vi.fn();
+    await expect(
+      dispatchAgentMailInboundEvent({
+        cfg: {},
+        account,
+        record,
+        channelRuntime: { inbound: { run } } as never,
+        client: {
+          inboxes: {
+            messages: {
+              get: vi.fn(async () => message(overrides as Partial<AgentMail.Message>)),
+            },
+          },
+        } as never,
+        log: { warn },
+      }),
+    ).resolves.toBeUndefined();
+    expect(run).not.toHaveBeenCalled();
+    expect(warn).toHaveBeenCalled();
+  });
+
   it("settles permanently unsafe hydrated messages without dispatch", async () => {
     const run = vi.fn();
     const warn = vi.fn();

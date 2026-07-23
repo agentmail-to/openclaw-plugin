@@ -166,6 +166,32 @@ export function isAgentMailAccountConfigured(account: ResolvedAgentMailAccount):
   return Boolean(account.apiKey && account.inboxId);
 }
 
+const inboxOwnersByConfig = new WeakMap<object, Map<string, string>>();
+
+function resolveAgentMailInboxOwners(cfg: OpenClawConfig): Map<string, string> {
+  const configIdentity = cfg as object;
+  const cached = inboxOwnersByConfig.get(configIdentity);
+  if (cached) {
+    return cached;
+  }
+  const owners = new Map<string, string>();
+  for (const accountId of listAgentMailAccountIds(cfg)) {
+    const candidate = resolveAgentMailAccount(cfg, accountId);
+    if (!candidate.enabled || !isAgentMailAccountConfigured(candidate)) {
+      continue;
+    }
+    const inboxId = normalizeAgentMailInboxId(candidate.inboxId);
+    const owner = owners.get(inboxId);
+    if (owner === undefined || candidate.accountId < owner) {
+      owners.set(inboxId, candidate.accountId);
+    }
+  }
+  // OpenClaw passes a fresh configuration snapshot on reload. Cache its ownership index so
+  // starting n accounts resolves the account set once instead of rescanning it n times.
+  inboxOwnersByConfig.set(configIdentity, owners);
+  return owners;
+}
+
 /**
  * Returns the id of an earlier-sorted account that also targets this account's inbox, or null when
  * the inbox is unique. Two accounts consuming one inbox would open separate durable journals (keyed
@@ -179,24 +205,10 @@ export function findConflictingAgentMailInboxOwner(
   if (!account.inboxId) {
     return null;
   }
-  for (const otherId of listAgentMailAccountIds(cfg)) {
-    const other = resolveAgentMailAccount(cfg, otherId);
-    // Compare canonical (resolved) ids with a strict byte order — never localeCompare, whose ties
-    // between distinct ids could let both accounts believe they are the owner and double-reply.
-    if (other.accountId === account.accountId || other.accountId >= account.accountId) {
-      continue;
-    }
-    // Only an enabled AND fully-configured account can own the inbox; an enabled-but-unconfigured
-    // account must not block the real consumer and silently disable inbound mail.
-    if (
-      other.enabled &&
-      isAgentMailAccountConfigured(other) &&
-      normalizeAgentMailInboxId(other.inboxId) === normalizeAgentMailInboxId(account.inboxId)
-    ) {
-      return other.accountId;
-    }
-  }
-  return null;
+  const owner = resolveAgentMailInboxOwners(cfg).get(
+    normalizeAgentMailInboxId(account.inboxId),
+  );
+  return owner && owner !== account.accountId && owner < account.accountId ? owner : null;
 }
 
 export function inspectAgentMailAccount(cfg: OpenClawConfig, accountId?: string | null) {

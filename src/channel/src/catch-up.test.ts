@@ -412,6 +412,41 @@ describe("AgentMail durable REST catch-up", () => {
     );
   });
 
+  it("repairs a stored cursor after the host clock moves backwards", async () => {
+    const store = memoryStore<AgentMailCatchUpCursor>();
+    const key = sha256Hex("default\ninbox_1");
+    await store.register(key, {
+      version: 1,
+      baselineAtMs: 2_000_000,
+      highWaterAtMs: 3_000_000,
+      established: true,
+    });
+    const list = vi.fn(async () => ({ count: 0, messages: [] }));
+    const session = await createAgentMailCatchUpSession({
+      account,
+      client: { inboxes: { messages: { list } } } as never,
+      store,
+      now: () => 1_000_000,
+    });
+
+    await session.run({
+      receive: vi.fn(),
+      abortSignal: new AbortController().signal,
+      sinceBaseline: true,
+    });
+
+    expect(list).toHaveBeenCalledWith(
+      "inbox_1",
+      expect.objectContaining({ after: new Date(1_000_000) }),
+      expect.any(Object),
+    );
+    expect(await store.lookup(key)).toMatchObject({
+      baselineAtMs: 1_000_000,
+      highWaterAtMs: 1_000_000,
+      established: true,
+    });
+  });
+
   it("lists from the monitoring baseline on a deep sweep", async () => {
     const store = memoryStore<never>();
     const list = vi.fn(async () => ({
@@ -611,6 +646,64 @@ describe("AgentMail durable REST catch-up", () => {
       "message_2",
       "message_1",
       "message_2",
+    ]);
+  });
+
+  it("does not commit a page cursor before every page is durably admitted", async () => {
+    const store = memoryStore<AgentMailCatchUpCursor>();
+    const key = sha256Hex("default\ninbox_1");
+    await store.register(key, {
+      version: 1,
+      baselineAtMs: 100_000,
+      highWaterAtMs: 400_000,
+      established: true,
+    });
+    const firstPage = {
+      count: 1,
+      messages: [message({ id: "newer", timestamp: 900_000 })],
+      nextPageToken: "page_2",
+    };
+    const secondPage = {
+      count: 1,
+      // Defensive case: provider pagination claims ascending order but returns a later page with a
+      // timestamp below both the first page and the overlap window.
+      messages: [message({ id: "backdated", timestamp: 200_000 })],
+    };
+    const list = vi.fn(async (_inboxId: string, options: { pageToken?: string }) =>
+      options.pageToken ? secondPage : firstPage,
+    );
+    const session = await createAgentMailCatchUpSession({
+      account,
+      client: { inboxes: { messages: { list } } } as never,
+      store,
+      now: () => 1_000_000,
+    });
+    const receive = vi.fn(async (record: AgentMailIngressRecord) => {
+      if (record.messageId === "backdated") {
+        throw new Error("durable store unavailable");
+      }
+    });
+
+    await expect(
+      session.run({ receive, abortSignal: new AbortController().signal }),
+    ).rejects.toThrow("durable store unavailable");
+    await expect(
+      session.run({ receive, abortSignal: new AbortController().signal }),
+    ).rejects.toThrow("durable store unavailable");
+
+    expect(list).toHaveBeenNthCalledWith(
+      3,
+      "inbox_1",
+      expect.objectContaining({
+        after: new Date(400_000 - AGENTMAIL_REST_CATCH_UP_OVERLAP_MS),
+      }),
+      expect.any(Object),
+    );
+    expect(receive.mock.calls.map(([value]) => value.messageId)).toEqual([
+      "newer",
+      "backdated",
+      "newer",
+      "backdated",
     ]);
   });
 });

@@ -23,6 +23,8 @@ Always put `--` after `agentmail`; it prevents OpenClaw from interpreting AgentM
 Never pass `--api-key`, `--base-url`, `--environment`, or print the API key. Authentication is
 inherited from `AGENTMAIL_API_KEY`, and only operator-controlled plugin configuration may select
 the API endpoint.
+If a literal command value begins with `--base-url` or `--environment`, pass it with the containing
+option's `--option=value` form so the endpoint guard can distinguish it from a global override.
 
 Run this command on the OpenClaw host, not inside an agent sandbox. The bundled executable and
 skill-scoped credentials are available only to host execution.

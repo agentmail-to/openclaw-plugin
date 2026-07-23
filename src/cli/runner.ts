@@ -20,6 +20,7 @@ const optionsWithSeparateValues = new Set([
   "format-error",
   "transform",
   "transform-error",
+  "subject",
 ]);
 const restrictedEnvironmentKeys = new Set([
   "AGENTMAIL_BASE_URL",

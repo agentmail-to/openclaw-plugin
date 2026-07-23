@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { unzipSync } from "fflate";
 import {
   chmodSync,
@@ -11,6 +11,7 @@ import {
   readFileSync,
   renameSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -26,6 +27,94 @@ const vendorParent = dirname(vendorRoot);
 const versionPath = join(vendorRoot, "VERSION");
 const preparationLock = `${vendorRoot}.prepare-lock`;
 const allTargets = Object.keys(release.assets).sort();
+const INCOMPLETE_LOCK_GRACE_MS = 30_000;
+
+function processIsRunning(pid) {
+  if (!Number.isSafeInteger(pid) || pid <= 0) {
+    return false;
+  }
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error?.code !== "ESRCH";
+  }
+}
+
+function acquirePreparationLock() {
+  const owner = {
+    pid: process.pid,
+    token: randomUUID(),
+    createdAt: Date.now(),
+  };
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      // `wx` makes ownership acquisition atomic. The token prevents this process from deleting a
+      // replacement lock during cleanup.
+      writeFileSync(preparationLock, `${JSON.stringify(owner)}\n`, {
+        encoding: "utf8",
+        flag: "wx",
+        mode: 0o600,
+      });
+      return owner.token;
+    } catch (error) {
+      if (error?.code !== "EEXIST") {
+        throw error;
+      }
+    }
+
+    let existing;
+    try {
+      existing = JSON.parse(readFileSync(preparationLock, "utf8"));
+    } catch {
+      // A writer can be between exclusive creation and its synchronous write. Do not steal a
+      // fresh unreadable lock; an interrupted/incomplete marker becomes recoverable after grace.
+      let ageMs;
+      try {
+        ageMs = Date.now() - statSync(preparationLock).mtimeMs;
+      } catch (error) {
+        if (error?.code === "ENOENT") {
+          continue;
+        }
+        throw error;
+      }
+      if (ageMs < INCOMPLETE_LOCK_GRACE_MS) {
+        throw new Error(
+          `Another AgentMail CLI preparation is already using ${preparationLock}.`,
+        );
+      }
+    }
+    if (processIsRunning(existing?.pid)) {
+      throw new Error(
+        `Another AgentMail CLI preparation (pid ${existing.pid}) is already using ${preparationLock}.`,
+      );
+    }
+
+    // Rename the exact stale marker out of the lock path before deletion. A competing recovery can
+    // then win acquisition without either process deleting the other's new lock.
+    const staleLock = `${preparationLock}.stale-${process.pid}-${randomUUID()}`;
+    try {
+      renameSync(preparationLock, staleLock);
+      rmSync(staleLock, { recursive: true, force: true });
+    } catch (error) {
+      if (error?.code !== "ENOENT") {
+        throw error;
+      }
+    }
+  }
+  throw new Error(`Could not acquire AgentMail CLI preparation lock ${preparationLock}.`);
+}
+
+function releasePreparationLock(token) {
+  try {
+    const owner = JSON.parse(readFileSync(preparationLock, "utf8"));
+    if (owner?.pid === process.pid && owner?.token === token) {
+      rmSync(preparationLock, { force: true });
+    }
+  } catch {
+    // Best effort. A missing or replaced lock belongs to no work this process may clean up.
+  }
+}
 
 function currentTarget() {
   const key = `${process.platform}-${process.arch}`;
@@ -110,16 +199,7 @@ async function prepareTarget(target, temporaryRoot, destinationRoot) {
 
 async function main() {
   mkdirSync(vendorParent, { recursive: true });
-  try {
-    mkdirSync(preparationLock);
-  } catch (error) {
-    if (error?.code === "EEXIST") {
-      throw new Error(
-        `Another AgentMail CLI preparation is already using ${preparationLock}.`,
-      );
-    }
-    throw error;
-  }
+  const preparationLockToken = acquirePreparationLock();
 
   let temporaryRoot;
   let stagingParent;
@@ -198,7 +278,7 @@ async function main() {
     if (stagingParent) {
       rmSync(stagingParent, { recursive: true, force: true });
     }
-    rmSync(preparationLock, { recursive: true, force: true });
+    releasePreparationLock(preparationLockToken);
   }
 }
 

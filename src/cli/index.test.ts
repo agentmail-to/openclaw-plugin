@@ -85,6 +85,17 @@ describe("AgentMail CLI bridge", () => {
         undefined,
       ),
     ).toEqual(["--transform", "--base-url=literal-output", "inboxes", "list"]);
+    expect(
+      withConfiguredBaseUrl(
+        ["inboxes:messages", "send", "--subject", "--base-url=is restricted"],
+        undefined,
+      ),
+    ).toEqual([
+      "inboxes:messages",
+      "send",
+      "--subject",
+      "--base-url=is restricted",
+    ]);
   });
 
   it("removes inherited endpoint selectors while preserving credentials", () => {

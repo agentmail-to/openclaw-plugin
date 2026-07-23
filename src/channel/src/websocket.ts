@@ -17,6 +17,7 @@ import {
 import type { AgentMailIngressRecord, ResolvedAgentMailAccount } from "./types.js";
 
 const AGENTMAIL_WEBSOCKET_LIVE_QUEUE_MAX = 32;
+const AGENTMAIL_WEBSOCKET_STABLE_CONNECTION_MS = 30_000;
 // A single record must not pin the one bounded live worker forever. After this many failed durable
 // admissions, hand the record to REST catch-up (which retains the provider-side source) so later
 // live events keep advancing.
@@ -98,6 +99,7 @@ export async function startAgentMailWebSocket(params: {
   catchUpIntervalMs?: number;
   deepSweepIntervalMs?: number;
   client?: AgentMailClient;
+  now?: () => number;
 }): Promise<void> {
   const client = params.client ?? createAgentMailClient(params.account);
   const catchUpSession =
@@ -110,6 +112,7 @@ export async function startAgentMailWebSocket(params: {
   const retryDelay = params.retryDelayMs ?? websocketRetryDelayMs;
   const reconnectDelay = params.reconnectDelayMs ?? retryDelay;
   const liveQueueMax = params.liveQueueMax ?? AGENTMAIL_WEBSOCKET_LIVE_QUEUE_MAX;
+  const now = params.now ?? Date.now;
   const liveQueue: AgentMailIngressRecord[] = [];
   const queuedMessageIds = new Set<string>();
   let liveWorker: Promise<void> | undefined;
@@ -232,6 +235,7 @@ export async function startAgentMailWebSocket(params: {
         continue;
       }
       let subscribedForCurrentConnection = false;
+      let subscribedAtMs: number | undefined;
       const subscribe = () => {
         if (subscribedForCurrentConnection) {
           return;
@@ -242,6 +246,7 @@ export async function startAgentMailWebSocket(params: {
           eventTypes: ["message.received"],
         });
         subscribedForCurrentConnection = true;
+        subscribedAtMs = now();
         params.log?.info?.(
           `AgentMail WebSocket subscribed for account ${params.account.accountId}`,
         );
@@ -260,7 +265,6 @@ export async function startAgentMailWebSocket(params: {
           resolve();
         };
         socket.on("open", () => {
-          reconnectAttempt = 0;
           subscribe();
         });
         socket.on("close", settleClosed);
@@ -286,6 +290,15 @@ export async function startAgentMailWebSocket(params: {
       socket.close();
       if (params.abortSignal.aborted) {
         return;
+      }
+      // An `open` event alone does not prove a healthy connection: resetting there turns repeated
+      // open/close flaps into a zero-attempt reconnect loop. Reset only after the socket remained
+      // subscribed for a meaningful interval.
+      if (
+        subscribedAtMs !== undefined &&
+        now() - subscribedAtMs >= AGENTMAIL_WEBSOCKET_STABLE_CONNECTION_MS
+      ) {
+        reconnectAttempt = 0;
       }
       // Unexpected close: reconnect after a bounded backoff. REST catch-up covers the gap.
       params.log?.warn?.(

@@ -78,6 +78,9 @@ For credential safety, command arguments cannot override `--base-url`; only the
 operator-controlled plugin setting above can select the AgentMail API endpoint. The passthrough
 also rejects `--environment` and removes inherited endpoint-selector and standard proxy environment
 variables (`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, and `NO_PROXY`, including lowercase forms).
+If a command value must literally begin with `--base-url` or `--environment`, use the CLI's
+`--option=value` form (for example, `--subject=--base-url-is-restricted`). The endpoint guard fails
+closed for unrecognized separate-value options.
 
 ### Channel config
 

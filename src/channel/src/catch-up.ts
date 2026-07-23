@@ -190,12 +190,24 @@ function normalizeCursor(value: unknown): AgentMailCatchUpCursor | null {
 function mergeCursor(
   currentValue: unknown,
   next: Pick<AgentMailCatchUpCursor, "baselineAtMs" | "highWaterAtMs" | "established">,
+  upperBoundAtMs: number,
 ): AgentMailCatchUpCursor {
   const current = normalizeCursor(currentValue);
+  const baselineAtMs = Math.min(
+    upperBoundAtMs,
+    current?.baselineAtMs ?? next.baselineAtMs,
+    next.baselineAtMs,
+  );
   return {
     version: CURSOR_VERSION,
-    baselineAtMs: current?.baselineAtMs ?? next.baselineAtMs,
-    highWaterAtMs: Math.max(current?.highWaterAtMs ?? 0, next.highWaterAtMs),
+    baselineAtMs,
+    // A wall-clock rollback must be allowed to lower a cursor that is now in the future. Within
+    // the current clock horizon, concurrent updates still merge monotonically.
+    highWaterAtMs: Math.max(
+      baselineAtMs,
+      Math.min(upperBoundAtMs, current?.highWaterAtMs ?? 0),
+      Math.min(upperBoundAtMs, next.highWaterAtMs),
+    ),
     established: current?.established === true || next.established,
   };
 }
@@ -206,19 +218,20 @@ async function persistCursor(params: {
   baselineAtMs: number;
   highWaterAtMs: number;
   established: boolean;
+  upperBoundAtMs: number;
 }): Promise<void> {
   const update = params.store.update;
   if (update) {
     await update(
       params.key,
-      (currentValue) => mergeCursor(currentValue, params),
+      (currentValue) => mergeCursor(currentValue, params, params.upperBoundAtMs),
       { ttlMs: AGENTMAIL_REST_CATCH_UP_CURSOR_TTL_MS },
     );
     return;
   }
   await params.store.register(
     params.key,
-    mergeCursor(await params.store.lookup(params.key), params),
+    mergeCursor(await params.store.lookup(params.key), params, params.upperBoundAtMs),
     { ttlMs: AGENTMAIL_REST_CATCH_UP_CURSOR_TTL_MS },
   );
 }
@@ -298,14 +311,21 @@ export async function createAgentMailCatchUpSession(params: {
       // the durable retention window and since monitoring began, but deliberately does not scan
       // before the baseline, which would re-inject pre-monitoring history.
       const sweepAtMs = now();
+      // If the host clock moved backwards, both stored bounds can be in the future. Clamp the
+      // effective cursor for this run and persist the repaired value after a successful sweep.
+      const effectiveBaselineAtMs = Math.min(storedCursor.baselineAtMs, sweepAtMs);
+      const effectiveHighWaterAtMs = Math.max(
+        effectiveBaselineAtMs,
+        Math.min(storedCursor.highWaterAtMs, sweepAtMs),
+      );
       const recoveryFloorMs = sweepAtMs - AGENTMAIL_DURABLE_PENDING_TTL_MS;
       const beforeMs = sweepAtMs + 1;
       const baseAfterMs =
         sinceBaseline || !storedCursor.established
-          ? storedCursor.baselineAtMs
-          : storedCursor.highWaterAtMs - AGENTMAIL_REST_CATCH_UP_OVERLAP_MS;
+          ? effectiveBaselineAtMs
+          : effectiveHighWaterAtMs - AGENTMAIL_REST_CATCH_UP_OVERLAP_MS;
       const afterMs = Math.max(0, baseAfterMs, recoveryFloorMs);
-      let highWaterAtMs = storedCursor.highWaterAtMs;
+      let highWaterAtMs = effectiveHighWaterAtMs;
       let pageCursor: string | undefined;
       let admitted = 0;
       do {
@@ -327,7 +347,6 @@ export async function createAgentMailCatchUpSession(params: {
           },
           { abortSignal },
         );
-        let pageAdvanced = false;
         for (const message of page.messages) {
           if (abortSignal.aborted) {
             return;
@@ -380,18 +399,6 @@ export async function createAgentMailCatchUpSession(params: {
           }
           admitted += 1;
           highWaterAtMs = Math.max(highWaterAtMs, receivedAt);
-          pageAdvanced = true;
-        }
-        if (pageAdvanced) {
-          // Persist once per page. If admission fails mid-page, the cursor stays behind the page
-          // and durable message-id dedupe safely absorbs the repeated prefix on the next pass.
-          await persistCursor({
-            store,
-            key,
-            baselineAtMs: storedCursor.baselineAtMs,
-            highWaterAtMs,
-            established: false,
-          });
         }
         pageCursor = page.nextPageToken;
       } while (pageCursor && !abortSignal.aborted);
@@ -402,9 +409,10 @@ export async function createAgentMailCatchUpSession(params: {
       await persistCursor({
         store,
         key,
-        baselineAtMs: storedCursor.baselineAtMs,
+        baselineAtMs: effectiveBaselineAtMs,
         highWaterAtMs,
         established: true,
+        upperBoundAtMs: sweepAtMs,
       });
       if (admitted > 0) {
         params.log?.info?.(
