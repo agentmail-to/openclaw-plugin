@@ -196,7 +196,7 @@ describe("AgentMail durable REST catch-up", () => {
     );
   });
 
-  it("does not advance the cursor beyond the sweep's fixed upper bound", async () => {
+  it("does not advance the cursor from an invalid timestamp's local fallback", async () => {
     const store = memoryStore<never>();
     const malformed = message({ id: "bad_timestamp", timestamp: 1_100 }) as AgentMail.MessageItem;
     (malformed as { timestamp: unknown }).timestamp = new Date(Number.NaN);
@@ -223,7 +223,41 @@ describe("AgentMail durable REST catch-up", () => {
     expect(list).toHaveBeenLastCalledWith(
       "inbox_1",
       expect.objectContaining({
-        after: new Date(2_000_000 - AGENTMAIL_REST_CATCH_UP_OVERLAP_MS),
+        after: new Date(1_000_000 - AGENTMAIL_REST_CATCH_UP_OVERLAP_MS),
+      }),
+      expect.any(Object),
+    );
+  });
+
+  it("does not regress a stored high-water mark when the clock moves backward", async () => {
+    const store = memoryStore<never>();
+    const list = vi
+      .fn()
+      .mockResolvedValueOnce({
+        count: 1,
+        messages: [message({ id: "message_1", timestamp: 1_900_000 })],
+      })
+      .mockResolvedValue({ count: 0, messages: [] });
+    let nowMs = 1_000_000;
+    const session = await createAgentMailCatchUpSession({
+      account,
+      client: { inboxes: { messages: { list } } } as never,
+      store: store as never,
+      now: () => nowMs,
+    });
+    const receive = vi.fn(async () => undefined);
+
+    nowMs = 2_000_000;
+    await session.run({ receive, abortSignal: new AbortController().signal });
+    nowMs = 1_500_000;
+    await session.run({ receive, abortSignal: new AbortController().signal });
+    nowMs = 2_000_000;
+    await session.run({ receive, abortSignal: new AbortController().signal });
+
+    expect(list).toHaveBeenLastCalledWith(
+      "inbox_1",
+      expect.objectContaining({
+        after: new Date(1_900_000 - AGENTMAIL_REST_CATCH_UP_OVERLAP_MS),
       }),
       expect.any(Object),
     );

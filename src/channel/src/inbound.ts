@@ -270,7 +270,7 @@ export async function dispatchAgentMailInboundEvent(params: {
   let detachAbortCleanup = () => {};
   if (params.abortSignal) {
     const onAbort = () => {
-      if (!turnAdoptionObserved) {
+      if (!turnAdoptionObserved && !turnDeferred) {
         void cleanupInboundMedia();
       }
     };

@@ -187,38 +187,28 @@ async function persistCursor(params: {
   upperBoundAtMs: number;
   established: boolean;
 }): Promise<void> {
+  const merge = (currentValue: unknown): AgentMailCatchUpCursor => {
+    const current = normalizeCursor(currentValue);
+    const baselineAtMs = current?.baselineAtMs ?? params.baselineAtMs;
+    return {
+      version: CURSOR_VERSION,
+      baselineAtMs,
+      // A backward-moving clock may lower this run's upper bound, but must never lower a
+      // high-water mark already committed by an earlier run. Clamp only the new contribution.
+      highWaterAtMs: Math.max(
+        baselineAtMs,
+        current?.highWaterAtMs ?? 0,
+        Math.min(params.upperBoundAtMs, params.highWaterAtMs),
+      ),
+      established: current?.established === true || params.established,
+    };
+  };
   const update = params.store.update;
   if (update) {
-    await update(params.key, (currentValue) => {
-      const current = normalizeCursor(currentValue);
-      return {
-        version: CURSOR_VERSION,
-        baselineAtMs: current?.baselineAtMs ?? params.baselineAtMs,
-        highWaterAtMs: Math.max(
-          current?.baselineAtMs ?? params.baselineAtMs,
-          Math.min(
-            params.upperBoundAtMs,
-            Math.max(current?.highWaterAtMs ?? 0, params.highWaterAtMs),
-          ),
-        ),
-        established: current?.established === true || params.established,
-      };
-    });
+    await update(params.key, merge);
     return;
   }
-  const current = normalizeCursor(await params.store.lookup(params.key));
-  await params.store.register(params.key, {
-    version: CURSOR_VERSION,
-    baselineAtMs: current?.baselineAtMs ?? params.baselineAtMs,
-    highWaterAtMs: Math.max(
-      current?.baselineAtMs ?? params.baselineAtMs,
-      Math.min(
-        params.upperBoundAtMs,
-        Math.max(current?.highWaterAtMs ?? 0, params.highWaterAtMs),
-      ),
-    ),
-    established: current?.established === true || params.established,
-  });
+  await params.store.register(params.key, merge(await params.store.lookup(params.key)));
 }
 
 export async function createAgentMailCatchUpSession(params: {
@@ -304,16 +294,18 @@ export async function createAgentMailCatchUpSession(params: {
           }
           // Invalid provider time must not turn a missed live event into a permanent drop. Admit
           // with local observation time; durable message-id dedupe keeps overlap scans safe.
-          const messageTimestampMs =
-            resolveReceivedAgentMailMessageTimestampMs(message, params.account.inboxId) ??
-            scanUpperBoundAtMs;
+          const providerTimestampMs = resolveReceivedAgentMailMessageTimestampMs(
+            message,
+            params.account.inboxId,
+          );
+          const admissionTimestampMs = providerTimestampMs ?? scanUpperBoundAtMs;
           try {
             await receive({
               accountId: params.account.accountId,
               inboxId: params.account.inboxId,
               messageId: message.messageId,
               transport: "rest",
-              receivedAt: messageTimestampMs,
+              receivedAt: admissionTimestampMs,
               arrivedAt: now(),
             });
           } catch (error) {
@@ -329,11 +321,16 @@ export async function createAgentMailCatchUpSession(params: {
             throw error;
           }
           admitted += 1;
-          highWaterAtMs = Math.max(
-            highWaterAtMs,
-            Math.min(messageTimestampMs, scanUpperBoundAtMs),
-          );
-          pageAdvanced = true;
+          // Local observation time makes an invalid provider timestamp admissible, but it is not
+          // evidence that every older provider message has been indexed. Only real provider time
+          // may advance the REST scan cursor.
+          if (providerTimestampMs !== null) {
+            highWaterAtMs = Math.max(
+              highWaterAtMs,
+              Math.min(providerTimestampMs, scanUpperBoundAtMs),
+            );
+            pageAdvanced = true;
+          }
         }
         if (pageAdvanced) {
           // Persist once per page. If admission fails mid-page, the cursor stays behind the page

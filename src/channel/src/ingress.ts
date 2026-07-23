@@ -8,12 +8,7 @@ import type { AgentMailIngressRecord } from "./types.js";
 // Re-exported for transports (websocket) that catch capacity backpressure by class.
 export { AgentMailIngressCapacityError };
 
-type AgentMailJournal = ReturnType<typeof createAgentMailDurableInboundReceiveJournal> & {
-  fail?: (
-    id: string,
-    options: { reason: string; message?: string; failedAt?: number },
-  ) => Promise<boolean>;
-};
+type AgentMailJournal = ReturnType<typeof createAgentMailDurableInboundReceiveJournal>;
 
 type DispatchParams = {
   journal: AgentMailJournal;
@@ -77,6 +72,24 @@ type ActiveDispatch = {
 const activeDispatches = new Map<string, ActiveDispatch>();
 
 const retryDelayMs = createBackoff(30 * 60_000);
+
+async function completeAgentMailIngress(params: {
+  journal: AgentMailJournal;
+  id: string;
+  record: AgentMailIngressRecord;
+}): Promise<void> {
+  // REST catch-up scans by provider timestamp. A live message stamped in the future must retain its
+  // tombstone until seven days after that provider time, or it can re-enter the scan window only
+  // after a locally-timestamped completion marker has already expired.
+  const completedAt = Date.now();
+  const providerReceivedAt =
+    Number.isFinite(params.record.receivedAt) && params.record.receivedAt >= 0
+      ? params.record.receivedAt
+      : completedAt;
+  await params.journal.complete(params.id, {
+    completedAt: Math.max(completedAt, providerReceivedAt),
+  });
+}
 
 // True when a dispatch failure is a provider-projection race: either a 404 (message not yet
 // REST-visible) or a not-yet-projected `received` label. Both resolve on their own within seconds.
@@ -203,7 +216,7 @@ async function dispatchAgentMailIngressUntilSettled(params: DispatchParams): Pro
         adoptionTask = (async () => {
           while (!params.abortSignal?.aborted) {
             try {
-              await params.journal.complete(params.id);
+              await completeAgentMailIngress(params);
               params.dispatchCompleted = true;
               turnAdopted = true;
               settleDeferred("adopted");
@@ -308,7 +321,7 @@ async function dispatchAgentMailIngressUntilSettled(params: DispatchParams): Pro
                 message: lastError,
               });
             } else {
-              await params.journal.complete(params.id);
+              await completeAgentMailIngress(params);
             }
           } catch {
             // Best effort: TTL pruning still reclaims the row if the terminal marker cannot
@@ -346,7 +359,7 @@ async function dispatchAgentMailIngressUntilSettled(params: DispatchParams): Pro
                 message: errorText(dispatchError),
               });
             } else {
-              await params.journal.complete(params.id);
+              await completeAgentMailIngress(params);
             }
           } catch {
             // Best effort: TTL pruning still reclaims the row if the terminal marker cannot persist.
@@ -394,7 +407,7 @@ async function dispatchAgentMailIngressUntilSettled(params: DispatchParams): Pro
       params.dispatchCompleted = true;
     }
     try {
-      await params.journal.complete(params.id);
+      await completeAgentMailIngress(params);
       return true;
     } catch {
       completionAttempts += 1;

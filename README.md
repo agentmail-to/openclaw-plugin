@@ -104,6 +104,10 @@ Security defaults worth knowing:
 - `dmPolicy: "open"` requires `allowFrom` to include `"*"`.
 - Every reply re-hydrates the triggering message and re-authorizes its `From`, so an untrusted `Reply-To` cannot redirect delivery.
 
+The configured `inboxId` also identifies the durable receive queue. Keep its casing stable across
+upgrades: changing only letter case can create a new queue identity, so messages covered only by
+older completion tombstones may be dispatched once more during the migration.
+
 ## Tools
 
 | Tool | Purpose |

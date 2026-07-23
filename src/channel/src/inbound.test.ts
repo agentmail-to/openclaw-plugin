@@ -337,13 +337,16 @@ describe("AgentMail REST-authoritative inbound", () => {
     expect(onTurnAbandoned).toHaveBeenCalledOnce();
   });
 
-  it("cleans up deferred-turn attachments when account shutdown aborts the queued turn", async () => {
+  it("does not delete core-owned deferred attachments when account shutdown aborts", async () => {
     rm.mockClear();
     loadAgentMailInboundAttachments.mockResolvedValueOnce({
       paths: ["/tmp/deferred-abort.bin"],
       types: ["application/octet-stream"],
     });
     const controller = new AbortController();
+    let lifecycle:
+      | { onDeferred: () => void; onAbandoned: () => Promise<void> }
+      | undefined;
     await dispatchAgentMailInboundEvent({
       cfg: {},
       account,
@@ -355,9 +358,10 @@ describe("AgentMail REST-authoritative inbound", () => {
           run: async ({
             turnAdoptionLifecycle,
           }: {
-            turnAdoptionLifecycle: { onDeferred: () => void };
+            turnAdoptionLifecycle: typeof lifecycle;
           }) => {
-            turnAdoptionLifecycle.onDeferred();
+            lifecycle = turnAdoptionLifecycle;
+            turnAdoptionLifecycle?.onDeferred();
           },
         },
         session: { resolveStorePath: () => "/tmp/s.json", recordInboundSession: vi.fn() },
@@ -369,9 +373,11 @@ describe("AgentMail REST-authoritative inbound", () => {
     expect(rm).not.toHaveBeenCalled();
 
     controller.abort();
-    await vi.waitFor(() =>
-      expect(rm).toHaveBeenCalledWith("/tmp/deferred-abort.bin", { force: true }),
-    );
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(rm).not.toHaveBeenCalled();
+
+    await lifecycle?.onAbandoned();
+    expect(rm).toHaveBeenCalledWith("/tmp/deferred-abort.bin", { force: true });
   });
 
   it("cleans up attachments when inbound handling resolves without adoption", async () => {
