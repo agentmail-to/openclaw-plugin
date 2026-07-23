@@ -14,14 +14,14 @@ import { AgentMailChannelConfigSchema } from "../dist/channel/src/config-schema.
 
 const MANIFEST_PATH = fileURLToPath(new URL("../openclaw.plugin.json", import.meta.url));
 
-const DESCRIPTION =
-  "AgentMail for OpenClaw: a CLI-backed skill plus a durable, allowlisted, reply-only email channel.";
+const packageJson = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
+const DESCRIPTION = packageJson.description;
 
 const manifest = {
   id: "agentmail",
   name: "AgentMail",
   description: DESCRIPTION,
-  version: JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")).version,
+  version: packageJson.version,
   configSchema: agentMailCliConfigJsonSchema,
   activation: { onStartup: true },
   channels: ["agentmail"],

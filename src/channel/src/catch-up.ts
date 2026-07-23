@@ -16,7 +16,9 @@ const CURSOR_VERSION = 1;
 const PAGE_LIMIT = 100;
 
 export const AGENTMAIL_REST_CATCH_UP_NAMESPACE = "agentmail.rest-catch-up";
+export const AGENTMAIL_REST_CATCH_UP_LEGACY_MAX_ACCOUNTS = 1_000;
 export const AGENTMAIL_REST_CATCH_UP_MAX_ENTRIES_PER_ACCOUNT = 1;
+export const AGENTMAIL_REST_CATCH_UP_CURSOR_TTL_MS = 90 * 24 * 60 * 60 * 1000;
 export const AGENTMAIL_REST_CATCH_UP_OVERLAP_MS = 5 * 60_000;
 // Periodic overlap covers half-open sockets and provider webhook gaps; the less frequent deep sweep
 // lists from the baseline so back-dated mail below the overlap window is still recovered. Both run
@@ -150,6 +152,12 @@ function cursorKey(account: ResolvedAgentMailAccount): string {
   return sha256Hex(`${account.accountId}\n${account.inboxId}`);
 }
 
+function cursorNamespace(account: ResolvedAgentMailAccount): string {
+  // Namespace by account rather than inbox so rotation reuses the bounded store and evicts the old
+  // inbox cursor. The hash keeps operator-provided account ids out of state paths.
+  return `${AGENTMAIL_REST_CATCH_UP_NAMESPACE}.${sha256Hex(account.accountId)}`;
+}
+
 function validTimestamp(value: unknown): value is number {
   return typeof value === "number" && Number.isFinite(value) && value >= 0;
 }
@@ -193,24 +201,32 @@ async function persistCursor(params: {
 }): Promise<void> {
   const update = params.store.update;
   if (update) {
-    await update(params.key, (currentValue) => {
-      const current = normalizeCursor(currentValue);
-      return {
-        version: CURSOR_VERSION,
-        baselineAtMs: current?.baselineAtMs ?? params.baselineAtMs,
-        highWaterAtMs: Math.max(current?.highWaterAtMs ?? 0, params.highWaterAtMs),
-        established: current?.established === true || params.established,
-      };
-    });
+    await update(
+      params.key,
+      (currentValue) => {
+        const current = normalizeCursor(currentValue);
+        return {
+          version: CURSOR_VERSION,
+          baselineAtMs: current?.baselineAtMs ?? params.baselineAtMs,
+          highWaterAtMs: Math.max(current?.highWaterAtMs ?? 0, params.highWaterAtMs),
+          established: current?.established === true || params.established,
+        };
+      },
+      { ttlMs: AGENTMAIL_REST_CATCH_UP_CURSOR_TTL_MS },
+    );
     return;
   }
   const current = normalizeCursor(await params.store.lookup(params.key));
-  await params.store.register(params.key, {
-    version: CURSOR_VERSION,
-    baselineAtMs: current?.baselineAtMs ?? params.baselineAtMs,
-    highWaterAtMs: Math.max(current?.highWaterAtMs ?? 0, params.highWaterAtMs),
-    established: current?.established === true || params.established,
-  });
+  await params.store.register(
+    params.key,
+    {
+      version: CURSOR_VERSION,
+      baselineAtMs: current?.baselineAtMs ?? params.baselineAtMs,
+      highWaterAtMs: Math.max(current?.highWaterAtMs ?? 0, params.highWaterAtMs),
+      established: current?.established === true || params.established,
+    },
+    { ttlMs: AGENTMAIL_REST_CATCH_UP_CURSOR_TTL_MS },
+  );
 }
 
 export async function createAgentMailCatchUpSession(params: {
@@ -222,16 +238,59 @@ export async function createAgentMailCatchUpSession(params: {
 }): Promise<AgentMailCatchUpSession> {
   const now = params.now ?? Date.now;
   const key = cursorKey(params.account);
-  const store =
-    params.store ??
-    getAgentMailRuntime().state.openKeyedStore<AgentMailCatchUpCursor>({
-      // Isolate each account in its own one-entry namespace. A shared reject-new namespace capped
-      // at 1,000 entries left every later account without a cursor and made its supervisor retry
-      // forever. The hashed suffix keeps account and inbox identifiers out of state paths.
-      namespace: `${AGENTMAIL_REST_CATCH_UP_NAMESPACE}.${key}`,
+  let store = params.store;
+  if (!store) {
+    const state = getAgentMailRuntime().state;
+    const accountStore = state.openKeyedStore<AgentMailCatchUpCursor>({
+      // Isolate each account in its own one-entry namespace. Inbox rotation evicts the prior cursor,
+      // while inactive rows expire instead of accumulating forever.
+      namespace: cursorNamespace(params.account),
       maxEntries: AGENTMAIL_REST_CATCH_UP_MAX_ENTRIES_PER_ACCOUNT,
-      overflowPolicy: "reject-new",
+      overflowPolicy: "evict-oldest",
+      defaultTtlMs: AGENTMAIL_REST_CATCH_UP_CURSOR_TTL_MS,
     });
+    store = accountStore;
+    if (!normalizeCursor(await accountStore.lookup(key))) {
+      const migrateFrom = async (
+        source: PluginStateKeyedStore<AgentMailCatchUpCursor>,
+      ): Promise<boolean> => {
+        const previousCursor = normalizeCursor(await source.lookup(key));
+        if (!previousCursor) {
+          return false;
+        }
+        await accountStore.registerIfAbsent(key, previousCursor, {
+          ttlMs: AGENTMAIL_REST_CATCH_UP_CURSOR_TTL_MS,
+        });
+        if (normalizeCursor(await accountStore.lookup(key))) {
+          try {
+            await source.delete(key);
+          } catch (error) {
+            params.log?.warn?.(
+              `AgentMail could not remove a migrated catch-up cursor: ${errorText(error)}`,
+            );
+          }
+          return true;
+        }
+        return false;
+      };
+      // Upgrade migration: first check the short-lived per-inbox namespace used by early builds of
+      // this PR, then the original shared namespace. Copy before creating a fresh baseline so mail
+      // received between shutdown and upgraded startup remains inside the recovery window.
+      const previousAccountStore = state.openKeyedStore<AgentMailCatchUpCursor>({
+        namespace: `${AGENTMAIL_REST_CATCH_UP_NAMESPACE}.${key}`,
+        maxEntries: AGENTMAIL_REST_CATCH_UP_MAX_ENTRIES_PER_ACCOUNT,
+        overflowPolicy: "reject-new",
+      });
+      if (!(await migrateFrom(previousAccountStore))) {
+        const legacyStore = state.openKeyedStore<AgentMailCatchUpCursor>({
+          namespace: AGENTMAIL_REST_CATCH_UP_NAMESPACE,
+          maxEntries: AGENTMAIL_REST_CATCH_UP_LEGACY_MAX_ACCOUNTS,
+          overflowPolicy: "reject-new",
+        });
+        await migrateFrom(legacyStore);
+      }
+    }
+  }
   const initialAtMs = now();
   const initialCursor: AgentMailCatchUpCursor = {
     version: CURSOR_VERSION,
@@ -239,7 +298,9 @@ export async function createAgentMailCatchUpSession(params: {
     highWaterAtMs: initialAtMs,
     established: false,
   };
-  await store.registerIfAbsent(key, initialCursor);
+  await store.registerIfAbsent(key, initialCursor, {
+    ttlMs: AGENTMAIL_REST_CATCH_UP_CURSOR_TTL_MS,
+  });
   const client = params.client ?? createAgentMailClient(params.account);
 
   return {

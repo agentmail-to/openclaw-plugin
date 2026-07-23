@@ -239,7 +239,7 @@
           },
           "mediaMaxMb": {
             "type": "number",
-            "minimum": 1,
+            "exclusiveMinimum": 0,
             "maximum": 100
           },
           "accounts": {
@@ -442,7 +442,7 @@
                 },
                 "mediaMaxMb": {
                   "type": "number",
-                  "minimum": 1,
+                  "exclusiveMinimum": 0,
                   "maximum": 100
                 }
               },

@@ -74,6 +74,8 @@ An optional API base URL override for the bundled CLI belongs under
 
 The previous `timeoutSeconds` and `maxRetries` tool settings remain accepted so existing
 configurations continue to load, but the bundled CLI does not use them.
+For credential safety, command arguments cannot override `--base-url`; only the
+operator-controlled plugin setting above can select the AgentMail API endpoint.
 
 ### Channel config
 
@@ -136,7 +138,7 @@ npm test               # vitest
 verifies its SHA-256 checksum, and regenerates `openclaw.plugin.json`. `npm pack` prepares every
 supported CLI target so installation never runs lifecycle scripts or downloads executables.
 
-CLI release version and checksum pins live in `scripts/agentmail-cli-release.json`. Update that file
+CLI release version and checksum pins live in `src/cli/agentmail-cli-release.json`. Update that file
 when intentionally adopting a new AgentMail CLI release.
 
 ## License

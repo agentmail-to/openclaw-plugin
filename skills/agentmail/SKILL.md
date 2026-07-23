@@ -20,8 +20,8 @@ openclaw agentmail -- <agentmail arguments>
 ```
 
 Always put `--` after `agentmail`; it prevents OpenClaw from interpreting AgentMail flags.
-Never pass `--api-key` or print the API key. Authentication is inherited from
-`AGENTMAIL_API_KEY`.
+Never pass `--api-key`, `--base-url`, or print the API key. Authentication is inherited from
+`AGENTMAIL_API_KEY`, and only operator-controlled plugin configuration may select the API endpoint.
 
 Run this command on the OpenClaw host, not inside an agent sandbox. The bundled executable and
 skill-scoped credentials are available only to host execution.

@@ -24,19 +24,29 @@ describe("AgentMail CLI bridge", () => {
     );
   });
 
-  it("adds the configured base URL unless the caller supplied one", () => {
+  it("allows only the operator-configured API base URL", () => {
     expect(withConfiguredBaseUrl(["inboxes", "list"], "https://example.test/v0")).toEqual([
       "--base-url",
       "https://example.test/v0",
       "inboxes",
       "list",
     ]);
-    expect(
+    expect(withConfiguredBaseUrl(["inboxes", "list"], undefined)).toEqual([
+      "inboxes",
+      "list",
+    ]);
+    expect(() =>
       withConfiguredBaseUrl(
         ["--base-url=https://override.test/v0", "inboxes", "list"],
         "https://example.test/v0",
       ),
-    ).toEqual(["--base-url=https://override.test/v0", "inboxes", "list"]);
+    ).toThrow("endpoint overrides are restricted");
+    expect(() =>
+      withConfiguredBaseUrl(
+        ["inboxes", "list", "--base-url", "https://override.test/v0"],
+        undefined,
+      ),
+    ).toThrow("endpoint overrides are restricted");
   });
 
   it("registers one passthrough command and invokes the bundled CLI runner", async () => {

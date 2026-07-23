@@ -171,10 +171,11 @@ describe("AgentMail account config", () => {
     expect(ids).not.toContain("Sales-US");
   });
 
-  it("bounds mediaMaxMb to a practical range", () => {
+  it("accepts positive fractional mediaMaxMb values and rejects zero or excessive values", () => {
     const runtime = AgentMailChannelConfigSchema.runtime;
     expect(runtime?.safeParse({ mediaMaxMb: 25 }).success).toBe(true);
-    expect(runtime?.safeParse({ mediaMaxMb: 0.000001 }).success).toBe(false);
+    expect(runtime?.safeParse({ mediaMaxMb: 0.5 }).success).toBe(true);
+    expect(runtime?.safeParse({ mediaMaxMb: 0 }).success).toBe(false);
     expect(runtime?.safeParse({ mediaMaxMb: 100_000 }).success).toBe(false);
   });
 

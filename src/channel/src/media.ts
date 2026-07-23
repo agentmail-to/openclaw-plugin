@@ -17,10 +17,16 @@ export type AgentMailInboundMedia = {
 
 export class AgentMailMediaPolicyError extends Error {}
 
+export const AGENTMAIL_INBOUND_MAX_ATTACHMENTS = 25;
+
 function isAcceptedAttachment(attachment: AgentMail.Attachment): boolean {
-  // Content-ID does not imply inline disposition: Outlook, Apple Mail, and forwarded messages can
-  // attach a CID to ordinary downloads. Only an explicit inline disposition is safe to omit.
-  return attachment.contentDisposition !== "inline";
+  // A CID with no explicit disposition is conventionally an embedded body part (logos, signatures,
+  // tracking pixels). Preserve CID-bearing downloads only when the provider explicitly labels them
+  // as attachments.
+  return (
+    attachment.contentDisposition === "attachment" ||
+    (attachment.contentDisposition !== "inline" && !attachment.contentId)
+  );
 }
 
 export async function loadAgentMailInboundAttachments(params: {
@@ -31,6 +37,11 @@ export async function loadAgentMailInboundAttachments(params: {
   maxBytes: number;
 }): Promise<AgentMailInboundMedia> {
   const accepted = params.attachments.filter(isAcceptedAttachment);
+  if (accepted.length > AGENTMAIL_INBOUND_MAX_ATTACHMENTS) {
+    throw new AgentMailMediaPolicyError(
+      `AgentMail message exceeds the ${AGENTMAIL_INBOUND_MAX_ATTACHMENTS}-attachment limit`,
+    );
+  }
   let declaredBytes = 0;
   for (const attachment of accepted) {
     if (attachment.size > params.maxBytes) {

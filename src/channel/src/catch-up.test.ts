@@ -5,12 +5,16 @@ import type {
 } from "openclaw/plugin-sdk/plugin-state-runtime";
 import { describe, expect, it, vi } from "vitest";
 import {
+  AGENTMAIL_REST_CATCH_UP_CURSOR_TTL_MS,
+  AGENTMAIL_REST_CATCH_UP_LEGACY_MAX_ACCOUNTS,
   AGENTMAIL_REST_CATCH_UP_MAX_ENTRIES_PER_ACCOUNT,
   AGENTMAIL_REST_CATCH_UP_NAMESPACE,
   AGENTMAIL_REST_CATCH_UP_OVERLAP_MS,
+  type AgentMailCatchUpCursor,
   createAgentMailCatchUpSession,
   createAgentMailCatchUpSupervisor,
 } from "./catch-up.js";
+import { sha256Hex } from "./digest.js";
 import {
   AGENTMAIL_DURABLE_PENDING_TTL_MS,
   AgentMailIngressCapacityError,
@@ -98,7 +102,10 @@ function message(params: {
 describe("AgentMail durable REST catch-up", () => {
   it("isolates each account cursor in a one-entry state namespace", async () => {
     openKeyedStore.mockReset();
-    openKeyedStore.mockImplementation(() => memoryStore());
+    const legacyStore = memoryStore();
+    openKeyedStore.mockImplementation(({ namespace }) =>
+      namespace === AGENTMAIL_REST_CATCH_UP_NAMESPACE ? legacyStore : memoryStore(),
+    );
     const client = { inboxes: { messages: { list: vi.fn() } } } as never;
 
     await createAgentMailCatchUpSession({ account, client, now: () => 1_000 });
@@ -108,16 +115,137 @@ describe("AgentMail durable REST catch-up", () => {
       now: () => 1_000,
     });
 
-    expect(openKeyedStore).toHaveBeenCalledTimes(2);
+    expect(openKeyedStore).toHaveBeenCalledTimes(6);
     const options = openKeyedStore.mock.calls.map(([value]) => value);
-    expect(options[0]).toMatchObject({
+    const accountOptions = options.filter(
+      ({ overflowPolicy }) => overflowPolicy === "evict-oldest",
+    );
+    expect(accountOptions).toHaveLength(2);
+    expect(accountOptions[0]).toMatchObject({
       maxEntries: AGENTMAIL_REST_CATCH_UP_MAX_ENTRIES_PER_ACCOUNT,
-      overflowPolicy: "reject-new",
+      overflowPolicy: "evict-oldest",
+      defaultTtlMs: AGENTMAIL_REST_CATCH_UP_CURSOR_TTL_MS,
     });
-    expect(options[0].namespace).toMatch(
+    expect(accountOptions[0].namespace).toMatch(
       new RegExp(`^${AGENTMAIL_REST_CATCH_UP_NAMESPACE}\\.`),
     );
-    expect(options[1].namespace).not.toBe(options[0].namespace);
+    expect(accountOptions[1].namespace).not.toBe(accountOptions[0].namespace);
+  });
+
+  it("reuses an account namespace when its inbox rotates", async () => {
+    openKeyedStore.mockReset();
+    const stores = new Map<string, PluginStateKeyedStore<unknown>>();
+    openKeyedStore.mockImplementation(({ namespace }) => {
+      const existing = stores.get(namespace);
+      if (existing) {
+        return existing;
+      }
+      const created = memoryStore();
+      stores.set(namespace, created);
+      return created;
+    });
+    const client = { inboxes: { messages: { list: vi.fn() } } } as never;
+
+    await createAgentMailCatchUpSession({ account, client, now: () => 1_000 });
+    await createAgentMailCatchUpSession({
+      account: { ...account, inboxId: "inbox_rotated" },
+      client,
+      now: () => 2_000,
+    });
+
+    const accountNamespaces = openKeyedStore.mock.calls
+      .map(([options]) => options)
+      .filter(({ overflowPolicy }) => overflowPolicy === "evict-oldest")
+      .map(({ namespace }) => namespace);
+    expect(accountNamespaces).toHaveLength(2);
+    expect(new Set(accountNamespaces).size).toBe(1);
+  });
+
+  it("migrates a legacy shared cursor before establishing a new baseline", async () => {
+    openKeyedStore.mockReset();
+    const legacyStore = memoryStore<AgentMailCatchUpCursor>();
+    const accountStore = memoryStore<AgentMailCatchUpCursor>();
+    const legacyCursor: AgentMailCatchUpCursor = {
+      version: 1,
+      baselineAtMs: 500,
+      highWaterAtMs: 900,
+      established: true,
+    };
+    await legacyStore.register(sha256Hex("default\ninbox_1"), legacyCursor);
+    legacyStore.delete = vi.fn(async () => true);
+    openKeyedStore.mockImplementation(({ namespace }) =>
+      namespace === AGENTMAIL_REST_CATCH_UP_NAMESPACE ? legacyStore : accountStore,
+    );
+    const list = vi.fn(async () => ({ count: 0, messages: [] }));
+
+    const session = await createAgentMailCatchUpSession({
+      account,
+      client: { inboxes: { messages: { list } } } as never,
+      now: () => 10_000,
+    });
+    await session.run({
+      receive: vi.fn(),
+      abortSignal: new AbortController().signal,
+    });
+
+    expect(list).toHaveBeenCalledWith(
+      "inbox_1",
+      expect.objectContaining({
+        after: new Date(Math.max(0, 900 - AGENTMAIL_REST_CATCH_UP_OVERLAP_MS)),
+      }),
+      expect.any(Object),
+    );
+    expect(legacyStore.delete).toHaveBeenCalledOnce();
+    expect(openKeyedStore).toHaveBeenCalledWith({
+      namespace: AGENTMAIL_REST_CATCH_UP_NAMESPACE,
+      maxEntries: AGENTMAIL_REST_CATCH_UP_LEGACY_MAX_ACCOUNTS,
+      overflowPolicy: "reject-new",
+    });
+  });
+
+  it("migrates the earlier per-inbox cursor namespace", async () => {
+    openKeyedStore.mockReset();
+    const key = sha256Hex("default\ninbox_1");
+    const previousStore = memoryStore<AgentMailCatchUpCursor>();
+    const accountStore = memoryStore<AgentMailCatchUpCursor>();
+    await previousStore.register(key, {
+      version: 1,
+      baselineAtMs: 600,
+      highWaterAtMs: 1_200,
+      established: true,
+    });
+    previousStore.delete = vi.fn(async () => true);
+    openKeyedStore.mockImplementation(({ namespace }) => {
+      if (namespace === `${AGENTMAIL_REST_CATCH_UP_NAMESPACE}.${key}`) {
+        return previousStore;
+      }
+      return accountStore;
+    });
+    const list = vi.fn(async () => ({ count: 0, messages: [] }));
+
+    const session = await createAgentMailCatchUpSession({
+      account,
+      client: { inboxes: { messages: { list } } } as never,
+      now: () => 10_000,
+    });
+    await session.run({
+      receive: vi.fn(),
+      abortSignal: new AbortController().signal,
+    });
+
+    expect(list).toHaveBeenCalledWith(
+      "inbox_1",
+      expect.objectContaining({
+        after: new Date(Math.max(0, 1_200 - AGENTMAIL_REST_CATCH_UP_OVERLAP_MS)),
+      }),
+      expect.any(Object),
+    );
+    expect(previousStore.delete).toHaveBeenCalledWith(key);
+    expect(
+      openKeyedStore.mock.calls.some(
+        ([options]) => options.namespace === AGENTMAIL_REST_CATCH_UP_NAMESPACE,
+      ),
+    ).toBe(false);
   });
 
   it("coalesces recovery requests into one bounded retry supervisor", async () => {

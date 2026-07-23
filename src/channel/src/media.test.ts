@@ -1,6 +1,7 @@
 import { MediaFetchError } from "openclaw/plugin-sdk/media-runtime";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  AGENTMAIL_INBOUND_MAX_ATTACHMENTS,
   AgentMailMediaPolicyError,
   loadAgentMailInboundAttachments,
   loadAgentMailOutboundAttachments,
@@ -66,7 +67,7 @@ describe("AgentMail inbound attachments", () => {
     expect(saveMediaBuffer).not.toHaveBeenCalled();
   });
 
-  it("skips only explicit inline parts and keeps downloadable CID attachments", async () => {
+  it("skips inline CID parts and keeps explicitly downloadable CID attachments", async () => {
     loadWebMediaRaw.mockResolvedValueOnce({
       buffer: Buffer.from("download"),
       contentType: "application/octet-stream",
@@ -86,6 +87,7 @@ describe("AgentMail inbound attachments", () => {
         messageId: "message_1",
         attachments: [
           { attachmentId: "inline", size: 1, contentDisposition: "inline" },
+          { attachmentId: "implicit-inline", size: 1, contentId: "logo@cid" },
           {
             attachmentId: "cid",
             size: 8,
@@ -101,6 +103,23 @@ describe("AgentMail inbound attachments", () => {
     });
     expect(getAttachment).toHaveBeenCalledOnce();
     expect(getAttachment).toHaveBeenCalledWith("inbox_1", "message_1", "cid");
+  });
+
+  it("rejects excessive attachment counts before downloading", async () => {
+    const getAttachment = vi.fn();
+    await expect(
+      loadAgentMailInboundAttachments({
+        client: { inboxes: { messages: { getAttachment } } } as never,
+        inboxId: "inbox_1",
+        messageId: "message_1",
+        attachments: Array.from(
+          { length: AGENTMAIL_INBOUND_MAX_ATTACHMENTS + 1 },
+          (_, index) => ({ attachmentId: `attachment-${index}`, size: 0 }),
+        ),
+        maxBytes: 100,
+      }),
+    ).rejects.toThrow("attachment limit");
+    expect(getAttachment).not.toHaveBeenCalled();
   });
 
   it("classifies static attachment size violations as terminal policy rejections", async () => {

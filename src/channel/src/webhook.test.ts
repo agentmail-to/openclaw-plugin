@@ -175,7 +175,7 @@ describe("AgentMail webhook", () => {
     expect(receive).not.toHaveBeenCalled();
   });
 
-  it("acknowledges a signed received event with an invalid provider timestamp", async () => {
+  it("falls back to arrival time for an invalid provider timestamp", async () => {
     const body = JSON.stringify({
       type: "event",
       event_type: "message.received",
@@ -186,13 +186,43 @@ describe("AgentMail webhook", () => {
       },
     });
     const res = response();
-    const receive = vi.fn();
-    await createAgentMailWebhookHandler({ account: account(), verifier, receive })(
+    const receive = vi.fn(async () => undefined);
+    const warn = vi.fn();
+    await createAgentMailWebhookHandler({
+      account: account(),
+      verifier,
+      receive,
+      log: { warn },
+      now: () => 1_234,
+    })(
       request(body, signed(body)),
       res,
     );
     expect(res.statusCode).toBe(200);
-    expect(receive).not.toHaveBeenCalled();
+    expect(receive).toHaveBeenCalledWith(
+      expect.objectContaining({ receivedAt: 1_234, arrivedAt: 1_234 }),
+    );
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("using arrival time"));
+  });
+
+  it("falls back to arrival time when the provider timestamp is missing", async () => {
+    const body = JSON.stringify({
+      type: "event",
+      event_type: "message.received",
+      message: { inbox_id: "inbox_1", message_id: "message_1" },
+    });
+    const res = response();
+    const receive = vi.fn(async () => undefined);
+    await createAgentMailWebhookHandler({
+      account: account(),
+      verifier,
+      receive,
+      now: () => 2_345,
+    })(request(body, signed(body)), res);
+    expect(res.statusCode).toBe(200);
+    expect(receive).toHaveBeenCalledWith(
+      expect.objectContaining({ receivedAt: 2_345, arrivedAt: 2_345 }),
+    );
   });
 
   it("returns retryable failure when durable receipt fails", async () => {

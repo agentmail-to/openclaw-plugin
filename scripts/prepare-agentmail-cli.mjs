@@ -17,7 +17,7 @@ import { fileURLToPath } from "node:url";
 
 const root = fileURLToPath(new URL("..", import.meta.url));
 const release = JSON.parse(
-  readFileSync(new URL("./agentmail-cli-release.json", import.meta.url), "utf8"),
+  readFileSync(new URL("../src/cli/agentmail-cli-release.json", import.meta.url), "utf8"),
 );
 const vendorRoot = join(root, "vendor", "agentmail");
 const versionPath = join(vendorRoot, "VERSION");
@@ -45,6 +45,11 @@ async function download(url, destination) {
 
 function extract(archive, destination) {
   mkdirSync(destination, { recursive: true });
+  const powershellEnv = {
+    ...process.env,
+    AGENTMAIL_CLI_ARCHIVE_PATH: archive,
+    AGENTMAIL_CLI_DESTINATION_PATH: destination,
+  };
   const result = archive.endsWith(".tar.gz")
     ? spawnSync("tar", ["-xzf", archive, "-C", destination], { stdio: "inherit" })
     : process.platform === "win32"
@@ -52,15 +57,11 @@ function extract(archive, destination) {
           "powershell",
           [
             "-NoProfile",
+            "-NonInteractive",
             "-Command",
-            "Expand-Archive",
-            "-LiteralPath",
-            archive,
-            "-DestinationPath",
-            destination,
-            "-Force",
+            "Expand-Archive -LiteralPath $env:AGENTMAIL_CLI_ARCHIVE_PATH -DestinationPath $env:AGENTMAIL_CLI_DESTINATION_PATH -Force",
           ],
-          { stdio: "inherit" },
+          { env: powershellEnv, stdio: "inherit" },
         )
       : spawnSync("unzip", ["-q", "-o", archive, "-d", destination], {
           stdio: "inherit",
@@ -76,7 +77,7 @@ function extract(archive, destination) {
 
 async function prepareTarget(target, temporaryRoot) {
   const metadata = release.assets[target];
-  const executableName = target.startsWith("win32-") ? "agentmail.exe" : "agentmail";
+  const executableName = metadata.executableName;
   const destination = join(vendorRoot, target, executableName);
   if (existsSync(destination)) {
     console.log(`AgentMail CLI ${release.version} already prepared for ${target}.`);
@@ -116,11 +117,13 @@ async function prepareTarget(target, temporaryRoot) {
 const existingVersion = existsSync(versionPath)
   ? readFileSync(versionPath, "utf8").trim()
   : undefined;
-if (existingVersion && existingVersion !== release.version) {
+if (existingVersion !== release.version && existsSync(vendorRoot)) {
   rmSync(vendorRoot, { recursive: true, force: true });
 }
 mkdirSync(vendorRoot, { recursive: true });
-writeFileSync(versionPath, `${release.version}\n`);
+// A marker represents a fully successful preparation run, not merely a selected release. Remove
+// any prior marker while verifying/filling the requested target set and restore it atomically below.
+rmSync(versionPath, { force: true });
 
 const targets = process.argv.includes("--all") ? allTargets : [currentTarget()];
 const temporaryRoot = mkdtempSync(join(tmpdir(), "agentmail-cli-prepare-"));
@@ -137,6 +140,11 @@ try {
       licensePath,
     );
   }
+  // Commit the version marker only after the requested binaries and license are complete. If any
+  // preparation step fails, the absent marker forces the next run to rebuild the partial directory.
+  const stagedVersionPath = `${versionPath}.tmp-${process.pid}`;
+  writeFileSync(stagedVersionPath, `${release.version}\n`);
+  renameSync(stagedVersionPath, versionPath);
 } finally {
   rmSync(temporaryRoot, { recursive: true, force: true });
 }

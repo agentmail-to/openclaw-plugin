@@ -1,9 +1,7 @@
 import { spawn } from "node:child_process";
 import { accessSync, constants } from "node:fs";
 import { fileURLToPath } from "node:url";
-
-type SupportedPlatform = "darwin" | "linux" | "win32";
-type SupportedArch = "arm64" | "ia32" | "x64";
+import release from "./agentmail-cli-release.json" with { type: "json" };
 
 export type AgentMailCliTarget = {
   directory: string;
@@ -14,19 +12,18 @@ export function resolveAgentMailCliTarget(
   platform: NodeJS.Platform = process.platform,
   arch: NodeJS.Architecture = process.arch,
 ): AgentMailCliTarget {
-  if (!["darwin", "linux", "win32"].includes(platform)) {
-    throw new Error(`The bundled AgentMail CLI does not support platform ${platform}.`);
+  const directory = `${platform}-${arch}`;
+  const asset = release.assets[directory as keyof typeof release.assets];
+  if (!asset) {
+    throw new Error(`The bundled AgentMail CLI does not support ${platform}/${arch}.`);
   }
-  if (!["arm64", "ia32", "x64"].includes(arch)) {
-    throw new Error(`The bundled AgentMail CLI does not support architecture ${arch}.`);
-  }
-  if (platform === "darwin" && arch === "ia32") {
-    throw new Error("The bundled AgentMail CLI does not support darwin/ia32.");
+  if (asset.executableName !== "agentmail" && asset.executableName !== "agentmail.exe") {
+    throw new Error(`The bundled AgentMail CLI metadata is invalid for ${platform}/${arch}.`);
   }
 
   return {
-    directory: `${platform as SupportedPlatform}-${arch as SupportedArch}`,
-    executableName: platform === "win32" ? "agentmail.exe" : "agentmail",
+    directory,
+    executableName: asset.executableName,
   };
 }
 
@@ -44,14 +41,12 @@ export function withConfiguredBaseUrl(
   args: readonly string[],
   baseUrl: string | undefined,
 ): string[] {
-  if (
-    !baseUrl ||
-    args.includes("--base-url") ||
-    args.some((arg) => arg.startsWith("--base-url="))
-  ) {
-    return [...args];
+  if (args.some((arg) => arg === "--base-url" || arg.startsWith("--base-url="))) {
+    throw new Error(
+      "AgentMail API endpoint overrides are restricted to the operator-controlled plugin config.",
+    );
   }
-  return ["--base-url", baseUrl, ...args];
+  return baseUrl ? ["--base-url", baseUrl, ...args] : [...args];
 }
 
 export async function runAgentMailCli(

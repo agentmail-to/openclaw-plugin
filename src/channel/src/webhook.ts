@@ -24,7 +24,7 @@ function respond(res: ServerResponse, status: number, body = ""): true {
 function parseVerifiedEvent(payload: unknown): {
   inboxId: string;
   messageId: string;
-  receivedAt: number;
+  receivedAt?: number;
 } | null {
   if (!payload || typeof payload !== "object") {
     return null;
@@ -39,12 +39,16 @@ function parseVerifiedEvent(payload: unknown): {
   const messageId = typeof mail.message_id === "string" ? mail.message_id.trim() : "";
   const receivedAt =
     typeof mail.timestamp === "string" ? Date.parse(mail.timestamp) : Number.NaN;
-  // Require identifiers and the provider-reported message timestamp. Local receipt time is tracked
-  // separately as arrivedAt and must not replace provider ordering/retention semantics.
-  if (!inboxId || !messageId || !Number.isFinite(receivedAt) || receivedAt < 0) {
+  // Identifiers are required for durable dedupe and hydration. A malformed timestamp is recoverable
+  // because local arrival time provides a safe ordering/retention fallback.
+  if (!inboxId || !messageId) {
     return null;
   }
-  return { inboxId, messageId, receivedAt };
+  return {
+    inboxId,
+    messageId,
+    ...(Number.isFinite(receivedAt) && receivedAt >= 0 ? { receivedAt } : {}),
+  };
 }
 
 /**
@@ -119,12 +123,17 @@ export function createAgentMailWebhookHandler(params: {
     }
     try {
       const nowMs = params.now?.() ?? Date.now();
+      if (event.receivedAt === undefined) {
+        params.log?.warn?.(
+          `AgentMail webhook message ${event.messageId} has no valid provider timestamp; using arrival time`,
+        );
+      }
       await params.receive({
         accountId: params.account.accountId,
         inboxId: event.inboxId,
         messageId: event.messageId,
         transport: "webhook",
-        receivedAt: event.receivedAt,
+        receivedAt: event.receivedAt ?? nowMs,
         arrivedAt: nowMs,
       });
       return respond(res, 200);
