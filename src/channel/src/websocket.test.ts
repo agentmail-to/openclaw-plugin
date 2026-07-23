@@ -74,8 +74,9 @@ describe("AgentMail WebSocket ingress", () => {
       eventType: "message.received",
       eventId: "event_1",
       message: {
-        inboxId: "inbox_1",
+        inboxId: "INBOX_1",
         messageId: "message_1",
+        labels: ["received"],
         timestamp: new Date(1_234),
       },
     });
@@ -132,6 +133,7 @@ describe("AgentMail WebSocket ingress", () => {
       message: {
         inboxId: "inbox_1",
         messageId: "message_retry",
+        labels: ["received"],
         timestamp: new Date(1_234),
       },
     });
@@ -162,13 +164,23 @@ describe("AgentMail WebSocket ingress", () => {
     handlers.get("message")?.({
       type: "event",
       eventType: "message.received",
-      message: { inboxId: "inbox_1", messageId: "message_1", timestamp: new Date(1_234) },
+      message: {
+        inboxId: "inbox_1",
+        messageId: "message_1",
+        labels: ["received"],
+        timestamp: new Date(1_234),
+      },
     });
     await vi.waitFor(() => expect(receive).toHaveBeenCalledOnce());
     handlers.get("message")?.({
       type: "event",
       eventType: "message.received",
-      message: { inboxId: "inbox_1", messageId: "message_2", timestamp: new Date(1_235) },
+      message: {
+        inboxId: "inbox_1",
+        messageId: "message_2",
+        labels: ["received"],
+        timestamp: new Date(1_235),
+      },
     });
     await vi.waitFor(() => expect(catchUpRun).toHaveBeenCalledOnce());
     expect(receive).toHaveBeenCalledOnce();
@@ -198,12 +210,22 @@ describe("AgentMail WebSocket ingress", () => {
     handlers.get("message")?.({
       type: "event",
       eventType: "message.received",
-      message: { inboxId: "inbox_1", messageId: "message_full", timestamp: new Date(1_234) },
+      message: {
+        inboxId: "inbox_1",
+        messageId: "message_full",
+        labels: ["received"],
+        timestamp: new Date(1_234),
+      },
     });
     handlers.get("message")?.({
       type: "event",
       eventType: "message.received",
-      message: { inboxId: "inbox_1", messageId: "message_next", timestamp: new Date(1_235) },
+      message: {
+        inboxId: "inbox_1",
+        messageId: "message_next",
+        labels: ["received"],
+        timestamp: new Date(1_235),
+      },
     });
 
     await vi.waitFor(() => expect(receive).toHaveBeenCalledTimes(2));

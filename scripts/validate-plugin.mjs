@@ -20,6 +20,8 @@ const childEnv = {
   OPENCLAW_STATE_DIR: stateDir,
   OPENCLAW_CONFIG_DIR: stateDir,
   OPENCLAW_HOME: stateDir,
+  NO_COLOR: "1",
+  FORCE_COLOR: "0",
 };
 
 function run(args) {

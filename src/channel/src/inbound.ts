@@ -8,6 +8,11 @@ import type { AgentMailLog } from "./log.js";
 import { createAgentMailClient } from "./client.js";
 import { isAgentMailSenderAllowed, parseSingleFromMailbox } from "./mailbox.js";
 import { AgentMailMediaPolicyError, loadAgentMailInboundAttachments } from "./media.js";
+import {
+  AGENTMAIL_RECEIVED_LABEL,
+  agentMailInboxIdsEqual,
+  resolveAgentMailTimestampMs,
+} from "./received-message.js";
 import type { AgentMailIngressRecord, ResolvedAgentMailAccount } from "./types.js";
 
 const CHANNEL_ID = "agentmail";
@@ -15,7 +20,6 @@ export const HYDRATION_NOT_FOUND_RETRY_WINDOW_MS = 5 * 60_000;
 
 // AgentMail message labels the channel gates on. "received" marks authentic inbound mail; the
 // rejected set marks provider-flagged mail that must never reach the agent.
-export const AGENTMAIL_RECEIVED_LABEL = "received";
 const AGENTMAIL_REJECTED_LABELS = ["spam", "blocked", "unauthenticated"];
 
 /**
@@ -127,6 +131,8 @@ export async function dispatchAgentMailInboundEvent(params: {
   client?: AgentMailClient;
   log?: AgentMailLog;
   onTurnAdopted?: () => void | Promise<void>;
+  onTurnDeferred?: () => void;
+  onTurnAbandoned?: () => void | Promise<void>;
   abortSignal?: AbortSignal;
   now?: () => number;
 }): Promise<void> {
@@ -157,7 +163,7 @@ export async function dispatchAgentMailInboundEvent(params: {
     throw error;
   }
   if (
-    message.inboxId !== params.account.inboxId ||
+    !agentMailInboxIdsEqual(message.inboxId, params.account.inboxId) ||
     message.messageId !== params.record.messageId ||
     hasRejectedLabel(message)
   ) {
@@ -249,6 +255,7 @@ export async function dispatchAgentMailInboundEvent(params: {
   });
 
   let turnAdopted = false;
+  let turnDeferred = false;
   // Adoption fires when core has made recovery-relevant session/run state durable. The ingress row
   // is completed here (via params.onTurnAdopted), closing the crash window before agent tools run;
   // exclusive admission isolates the reply lane per turn, and the abort signal cancels a pre-adoption
@@ -259,6 +266,16 @@ export async function dispatchAgentMailInboundEvent(params: {
     onAdopted: async () => {
       await params.onTurnAdopted?.();
       turnAdopted = true;
+    },
+    onDeferred: () => {
+      turnDeferred = true;
+      params.onTurnDeferred?.();
+    },
+    onAbandoned: async () => {
+      if (!turnAdopted && inboundMedia.paths.length > 0) {
+        await Promise.allSettled(inboundMedia.paths.map((path) => rm(path, { force: true })));
+      }
+      await params.onTurnAbandoned?.();
     },
     ...(params.abortSignal ? { abortSignal: params.abortSignal } : {}),
   };
@@ -273,9 +290,8 @@ export async function dispatchAgentMailInboundEvent(params: {
         // Hydrated SDK objects may bypass Date validation; fall back to the durable record's arrival
         // time rather than throwing on an invalid timestamp.
         timestamp:
-          raw.timestamp instanceof Date && !Number.isNaN(raw.timestamp.getTime())
-            ? raw.timestamp.getTime()
-            : (params.record.arrivedAt ?? params.record.receivedAt),
+          resolveAgentMailTimestampMs(raw.timestamp) ??
+          (params.record.arrivedAt ?? params.record.receivedAt),
         rawText: body,
         textForAgent: body,
         textForCommands: body,
@@ -300,7 +316,11 @@ export async function dispatchAgentMailInboundEvent(params: {
             routeSessionKey: sessionKey,
             dispatchSessionKey: sessionKey,
           },
-          reply: { to: target, replyToId: message.messageId },
+          // Keep the triggering id on the durable delivery contract below, not on the payload
+          // context. Core treats a payload-level replyToId as explicitly authored even when it was
+          // copied from this inbound context; the AgentMail sender intentionally accepts only the
+          // implicit, host-owned reply binding for the active turn.
+          reply: { to: target },
           message: {
             rawBody: input.rawText,
             commandBody: input.textForCommands,
@@ -333,6 +353,17 @@ export async function dispatchAgentMailInboundEvent(params: {
           dispatchReplyWithBufferedBlockDispatcher:
             params.channelRuntime.reply.dispatchReplyWithBufferedBlockDispatcher,
           delivery: {
+            // Core auto-threads final payloads from MessageSid, which makes the payload-level id
+            // look explicitly authored to the outbound adapter. AgentMail accepts only the
+            // implicit id owned by the durable delivery contract below, so remove those derived
+            // payload directives immediately before delivery.
+            preparePayload: (payload) => {
+              const prepared = { ...payload };
+              delete prepared.replyToId;
+              delete prepared.replyToTag;
+              delete prepared.replyToCurrent;
+              return prepared;
+            },
             durable: () => ({
               to: target,
               replyToId: message.messageId,
@@ -361,12 +392,17 @@ export async function dispatchAgentMailInboundEvent(params: {
   try {
     await runPromise;
   } catch (error) {
-    if (!turnAdopted && inboundMedia.paths.length > 0) {
+    if (!turnAdopted && !turnDeferred && inboundMedia.paths.length > 0) {
       // The turn never adopted, so core did not take ownership of these freshly-saved attachment
       // files. Remove them so a durable retry (which re-downloads a clean set) does not leak one
       // copy per attempt.
       await Promise.allSettled(inboundMedia.paths.map((path) => rm(path, { force: true })));
     }
     throw error;
+  }
+  if (!turnAdopted && !turnDeferred && inboundMedia.paths.length > 0) {
+    // A normal return without adoption did not transfer ownership of freshly persisted files.
+    // Deferred turns retain them until the lifecycle later adopts or abandons the queued turn.
+    await Promise.allSettled(inboundMedia.paths.map((path) => rm(path, { force: true })));
   }
 }

@@ -1,8 +1,8 @@
 // Generates openclaw.plugin.json for the combined AgentMail plugin (tool extension + channel
 // extension). The stock `openclaw plugins build` codegen only understands tool-plugin metadata, so
 // it cannot own a manifest that also declares a channel. This script derives the tool half from the
-// compiled tool entry's metadata and merges the channel declarations (channels, channelEnvVars,
-// channelConfigs) so both surfaces load from one manifest.
+// compiled tool entry's metadata and merges the channel declarations (channels and channelConfigs)
+// so both surfaces load from one manifest.
 //
 // Usage:
 //   node scripts/build-manifest.mjs            # write openclaw.plugin.json
@@ -31,9 +31,9 @@ const manifest = {
   configSchema: toolMetadata.configSchema,
   activation: toolMetadata.activation ?? { onStartup: true },
   channels: ["agentmail"],
-  channelEnvVars: {
-    agentmail: ["AGENTMAIL_API_KEY", "AGENTMAIL_WEBHOOK_SECRET"],
-  },
+  // Deliberately omit channelEnvVars. AGENTMAIL_API_KEY also configures the tools, while the
+  // channel requires an inboxId; the host treats any declared non-empty env var as channel
+  // presence and would otherwise surface an unconfigured phantom channel.
   channelConfigs: {
     agentmail: {
       schema: AgentMailChannelConfigSchema.schema,

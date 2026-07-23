@@ -243,7 +243,21 @@ describe("AgentMail REST-authoritative inbound", () => {
         conversationId: "inbox_1:thread:thread_1",
       }),
     );
-    const delivery = turn?.delivery as { durable: () => Record<string, unknown> };
+    expect((turn?.ctxPayload as { reply?: unknown }).reply).toEqual({
+      to: "message:message_1",
+    });
+    const delivery = turn?.delivery as {
+      preparePayload: (payload: Record<string, unknown>) => Record<string, unknown>;
+      durable: () => Record<string, unknown>;
+    };
+    expect(
+      delivery.preparePayload({
+        text: "reply",
+        replyToId: "message_1",
+        replyToTag: false,
+        replyToCurrent: true,
+      }),
+    ).toEqual({ text: "reply" });
     expect(delivery.durable()).toMatchObject({
       to: "message:message_1",
       replyToId: "message_1",
@@ -282,6 +296,69 @@ describe("AgentMail REST-authoritative inbound", () => {
       }),
     ).rejects.toThrow("dispatch failed before adoption");
     expect(rm).toHaveBeenCalledWith("/tmp/a.bin", { force: true });
+  });
+
+  it("retains deferred-turn attachments until the queued turn is abandoned", async () => {
+    rm.mockClear();
+    loadAgentMailInboundAttachments.mockResolvedValueOnce({
+      paths: ["/tmp/deferred.bin"],
+      types: ["application/octet-stream"],
+    });
+    let lifecycle:
+      | { onDeferred: () => void; onAbandoned: () => Promise<void> }
+      | undefined;
+    const onTurnDeferred = vi.fn();
+    const onTurnAbandoned = vi.fn(async () => undefined);
+    await dispatchAgentMailInboundEvent({
+      cfg: {},
+      account,
+      record,
+      channelRuntime: {
+        routing: { resolveAgentRoute: () => ({ agentId: "agent-1" }) },
+        inbound: {
+          buildContext: (ctx: Record<string, unknown>) => ctx,
+          run: async ({ turnAdoptionLifecycle }: { turnAdoptionLifecycle: typeof lifecycle }) => {
+            lifecycle = turnAdoptionLifecycle;
+            turnAdoptionLifecycle?.onDeferred();
+          },
+        },
+        session: { resolveStorePath: () => "/tmp/s.json", recordInboundSession: vi.fn() },
+        reply: { dispatchReplyWithBufferedBlockDispatcher: vi.fn() },
+      } as never,
+      client: { inboxes: { messages: { get: vi.fn(async () => message()) } } } as never,
+      onTurnDeferred,
+      onTurnAbandoned,
+    });
+
+    expect(onTurnDeferred).toHaveBeenCalledOnce();
+    expect(rm).not.toHaveBeenCalled();
+    await lifecycle?.onAbandoned();
+    expect(rm).toHaveBeenCalledWith("/tmp/deferred.bin", { force: true });
+    expect(onTurnAbandoned).toHaveBeenCalledOnce();
+  });
+
+  it("cleans up attachments when inbound handling resolves without adoption", async () => {
+    rm.mockClear();
+    loadAgentMailInboundAttachments.mockResolvedValueOnce({
+      paths: ["/tmp/ignored.bin"],
+      types: ["application/octet-stream"],
+    });
+    await dispatchAgentMailInboundEvent({
+      cfg: {},
+      account,
+      record,
+      channelRuntime: {
+        routing: { resolveAgentRoute: () => ({ agentId: "agent-1" }) },
+        inbound: {
+          buildContext: (ctx: Record<string, unknown>) => ctx,
+          run: async () => undefined,
+        },
+        session: { resolveStorePath: () => "/tmp/s.json", recordInboundSession: vi.fn() },
+        reply: { dispatchReplyWithBufferedBlockDispatcher: vi.fn() },
+      } as never,
+      client: { inboxes: { messages: { get: vi.fn(async () => message()) } } } as never,
+    });
+    expect(rm).toHaveBeenCalledWith("/tmp/ignored.bin", { force: true });
   });
 
   it("cleans up attachments when the adoption hook itself fails", async () => {

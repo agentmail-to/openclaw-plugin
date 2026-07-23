@@ -9,6 +9,10 @@ import { type AgentMailLog, errorText } from "./log.js";
 import { createAgentMailClient } from "./client.js";
 import { AgentMailIngressCapacityError } from "./ingress.js";
 import { createBackoff, waitForRetry } from "./retry.js";
+import {
+  agentMailInboxIdsEqual,
+  resolveReceivedAgentMailMessageTimestampMs,
+} from "./received-message.js";
 import type { AgentMailIngressRecord, ResolvedAgentMailAccount } from "./types.js";
 
 const AGENTMAIL_WEBSOCKET_LIVE_QUEUE_MAX = 32;
@@ -25,16 +29,13 @@ function isReceivedEvent(value: unknown): value is AgentMail.MessageReceivedEven
   if (event.type !== "event" || event.eventType !== "message.received") {
     return false;
   }
-  // Fully validate the message shape here so downstream field access (inboxId, messageId,
-  // timestamp.getTime()) cannot throw on a malformed frame. A malformed live event is ignored; REST
-  // catch-up still recovers the message from the provider.
+  // Validate the stable identifier shape here. The shared received-message predicate below owns
+  // inbox, label, and timestamp validation for both WebSocket and REST recovery.
   const message = event.message as Partial<AgentMail.Message> | undefined;
   return Boolean(
     message &&
       typeof message.inboxId === "string" &&
-      typeof message.messageId === "string" &&
-      message.timestamp instanceof Date &&
-      !Number.isNaN(message.timestamp.getTime()),
+      typeof message.messageId === "string",
   );
 }
 
@@ -163,8 +164,15 @@ export async function startAgentMailWebSocket(params: {
     if (!isReceivedEvent(event)) {
       return;
     }
-    if (event.message.inboxId !== params.account.inboxId) {
+    if (!agentMailInboxIdsEqual(event.message.inboxId, params.account.inboxId)) {
       params.log?.warn?.("AgentMail WebSocket ignored an event for the wrong inbox");
+      return;
+    }
+    const messageTimestampMs = resolveReceivedAgentMailMessageTimestampMs(
+      event.message,
+      params.account.inboxId,
+    );
+    if (messageTimestampMs === null) {
       return;
     }
     if (queuedMessageIds.has(event.message.messageId)) {
@@ -180,10 +188,10 @@ export async function startAgentMailWebSocket(params: {
     queuedMessageIds.add(event.message.messageId);
     liveQueue.push({
       accountId: params.account.accountId,
-      inboxId: event.message.inboxId,
+      inboxId: params.account.inboxId,
       messageId: event.message.messageId,
       transport: "websocket",
-      receivedAt: event.message.timestamp.getTime(),
+      receivedAt: messageTimestampMs,
       arrivedAt: Date.now(),
     });
     runLiveWorker();

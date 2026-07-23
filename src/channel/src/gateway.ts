@@ -89,7 +89,12 @@ export async function startAgentMailGatewayAccount(params: {
   });
   const dispatch = async (
     record: AgentMailIngressRecord,
-    lifecycle: { onTurnAdopted: () => Promise<void>; abortSignal?: AbortSignal },
+    lifecycle: {
+      onTurnAdopted: () => Promise<void>;
+      onTurnDeferred: () => void;
+      onTurnAbandoned: () => Promise<void>;
+      abortSignal?: AbortSignal;
+    },
   ) =>
     await dispatchAgentMailInboundEvent({
       cfg: params.cfg,
@@ -99,6 +104,8 @@ export async function startAgentMailGatewayAccount(params: {
       client,
       log: params.log,
       onTurnAdopted: lifecycle.onTurnAdopted,
+      onTurnDeferred: lifecycle.onTurnDeferred,
+      onTurnAbandoned: lifecycle.onTurnAbandoned,
       abortSignal: lifecycle.abortSignal,
     });
   const receive = async (record: AgentMailIngressRecord) => {
@@ -161,39 +168,49 @@ export async function startAgentMailGatewayAccount(params: {
   // Claim ownership synchronously here, before the first await, so the check-and-claim is atomic:
   // two concurrent startups for the same path can no longer both observe it as free.
   routeOwners.set(path, params.account.accountId);
-  const catchUpSession = await createAgentMailCatchUpSession({
-    account: params.account,
-    client,
-    log: params.log,
-  });
-  const catchUpSupervisor = createAgentMailCatchUpSupervisor({
-    session: catchUpSession,
-    receive,
-    abortSignal: params.abortSignal,
-    log: params.log,
-  });
-  const receiveWithRecovery = async (record: AgentMailIngressRecord) => {
-    try {
-      await receive(record);
-    } catch (error) {
-      // Provider retries remain useful, but REST recovery is the durable fallback if the provider
-      // exhausts them while local admission is full or temporarily unavailable.
-      catchUpSupervisor.request();
-      throw error;
-    }
-  };
-  const unregister = registerPluginHttpRoute({
-    path,
-    auth: "plugin",
-    pluginId: "agentmail",
-    accountId: params.account.accountId,
-    handler: createAgentMailWebhookHandler({
+  let catchUpSupervisor: ReturnType<typeof createAgentMailCatchUpSupervisor>;
+  let unregister: (() => void) | undefined;
+  try {
+    const catchUpSession = await createAgentMailCatchUpSession({
       account: params.account,
-      verifier,
-      receive: receiveWithRecovery,
+      client,
       log: params.log,
-    }),
-  });
+    });
+    catchUpSupervisor = createAgentMailCatchUpSupervisor({
+      session: catchUpSession,
+      receive,
+      abortSignal: params.abortSignal,
+      log: params.log,
+    });
+    const receiveWithRecovery = async (record: AgentMailIngressRecord) => {
+      try {
+        await receive(record);
+      } catch (error) {
+        // Provider retries remain useful, but REST recovery is the durable fallback if the provider
+        // exhausts them while local admission is full or temporarily unavailable.
+        catchUpSupervisor.request();
+        throw error;
+      }
+    };
+    unregister = registerPluginHttpRoute({
+      path,
+      auth: "plugin",
+      pluginId: "agentmail",
+      accountId: params.account.accountId,
+      handler: createAgentMailWebhookHandler({
+        account: params.account,
+        verifier,
+        receive: receiveWithRecovery,
+        log: params.log,
+      }),
+    });
+  } catch (error) {
+    unregister?.();
+    if (routeOwners.get(path) === params.account.accountId) {
+      routeOwners.delete(path);
+    }
+    throw error;
+  }
   const activeRoute = { path, unregister };
   activeRoutes.set(params.account.accountId, activeRoute);
   // Ownership was already claimed synchronously above.

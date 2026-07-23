@@ -59,7 +59,11 @@ describe("AgentMail webhook", () => {
       type: "event",
       event_type: "message.received",
       event_id: "event_1",
-      message: { inbox_id: "inbox_1", message_id: "message_1" },
+      message: {
+        inbox_id: "INBOX_1",
+        message_id: "message_1",
+        timestamp: "2026-07-15T12:34:56.000Z",
+      },
     });
     const res = response();
     await createAgentMailWebhookHandler({ account: account(), verifier, receive })(
@@ -72,6 +76,7 @@ describe("AgentMail webhook", () => {
         inboxId: "inbox_1",
         messageId: "message_1",
         transport: "webhook",
+        receivedAt: Date.parse("2026-07-15T12:34:56.000Z"),
       }),
     );
   });

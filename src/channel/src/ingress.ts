@@ -8,7 +8,12 @@ import type { AgentMailIngressRecord } from "./types.js";
 // Re-exported for transports (websocket) that catch capacity backpressure by class.
 export { AgentMailIngressCapacityError };
 
-type AgentMailJournal = ReturnType<typeof createAgentMailDurableInboundReceiveJournal>;
+type AgentMailJournal = ReturnType<typeof createAgentMailDurableInboundReceiveJournal> & {
+  fail?: (
+    id: string,
+    options: { reason: string; message?: string; failedAt?: number },
+  ) => Promise<boolean>;
+};
 
 type DispatchParams = {
   journal: AgentMailJournal;
@@ -24,15 +29,43 @@ type DispatchParams = {
 
 export type AgentMailIngressDispatch = (
   record: AgentMailIngressRecord,
-  lifecycle: { onTurnAdopted: () => Promise<void>; abortSignal?: AbortSignal },
+  lifecycle: {
+    onTurnAdopted: () => Promise<void>;
+    onTurnDeferred: () => void;
+    onTurnAbandoned: () => Promise<void>;
+    abortSignal?: AbortSignal;
+  },
 ) => Promise<void>;
 
 // Ceiling on pre-adoption dispatch attempts for a single message. A deterministically failing
 // (poison) message would otherwise retry until its ~30-day TTL, and ~450 such rows would fill the
-// pending queue and reject all new mail. On exhaustion the row is dropped (completed) so it stops
-// occupying an admission slot. The journal exposes no distinct `fail` op, so completion is the
-// terminal marker. Comfortably above the legitimate transient-retry budget the tests exercise.
+// pending queue and reject all new mail. On exhaustion the row receives a terminal marker so it
+// stops occupying an admission slot. Comfortably above the legitimate transient-retry budget the
+// tests exercise.
 const AGENTMAIL_MAX_DISPATCH_ATTEMPTS = 50;
+const AGENTMAIL_MAX_COMPLETION_ATTEMPTS = 50;
+
+type DeferredOutcome = "adopted" | "abandoned" | "aborted";
+
+async function waitForDeferredOutcome(
+  outcome: Promise<Exclude<DeferredOutcome, "aborted">>,
+  abortSignal?: AbortSignal,
+): Promise<DeferredOutcome> {
+  if (!abortSignal) {
+    return await outcome;
+  }
+  if (abortSignal.aborted) {
+    return "aborted";
+  }
+  return await new Promise<DeferredOutcome>((resolve) => {
+    const onAbort = () => resolve("aborted");
+    abortSignal.addEventListener("abort", onAbort, { once: true });
+    void outcome.then((value) => {
+      abortSignal.removeEventListener("abort", onAbort);
+      resolve(value);
+    });
+  });
+}
 
 type ActiveDispatch = {
   task: Promise<boolean>;
@@ -150,6 +183,11 @@ async function dispatchAgentMailIngressUntilSettled(params: DispatchParams): Pro
   while (!params.abortSignal?.aborted) {
     if (!params.dispatchCompleted) {
       let turnAdopted = false;
+      let turnDeferred = false;
+      let settleDeferred!: (outcome: Exclude<DeferredOutcome, "aborted">) => void;
+      const deferredOutcome = new Promise<Exclude<DeferredOutcome, "aborted">>((resolve) => {
+        settleDeferred = resolve;
+      });
       const onTurnAdopted = async () => {
         if (turnAdopted) {
           return;
@@ -160,11 +198,49 @@ async function dispatchAgentMailIngressUntilSettled(params: DispatchParams): Pro
         await params.journal.complete(params.id);
         turnAdopted = true;
         params.dispatchCompleted = true;
+        settleDeferred("adopted");
+      };
+      const onTurnDeferred = () => {
+        turnDeferred = true;
+      };
+      const onTurnAbandoned = async () => {
+        if (!turnAdopted) {
+          settleDeferred("abandoned");
+        }
       };
       try {
-        await params.dispatch(params.record, { onTurnAdopted, abortSignal: params.abortSignal });
+        await params.dispatch(params.record, {
+          onTurnAdopted,
+          onTurnDeferred,
+          onTurnAbandoned,
+          abortSignal: params.abortSignal,
+        });
         if (turnAdopted) {
           return true;
+        }
+        if (turnDeferred) {
+          const outcome = await waitForDeferredOutcome(deferredOutcome, params.abortSignal);
+          if (outcome === "adopted") {
+            return true;
+          }
+          if (outcome === "aborted") {
+            return false;
+          }
+          attempts += 1;
+          const lastError = "deferred turn abandoned before adoption";
+          const released = await params.journal.release(params.id, { lastError });
+          if (!released) {
+            return true;
+          }
+          if (
+            !(await waitForRetry(
+              params.abortSignal,
+              (params.retryDelay ?? retryDelayMs)(attempts),
+            ))
+          ) {
+            return false;
+          }
+          continue;
         }
         params.dispatchCompleted = true;
       } catch (error) {
@@ -175,14 +251,20 @@ async function dispatchAgentMailIngressUntilSettled(params: DispatchParams): Pro
         }
         attempts += 1;
         if (attempts >= AGENTMAIL_MAX_DISPATCH_ATTEMPTS) {
-          // Poison message: it has failed deterministically past the retry ceiling. Drop it
-          // (complete removes it from the pending set) so it stops occupying an admission slot and
-          // blocking new mail. Surface it so an operator can investigate the underlying failure.
+          // Poison message: it has failed deterministically past the retry ceiling. Mark it
+          // terminal so it stops occupying an admission slot and blocking new mail.
           params.log?.error?.(
             `AgentMail dropping message ${params.record.messageId} after ${attempts} failed dispatch attempts: ${errorText(error)}`,
           );
           try {
-            await params.journal.complete(params.id);
+            if (params.journal.fail) {
+              await params.journal.fail(params.id, {
+                reason: "dispatch-attempts-exhausted",
+                message: errorText(error),
+              });
+            } else {
+              await params.journal.complete(params.id);
+            }
           } catch {
             // Best effort: TTL pruning still reclaims the row if the terminal marker cannot persist.
           }
@@ -232,6 +314,18 @@ async function dispatchAgentMailIngressUntilSettled(params: DispatchParams): Pro
       return true;
     } catch {
       attempts += 1;
+      if (attempts >= AGENTMAIL_MAX_COMPLETION_ATTEMPTS) {
+        params.log?.error?.(
+          `AgentMail failed to persist completion for message ${params.record.messageId} after ${attempts} attempts; marking the ingress row failed`,
+        );
+        if (params.journal.fail) {
+          return await params.journal.fail(params.id, {
+            reason: "completion-marker-failed",
+            message: "AgentMail could not persist the completion marker",
+          });
+        }
+        return false;
+      }
       // Dispatch already produced the agent turn. Keep the row pending and retry only the
       // idempotent completion marker; releasing and redispatching would duplicate the reply.
       const shouldRetry = await waitForRetry(

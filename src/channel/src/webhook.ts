@@ -5,6 +5,7 @@ import {
 } from "openclaw/plugin-sdk/webhook-ingress";
 import { Webhook } from "svix";
 import { type AgentMailLog, errorText } from "./log.js";
+import { agentMailInboxIdsEqual, resolveAgentMailTimestampMs } from "./received-message.js";
 import type { AgentMailIngressRecord, ResolvedAgentMailAccount } from "./types.js";
 
 const MAX_WEBHOOK_BODY_BYTES = 1024 * 1024;
@@ -24,6 +25,7 @@ function respond(res: ServerResponse, status: number, body = ""): true {
 function parseVerifiedEvent(payload: unknown): {
   inboxId: string;
   messageId: string;
+  receivedAt?: number;
 } | null {
   if (!payload || typeof payload !== "object") {
     return null;
@@ -40,7 +42,8 @@ function parseVerifiedEvent(payload: unknown): {
   if (!inboxId || !messageId) {
     return null;
   }
-  return { inboxId, messageId };
+  const receivedAt = resolveAgentMailTimestampMs(mail.timestamp);
+  return { inboxId, messageId, ...(receivedAt === null ? {} : { receivedAt }) };
 }
 
 /**
@@ -106,7 +109,7 @@ export function createAgentMailWebhookHandler(params: {
       params.log?.warn?.("AgentMail webhook ignored a malformed signed received event");
       return respond(res, 200);
     }
-    if (event.inboxId !== params.account.inboxId) {
+    if (!agentMailInboxIdsEqual(event.inboxId, params.account.inboxId)) {
       // The signature is valid but this route cannot ever own the inbox. Acknowledge permanently
       // so provider retries cannot amplify a routing/configuration error.
       params.log?.warn?.("AgentMail webhook ignored an event for the wrong inbox");
@@ -116,10 +119,10 @@ export function createAgentMailWebhookHandler(params: {
       const nowMs = Date.now();
       await params.receive({
         accountId: params.account.accountId,
-        inboxId: event.inboxId,
+        inboxId: params.account.inboxId,
         messageId: event.messageId,
         transport: "webhook",
-        receivedAt: nowMs,
+        receivedAt: event.receivedAt ?? nowMs,
         arrivedAt: nowMs,
       });
       return respond(res, 200);

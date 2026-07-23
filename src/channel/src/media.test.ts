@@ -66,8 +66,16 @@ describe("AgentMail inbound attachments", () => {
     expect(saveMediaBuffer).not.toHaveBeenCalled();
   });
 
-  it("skips inline and CID parts", async () => {
-    const getAttachment = vi.fn();
+  it("skips explicit inline parts but retains attachment parts with a Content-ID", async () => {
+    const getAttachment = vi.fn(async () => ({
+      downloadUrl: "https://download.example/cid",
+      filename: "cid.png",
+    }));
+    loadWebMediaRaw.mockResolvedValueOnce({
+      buffer: Buffer.from("x"),
+      contentType: "image/png",
+    });
+    saveMediaBuffer.mockResolvedValueOnce({ path: "/tmp/cid.png", contentType: "image/png" });
     await expect(
       loadAgentMailInboundAttachments({
         client: { inboxes: { messages: { getAttachment } } } as never,
@@ -75,13 +83,35 @@ describe("AgentMail inbound attachments", () => {
         messageId: "message_1",
         attachments: [
           { attachmentId: "inline", size: 1, contentDisposition: "inline" },
-          { attachmentId: "cid", size: 1, contentId: "image@cid" },
+          {
+            attachmentId: "cid",
+            size: 1,
+            contentId: "image@cid",
+            contentDisposition: "attachment",
+          },
         ],
         maxBytes: 100,
       }),
-    ).resolves.toEqual({ paths: [], types: [] });
-    expect(getAttachment).not.toHaveBeenCalled();
+    ).resolves.toEqual({ paths: ["/tmp/cid.png"], types: ["image/png"] });
+    expect(getAttachment).toHaveBeenCalledOnce();
   });
+
+  it.each([undefined, Number.NaN, -1, 1.5])(
+    "rejects malformed declared attachment size %s before downloading",
+    async (size) => {
+      const getAttachment = vi.fn();
+      await expect(
+        loadAgentMailInboundAttachments({
+          client: { inboxes: { messages: { getAttachment } } } as never,
+          inboxId: "inbox_1",
+          messageId: "message_1",
+          attachments: [{ attachmentId: "bad-size", size } as never],
+          maxBytes: 100,
+        }),
+      ).rejects.toThrow("invalid declared size");
+      expect(getAttachment).not.toHaveBeenCalled();
+    },
+  );
 
   it("classifies static attachment size violations as terminal policy rejections", async () => {
     await expect(
