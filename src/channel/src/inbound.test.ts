@@ -337,6 +337,43 @@ describe("AgentMail REST-authoritative inbound", () => {
     expect(onTurnAbandoned).toHaveBeenCalledOnce();
   });
 
+  it("cleans up deferred-turn attachments when account shutdown aborts the queued turn", async () => {
+    rm.mockClear();
+    loadAgentMailInboundAttachments.mockResolvedValueOnce({
+      paths: ["/tmp/deferred-abort.bin"],
+      types: ["application/octet-stream"],
+    });
+    const controller = new AbortController();
+    await dispatchAgentMailInboundEvent({
+      cfg: {},
+      account,
+      record,
+      channelRuntime: {
+        routing: { resolveAgentRoute: () => ({ agentId: "agent-1" }) },
+        inbound: {
+          buildContext: (ctx: Record<string, unknown>) => ctx,
+          run: async ({
+            turnAdoptionLifecycle,
+          }: {
+            turnAdoptionLifecycle: { onDeferred: () => void };
+          }) => {
+            turnAdoptionLifecycle.onDeferred();
+          },
+        },
+        session: { resolveStorePath: () => "/tmp/s.json", recordInboundSession: vi.fn() },
+        reply: { dispatchReplyWithBufferedBlockDispatcher: vi.fn() },
+      } as never,
+      client: { inboxes: { messages: { get: vi.fn(async () => message()) } } } as never,
+      abortSignal: controller.signal,
+    });
+    expect(rm).not.toHaveBeenCalled();
+
+    controller.abort();
+    await vi.waitFor(() =>
+      expect(rm).toHaveBeenCalledWith("/tmp/deferred-abort.bin", { force: true }),
+    );
+  });
+
   it("cleans up attachments when inbound handling resolves without adoption", async () => {
     rm.mockClear();
     loadAgentMailInboundAttachments.mockResolvedValueOnce({

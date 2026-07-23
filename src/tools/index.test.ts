@@ -146,6 +146,31 @@ describe("agentmail", () => {
     expect(sdk.constructor).toHaveBeenCalledWith({ apiKey: "am_channel" });
   });
 
+  it("falls back to the environment when channel secret resolution is unavailable", async () => {
+    vi.stubEnv("AGENTMAIL_API_KEY", "am_env_fallback");
+    sdk.inboxes.list.mockResolvedValue({ count: 0, inboxes: [] });
+    const tool = findTool(
+      "agentmail_list_inboxes",
+      {},
+      {
+        channels: {
+          agentmail: {
+            apiKey: {
+              source: "env",
+              provider: "agentmail",
+              id: "UNRESOLVED_AGENTMAIL_API_KEY",
+            },
+            inboxId: "agent@agentmail.to",
+          },
+        },
+      },
+    );
+
+    await tool.execute("call-secret-fallback", {});
+
+    expect(sdk.constructor).toHaveBeenCalledWith({ apiKey: "am_env_fallback" });
+  });
+
   it("sends a message with idempotency and cancellation options", async () => {
     sdk.messages.send.mockResolvedValue({ messageId: "msg_1", threadId: "thr_1" });
     const signal = new AbortController().signal;

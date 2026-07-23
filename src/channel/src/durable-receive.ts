@@ -70,8 +70,28 @@ export function withAgentMailIngressCapacity(
           const pending = await journal.pending();
           pendingEstimate = pending.length;
           if (pendingEstimate > maxPendingEntries) {
-            await journal.deletePending(id);
-            pendingEstimate -= 1;
+            let removed = false;
+            try {
+              removed = await journal.deletePending(id);
+            } catch {
+              // Preserve the transport-facing capacity contract even if queue deletion is
+              // temporarily unavailable. A terminal marker is the best fallback for preventing
+              // this rejected admission from replaying as ordinary pending work.
+            }
+            if (!removed && journal.fail) {
+              try {
+                removed = await journal.fail(id, {
+                  reason: "capacity-overflow",
+                  message: "AgentMail rejected this ingress row because capacity was full",
+                });
+              } catch {
+                // The next admission re-scans source-of-truth pending state. Keep returning the
+                // capacity error class so WebSocket/webhook recovery behavior remains correct.
+              }
+            }
+            if (removed) {
+              pendingEstimate -= 1;
+            }
             throw new AgentMailIngressCapacityError();
           }
         } else {

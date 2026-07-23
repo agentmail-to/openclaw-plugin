@@ -20,11 +20,36 @@ import type { AgentMailIngressRecord, ResolvedAgentMailAccount } from "./types.j
 import { createAgentMailWebhookHandler, createAgentMailWebhookVerifier } from "./webhook.js";
 import { startAgentMailWebSocket } from "./websocket.js";
 
-type RouteClaim = { accountId: string; generation: symbol; valid: boolean };
+type RouteClaim = { accountId: string; generation: symbol };
 type ActiveRoute = { path: string; unregister: () => void; claim: RouteClaim };
 
 const activeRoutes = new Map<string, ActiveRoute>();
 const routeOwners = new Map<string, RouteClaim>();
+const routeStartupTails = new Map<string, Promise<void>>();
+
+async function withSerializedRouteStartup<T>(
+  accountId: string,
+  task: () => Promise<T>,
+): Promise<T> {
+  const predecessor = routeStartupTails.get(accountId) ?? Promise.resolve();
+  let release!: () => void;
+  const hold = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const tail = predecessor.catch(() => undefined).then(() => hold);
+  routeStartupTails.set(accountId, tail);
+  await predecessor.catch(() => undefined);
+  try {
+    return await task();
+  } finally {
+    release();
+    void tail.finally(() => {
+      if (routeStartupTails.get(accountId) === tail) {
+        routeStartupTails.delete(accountId);
+      }
+    });
+  }
+}
 
 // Single source of truth for AgentMail sender-authorization warnings, shared by gateway startup
 // diagnostics and the channel security surface so the two never drift.
@@ -153,90 +178,86 @@ export async function startAgentMailGatewayAccount(params: {
   const path = params.account.webhookPath.startsWith("/")
     ? params.account.webhookPath
     : `/${params.account.webhookPath}`;
-  const owner = routeOwners.get(path);
-  if (owner && owner.accountId !== params.account.accountId) {
-    throw new Error(
-      `AgentMail webhook path ${path} is already registered by account ${owner.accountId}; configure a distinct webhookPath.`,
-    );
-  }
-  const previousRoute = activeRoutes.get(params.account.accountId);
-  const claim: RouteClaim = {
-    accountId: params.account.accountId,
-    generation: Symbol(params.account.accountId),
-    valid: true,
-  };
-  // Claim ownership synchronously here, before the first await, so the check-and-claim is atomic:
-  // two concurrent startups for the same path can no longer both observe it as free. Keep the
-  // predecessor registered until the replacement is fully initialized and registered.
-  routeOwners.set(path, claim);
-  let catchUpSupervisor: ReturnType<typeof createAgentMailCatchUpSupervisor>;
-  let unregister: (() => void) | undefined;
-  try {
-    const catchUpSession = await createAgentMailCatchUpSession({
-      account: params.account,
-      client,
-      log: params.log,
-    });
-    // A newer overlapping startup claimed this path while initialization awaited. Its generation
-    // owns registration; park this stale invocation until its lifecycle is cancelled.
-    if (routeOwners.get(path) !== claim) {
-      claim.valid = false;
-      return await waitUntilAbort(params.abortSignal);
+  const setup = await withSerializedRouteStartup(params.account.accountId, async () => {
+    if (params.abortSignal.aborted) {
+      return null;
     }
-    catchUpSupervisor = createAgentMailCatchUpSupervisor({
-      session: catchUpSession,
-      receive,
-      abortSignal: params.abortSignal,
-      log: params.log,
-    });
-    const receiveWithRecovery = async (record: AgentMailIngressRecord) => {
-      try {
-        await receive(record);
-      } catch (error) {
-        // Provider retries remain useful, but REST recovery is the durable fallback if the provider
-        // exhausts them while local admission is full or temporarily unavailable.
-        catchUpSupervisor.request();
-        throw error;
-      }
-    };
-    unregister = registerPluginHttpRoute({
-      path,
-      auth: "plugin",
-      pluginId: "agentmail",
+    const owner = routeOwners.get(path);
+    if (owner && owner.accountId !== params.account.accountId) {
+      throw new Error(
+        `AgentMail webhook path ${path} is already registered by account ${owner.accountId}; configure a distinct webhookPath.`,
+      );
+    }
+    const previousRoute = activeRoutes.get(params.account.accountId);
+    const claim: RouteClaim = {
       accountId: params.account.accountId,
-      handler: createAgentMailWebhookHandler({
+      generation: Symbol(params.account.accountId),
+    };
+    // Claim before initialization so a different account cannot race onto this path. Same-account
+    // startup is serialized above, so rollback always has one well-defined predecessor.
+    routeOwners.set(path, claim);
+    let unregister: (() => void) | undefined;
+    try {
+      const catchUpSession = await createAgentMailCatchUpSession({
         account: params.account,
-        verifier,
-        receive: receiveWithRecovery,
+        client,
         log: params.log,
-      }),
-      // Replacing first is safe: OpenClaw removes the predecessor entry atomically, and its stale
-      // unregister handle becomes a no-op. This avoids a route outage if replacement setup fails.
-      replaceExisting: true,
-    });
-  } catch (error) {
-    claim.valid = false;
-    unregister?.();
-    // A stale startup must never release a newer startup's claim. Restore a still-valid predecessor
-    // on same-path rollback; otherwise release only this exact generation.
-    if (routeOwners.get(path) === claim) {
-      if (owner?.valid) {
-        routeOwners.set(path, owner);
-      } else {
-        routeOwners.delete(path);
+      });
+      const catchUpSupervisor = createAgentMailCatchUpSupervisor({
+        session: catchUpSession,
+        receive,
+        abortSignal: params.abortSignal,
+        log: params.log,
+      });
+      const receiveWithRecovery = async (record: AgentMailIngressRecord) => {
+        try {
+          await receive(record);
+        } catch (error) {
+          // Provider retries remain useful, but REST recovery is the durable fallback if the
+          // provider exhausts them while local admission is temporarily unavailable.
+          catchUpSupervisor.request();
+          throw error;
+        }
+      };
+      unregister = registerPluginHttpRoute({
+        path,
+        auth: "plugin",
+        pluginId: "agentmail",
+        accountId: params.account.accountId,
+        handler: createAgentMailWebhookHandler({
+          account: params.account,
+          verifier,
+          receive: receiveWithRecovery,
+          log: params.log,
+        }),
+        // OpenClaw atomically replaces the predecessor and makes its stale unregister a no-op.
+        replaceExisting: true,
+      });
+      const activeRoute = { path, unregister, claim };
+      activeRoutes.set(params.account.accountId, activeRoute);
+      if (previousRoute) {
+        previousRoute.unregister();
+        if (routeOwners.get(previousRoute.path) === previousRoute.claim) {
+          routeOwners.delete(previousRoute.path);
+        }
       }
+      return { activeRoute, catchUpSupervisor, claim, unregister };
+    } catch (error) {
+      unregister?.();
+      if (routeOwners.get(path) === claim) {
+        if (previousRoute?.path === path) {
+          routeOwners.set(path, previousRoute.claim);
+        } else {
+          routeOwners.delete(path);
+        }
+      }
+      throw error;
     }
-    throw error;
+  });
+  if (!setup) {
+    return;
   }
-  const activeRoute = { path, unregister, claim };
-  activeRoutes.set(params.account.accountId, activeRoute);
-  if (previousRoute && previousRoute !== activeRoute) {
-    previousRoute.claim.valid = false;
-    previousRoute.unregister();
-    if (routeOwners.get(previousRoute.path) === previousRoute.claim) {
-      routeOwners.delete(previousRoute.path);
-    }
-  }
+  const { activeRoute, catchUpSupervisor, claim, unregister } = setup;
   params.log?.info?.(
     `Registered AgentMail webhook route ${path} for account ${params.account.accountId}`,
   );
@@ -251,7 +272,6 @@ export async function startAgentMailGatewayAccount(params: {
   await waitUntilAbort(params.abortSignal, () => {
     // A replaced account invocation can abort later; it must not delete the newer registration.
     if (activeRoutes.get(params.account.accountId) === activeRoute) {
-      claim.valid = false;
       unregister();
       activeRoutes.delete(params.account.accountId);
       if (routeOwners.get(path) === claim) {

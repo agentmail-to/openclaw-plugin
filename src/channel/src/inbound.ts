@@ -256,24 +256,60 @@ export async function dispatchAgentMailInboundEvent(params: {
 
   let turnAdopted = false;
   let turnDeferred = false;
+  let turnAdoptionObserved = false;
+  let mediaCleanup: Promise<void> | undefined;
+  const cleanupInboundMedia = async () => {
+    if (inboundMedia.paths.length === 0) {
+      return;
+    }
+    mediaCleanup ??= Promise.allSettled(
+      inboundMedia.paths.map((path) => rm(path, { force: true })),
+    ).then(() => undefined);
+    await mediaCleanup;
+  };
+  let detachAbortCleanup = () => {};
+  if (params.abortSignal) {
+    const onAbort = () => {
+      if (!turnAdoptionObserved) {
+        void cleanupInboundMedia();
+      }
+    };
+    params.abortSignal.addEventListener("abort", onAbort, { once: true });
+    detachAbortCleanup = () => params.abortSignal?.removeEventListener("abort", onAbort);
+    if (params.abortSignal.aborted) {
+      onAbort();
+    }
+  }
   // Adoption fires when core has made recovery-relevant session/run state durable. The ingress row
   // is completed here (via params.onTurnAdopted), closing the crash window before agent tools run;
-  // exclusive admission isolates the reply lane per turn, and the abort signal cancels a pre-adoption
-  // turn on shutdown. The local `turnAdopted` flag is set only AFTER the hook resolves so a failed
-  // journal.complete still triggers media cleanup below.
+  // exclusive admission isolates the reply lane per turn, and the abort signal cancels a
+  // pre-adoption turn on shutdown.
   const turnAdoptionLifecycle = {
     admission: "exclusive" as const,
     onAdopted: async () => {
-      await params.onTurnAdopted?.();
-      turnAdopted = true;
+      turnAdoptionObserved = true;
+      try {
+        await params.onTurnAdopted?.();
+        turnAdopted = true;
+        detachAbortCleanup();
+      } catch (error) {
+        // Core has not started a fresh turn when its adoption observer rejects. Restore local media
+        // ownership so the normal failure/abort path can remove the files before a durable retry.
+        turnAdoptionObserved = false;
+        if (params.abortSignal?.aborted) {
+          await cleanupInboundMedia();
+        }
+        throw error;
+      }
     },
     onDeferred: () => {
       turnDeferred = true;
       params.onTurnDeferred?.();
     },
     onAbandoned: async () => {
-      if (!turnAdopted && inboundMedia.paths.length > 0) {
-        await Promise.allSettled(inboundMedia.paths.map((path) => rm(path, { force: true })));
+      detachAbortCleanup();
+      if (!turnAdoptionObserved) {
+        await cleanupInboundMedia();
       }
       await params.onTurnAbandoned?.();
     },
@@ -392,17 +428,19 @@ export async function dispatchAgentMailInboundEvent(params: {
   try {
     await runPromise;
   } catch (error) {
-    if (!turnAdopted && !turnDeferred && inboundMedia.paths.length > 0) {
+    if (!turnAdoptionObserved && !turnDeferred) {
       // The turn never adopted, so core did not take ownership of these freshly-saved attachment
       // files. Remove them so a durable retry (which re-downloads a clean set) does not leak one
       // copy per attempt.
-      await Promise.allSettled(inboundMedia.paths.map((path) => rm(path, { force: true })));
+      detachAbortCleanup();
+      await cleanupInboundMedia();
     }
     throw error;
   }
-  if (!turnAdopted && !turnDeferred && inboundMedia.paths.length > 0) {
+  if (!turnAdopted && !turnDeferred) {
     // A normal return without adoption did not transfer ownership of freshly persisted files.
     // Deferred turns retain them until the lifecycle later adopts or abandons the queued turn.
-    await Promise.allSettled(inboundMedia.paths.map((path) => rm(path, { force: true })));
+    detachAbortCleanup();
+    await cleanupInboundMedia();
   }
 }

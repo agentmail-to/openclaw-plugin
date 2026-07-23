@@ -37,11 +37,25 @@ export function createAgentMailClient(
 ): AgentMailClient {
   // The channel and tools share one plugin. Prefer the resolved channel credential so a secret
   // entered through channel configuration works for both, while preserving tools-only env setup.
-  const apiKey =
-    (hostConfig ? resolveAgentMailAccount(hostConfig).apiKey : "") ||
-    process.env.AGENTMAIL_API_KEY?.trim();
+  const envApiKey = process.env.AGENTMAIL_API_KEY?.trim();
+  let channelApiKey = "";
+  let channelResolutionError: unknown;
+  if (hostConfig) {
+    try {
+      channelApiKey = resolveAgentMailAccount(hostConfig).apiKey;
+    } catch (error) {
+      // Tool execution can receive the unresolved persisted config outside a gateway secret
+      // snapshot. Keep the environment fallback reachable; if it is absent, preserve the precise
+      // unresolved-secret diagnostic instead of replacing it with a generic configuration error.
+      channelResolutionError = error;
+    }
+  }
+  const apiKey = channelApiKey || envApiKey;
 
   if (!apiKey) {
+    if (channelResolutionError) {
+      throw channelResolutionError;
+    }
     throw new Error(
       "AgentMail is not configured. Configure channels.agentmail.apiKey or set AGENTMAIL_API_KEY and restart OpenClaw.",
     );

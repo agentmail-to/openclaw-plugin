@@ -61,6 +61,35 @@ describe("AgentMail durable ingress", () => {
     expect(deletePending).toHaveBeenCalledWith(id);
   });
 
+  it("preserves capacity backpressure when overflow deletion fails", async () => {
+    const id = createAgentMailDurableInboundId(record);
+    const fail = vi.fn(async () => true);
+    const journal = withAgentMailIngressCapacity(
+      {
+        accept: vi.fn(async () => ({ kind: "accepted", duplicate: false, record: {} })),
+        pending: vi.fn(async () => [
+          { id: "other", payload: record, attempts: 0 },
+          { id, payload: record, attempts: 0 },
+        ]),
+        complete: vi.fn(),
+        release: vi.fn(),
+        deletePending: vi.fn(async () => {
+          throw new Error("queue delete unavailable");
+        }),
+        fail,
+      } as never,
+      1,
+    );
+
+    await expect(
+      processAgentMailIngress({ journal: journal as never, record, dispatch: vi.fn() }),
+    ).rejects.toBeInstanceOf(AgentMailIngressCapacityError);
+    expect(fail).toHaveBeenCalledWith(id, {
+      reason: "capacity-overflow",
+      message: "AgentMail rejected this ingress row because capacity was full",
+    });
+  });
+
   it("accepts a completed duplicate at capacity without applying backpressure", async () => {
     const accept = vi.fn(async () => ({ kind: "completed", duplicate: true, record: {} }));
     const deletePending = vi.fn();
@@ -379,6 +408,123 @@ describe("AgentMail durable ingress", () => {
     expect(complete).toHaveBeenCalledOnce();
   });
 
+  it("does not redispatch when a queued deferred dispatch later rejects", async () => {
+    const complete = vi.fn(async () => undefined);
+    const release = vi.fn(async () => true);
+    let deferredLifecycle:
+      | {
+          onTurnDeferred: () => void;
+          onTurnAbandoned: () => Promise<void>;
+          onTurnAdopted: () => Promise<void>;
+        }
+      | undefined;
+    const dispatch = vi.fn(
+      async (
+        _record: AgentMailIngressRecord,
+        lifecycle: NonNullable<typeof deferredLifecycle>,
+      ) => {
+        if (dispatch.mock.calls.length === 1) {
+          deferredLifecycle = lifecycle;
+          lifecycle.onTurnDeferred();
+          throw new Error("post-enqueue session write failed");
+        }
+        await lifecycle.onTurnAdopted();
+      },
+    );
+    await processAgentMailIngress({
+      journal: {
+        accept: async () => ({ kind: "accepted", duplicate: false, record: {} }),
+        complete,
+        release,
+      } as never,
+      record,
+      dispatch,
+      retryDelayMs: () => 0,
+    });
+    await vi.waitFor(() => expect(dispatch).toHaveBeenCalledOnce());
+    expect(release).not.toHaveBeenCalled();
+
+    await deferredLifecycle?.onTurnAbandoned();
+    await vi.waitFor(() => expect(dispatch).toHaveBeenCalledTimes(2));
+    expect(release).toHaveBeenCalledOnce();
+    expect(complete).toHaveBeenCalledOnce();
+  });
+
+  it("retries a deferred adoption marker inside the lifecycle callback", async () => {
+    const complete = vi
+      .fn<() => Promise<void>>()
+      .mockRejectedValueOnce(new Error("database busy"))
+      .mockResolvedValueOnce(undefined);
+    const release = vi.fn(async () => true);
+    let deferredLifecycle:
+      | {
+          onTurnDeferred: () => void;
+          onTurnAdopted: () => Promise<void>;
+        }
+      | undefined;
+    const dispatch = vi.fn(
+      async (
+        _record: AgentMailIngressRecord,
+        lifecycle: NonNullable<typeof deferredLifecycle>,
+      ) => {
+        deferredLifecycle = lifecycle;
+        lifecycle.onTurnDeferred();
+      },
+    );
+    await processAgentMailIngress({
+      journal: {
+        accept: async () => ({ kind: "accepted", duplicate: false, record: {} }),
+        complete,
+        release,
+      } as never,
+      record,
+      dispatch,
+      retryDelayMs: () => 0,
+    });
+    await vi.waitFor(() => expect(deferredLifecycle).toBeDefined());
+
+    await deferredLifecycle?.onTurnAdopted();
+    await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(2));
+    expect(dispatch).toHaveBeenCalledOnce();
+    expect(release).not.toHaveBeenCalled();
+  });
+
+  it("retries a turn abandoned before a deferred notification", async () => {
+    const complete = vi.fn(async () => undefined);
+    const release = vi.fn(async () => true);
+    const dispatch = vi.fn(
+      async (
+        _record: AgentMailIngressRecord,
+        lifecycle: {
+          onTurnAbandoned: () => Promise<void>;
+          onTurnAdopted: () => Promise<void>;
+        },
+      ) => {
+        if (dispatch.mock.calls.length === 1) {
+          await lifecycle.onTurnAbandoned();
+          return;
+        }
+        await lifecycle.onTurnAdopted();
+      },
+    );
+    await processAgentMailIngress({
+      journal: {
+        accept: async () => ({ kind: "accepted", duplicate: false, record: {} }),
+        complete,
+        release,
+      } as never,
+      record,
+      dispatch,
+      retryDelayMs: () => 0,
+    });
+
+    await vi.waitFor(() => expect(dispatch).toHaveBeenCalledTimes(2));
+    expect(release).toHaveBeenCalledWith(createAgentMailDurableInboundId(record), {
+      lastError: "deferred turn abandoned before adoption",
+    });
+    expect(complete).toHaveBeenCalledOnce();
+  });
+
   it("fails repeatedly abandoned deferred turns at the dispatch ceiling", async () => {
     const release = vi.fn(async () => true);
     const fail = vi.fn(async () => true);
@@ -499,8 +645,41 @@ describe("AgentMail durable ingress", () => {
       retryDelayMs: () => 0,
     });
     await vi.waitFor(() => expect(agentStarted).toHaveBeenCalledOnce());
-    expect(dispatch).toHaveBeenCalledTimes(2);
+    expect(dispatch).toHaveBeenCalledOnce();
     expect(complete).toHaveBeenCalledTimes(2);
+  });
+
+  it("gives completion markers a full retry budget after dispatch retries", async () => {
+    let dispatchFailures = 0;
+    const dispatch = vi.fn(async () => {
+      if (dispatchFailures < 49) {
+        dispatchFailures += 1;
+        throw new Error("temporary dispatch failure");
+      }
+    });
+    let completionFailures = 0;
+    const complete = vi.fn(async () => {
+      if (completionFailures < 49) {
+        completionFailures += 1;
+        throw new Error("temporary completion failure");
+      }
+    });
+    const fail = vi.fn(async () => true);
+    await processAgentMailIngress({
+      journal: {
+        accept: async () => ({ kind: "accepted", duplicate: false, record: {} }),
+        complete,
+        release: vi.fn(async () => true),
+        fail,
+      } as never,
+      record,
+      dispatch,
+      retryDelayMs: () => 0,
+    });
+
+    await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(50));
+    expect(dispatch).toHaveBeenCalledTimes(50);
+    expect(fail).not.toHaveBeenCalled();
   });
 
   it("retries only the marker after an irrevocable active-turn adoption", async () => {

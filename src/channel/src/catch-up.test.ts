@@ -215,6 +215,12 @@ describe("AgentMail durable REST catch-up", () => {
     const receive = vi.fn(async () => undefined);
 
     await session.run({ receive, abortSignal: new AbortController().signal });
+    expect(list).toHaveBeenNthCalledWith(
+      1,
+      "inbox_1",
+      expect.objectContaining({ before: new Date(nowMs + 1) }),
+      expect.any(Object),
+    );
     await session.run({ receive, abortSignal: new AbortController().signal });
     expect(list).toHaveBeenLastCalledWith(
       "inbox_1",

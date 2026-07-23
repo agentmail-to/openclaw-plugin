@@ -281,6 +281,10 @@ export async function createAgentMailCatchUpSession(params: {
             ...(pageCursor ? { pageToken: pageCursor } : {}),
             labels: [AGENTMAIL_RECEIVED_LABEL],
             after: new Date(afterMs),
+            // Do not repeatedly scan provider-clock-skewed future messages. Add one millisecond so
+            // an exclusive provider bound includes messages stamped exactly at runAtMs and so a
+            // fresh cursor never sends identical after/before values.
+            before: new Date(runAtMs + 1),
             ascending: true,
             includeSpam: false,
             includeBlocked: false,
