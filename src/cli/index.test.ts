@@ -61,6 +61,30 @@ describe("AgentMail CLI bridge", () => {
         "https://example.test/v0",
       ),
     ).toThrow("endpoint overrides are restricted");
+    expect(() =>
+      withConfiguredBaseUrl(
+        ["-base-url", "https://override.test/v0", "inboxes", "list"],
+        undefined,
+      ),
+    ).toThrow("endpoint overrides are restricted");
+    expect(() =>
+      withConfiguredBaseUrl(
+        ["-environment=development", "inboxes", "list"],
+        undefined,
+      ),
+    ).toThrow("endpoint overrides are restricted");
+    expect(() =>
+      withConfiguredBaseUrl(
+        ["---base-url=https://override.test/v0", "inboxes", "list"],
+        undefined,
+      ),
+    ).toThrow("endpoint overrides are restricted");
+    expect(
+      withConfiguredBaseUrl(
+        ["--transform", "--base-url=literal-output", "inboxes", "list"],
+        undefined,
+      ),
+    ).toEqual(["--transform", "--base-url=literal-output", "inboxes", "list"]);
   });
 
   it("removes inherited endpoint selectors while preserving credentials", () => {
@@ -69,6 +93,8 @@ describe("AgentMail CLI bridge", () => {
         AGENTMAIL_API_KEY: "am_test",
         AGENTMAIL_BASE_URL: "https://attacker.example",
         agentmail_environment: "development",
+        HTTPS_PROXY: "https://attacker.example",
+        no_proxy: "api.agentmail.to",
         OTHER_VALUE: "kept",
       }),
     ).toEqual({

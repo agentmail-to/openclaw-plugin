@@ -151,92 +151,98 @@ async function dispatchAgentMailIngressUntilSettled(params: DispatchParams): Pro
   while (!params.abortSignal?.aborted) {
     if (!params.dispatchCompleted) {
       let turnAdopted = false;
+      let adoptionMarkerCompleted = false;
       const onTurnAdopted = async () => {
         if (turnAdopted) {
           return;
         }
-        // Core persists restart-recovery delivery state before this callback. A fresh turn does
-        // not begin if it rejects; an already-committed active steer falls through to the
-        // marker-only retry below. Completing here closes the normal crash window before tools.
-        await params.journal.complete(params.id);
+        // Core persists restart-recovery delivery state before this callback, so adoption is
+        // irrevocable even if the ingress completion marker transiently fails. Switch to the
+        // marker-only path before persisting it so no error path can redispatch the adopted turn.
         turnAdopted = true;
         params.dispatchCompleted = true;
+        await params.journal.complete(params.id);
+        adoptionMarkerCompleted = true;
       };
       try {
         await params.dispatch(params.record, { onTurnAdopted, abortSignal: params.abortSignal });
-        if (turnAdopted) {
+        if (adoptionMarkerCompleted) {
           return true;
         }
-        params.dispatchCompleted = true;
+        if (!turnAdopted) {
+          params.dispatchCompleted = true;
+        }
       } catch (error) {
         if (turnAdopted) {
-          // The adopted turn is now owned by core's restart-recovery machinery. Releasing the
-          // ingress row would replay agent tools even if the later turn failed.
-          return true;
-        }
-        attempts += 1;
-        if (attempts >= AGENTMAIL_MAX_DISPATCH_ATTEMPTS) {
-          // Poison message: it has failed deterministically past the retry ceiling. Drop it
-          // (complete removes it from the pending set) so it stops occupying an admission slot and
-          // blocking new mail. Surface it so an operator can investigate the underlying failure.
-          params.log?.error?.(
-            `AgentMail dropping message ${params.record.messageId} after ${attempts} failed dispatch attempts: ${errorText(error)}`,
+          // Fall through to the idempotent marker retry below. Releasing or redispatching would
+          // replay agent tools for a turn already owned by core's restart-recovery machinery.
+        } else {
+          attempts += 1;
+          if (attempts >= AGENTMAIL_MAX_DISPATCH_ATTEMPTS) {
+            // Poison message: it has failed deterministically past the retry ceiling. Drop it
+            // (complete removes it from the pending set) so it stops occupying an admission slot
+            // and blocking new mail. Surface it so an operator can investigate the underlying
+            // failure.
+            params.log?.error?.(
+              `AgentMail dropping message ${params.record.messageId} after ${attempts} failed dispatch attempts: ${errorText(error)}`,
+            );
+            try {
+              await params.journal.complete(params.id);
+            } catch {
+              // Best effort: TTL pruning still reclaims the row if the terminal marker cannot
+              // persist.
+            }
+            return true;
+          }
+          const lastError = errorText(error);
+          let releaseAttempts = 0;
+          while (!params.abortSignal?.aborted) {
+            try {
+              const released = await params.journal.release(params.id, { lastError });
+              if (!released) {
+                // A concurrent completion or retention prune means this worker no longer owns a
+                // pending row. Redispatching without ownership could duplicate an adopted turn.
+                return true;
+              }
+              break;
+            } catch (releaseError) {
+              releaseAttempts += 1;
+              if (releaseAttempts >= AGENTMAIL_MAX_JOURNAL_RELEASE_ATTEMPTS) {
+                // Do not retain an immortal active-dispatch entry and successor chain when storage
+                // is persistently unavailable. The durable row remains pending for replay on
+                // restart or a later duplicate delivery.
+                params.log?.error?.(
+                  `AgentMail stopped releasing message ${params.record.messageId} after ${releaseAttempts} failed journal attempts: ${errorText(releaseError)}`,
+                );
+                return false;
+              }
+              if (
+                !(await waitForRetry(
+                  params.abortSignal,
+                  (params.retryDelay ?? retryDelayMs)(releaseAttempts),
+                ))
+              ) {
+                return false;
+              }
+            }
+          }
+          if (params.abortSignal?.aborted) {
+            return false;
+          }
+          const shouldRetry = await waitForRetry(
+            params.abortSignal,
+            nextDispatchDelayMs({
+              error,
+              record: params.record,
+              attempts,
+              retryDelay: params.retryDelay ?? retryDelayMs,
+            }),
           );
-          try {
-            await params.journal.complete(params.id);
-          } catch {
-            // Best effort: TTL pruning still reclaims the row if the terminal marker cannot persist.
+          if (!shouldRetry) {
+            return false;
           }
-          return true;
+          continue;
         }
-        const lastError = errorText(error);
-        let releaseAttempts = 0;
-        while (!params.abortSignal?.aborted) {
-          try {
-            const released = await params.journal.release(params.id, { lastError });
-            if (!released) {
-              // A concurrent completion or retention prune means this worker no longer owns a
-              // pending row. Redispatching without ownership could duplicate an adopted turn.
-              return true;
-            }
-            break;
-          } catch (releaseError) {
-            releaseAttempts += 1;
-            if (releaseAttempts >= AGENTMAIL_MAX_JOURNAL_RELEASE_ATTEMPTS) {
-              // Do not retain an immortal active-dispatch entry and successor chain when storage is
-              // persistently unavailable. The durable row remains pending for replay on restart or
-              // a later duplicate delivery.
-              params.log?.error?.(
-                `AgentMail stopped releasing message ${params.record.messageId} after ${releaseAttempts} failed journal attempts: ${errorText(releaseError)}`,
-              );
-              return false;
-            }
-            if (
-              !(await waitForRetry(
-                params.abortSignal,
-                (params.retryDelay ?? retryDelayMs)(releaseAttempts),
-              ))
-            ) {
-              return false;
-            }
-          }
-        }
-        if (params.abortSignal?.aborted) {
-          return false;
-        }
-        const shouldRetry = await waitForRetry(
-          params.abortSignal,
-          nextDispatchDelayMs({
-            error,
-            record: params.record,
-            attempts,
-            retryDelay: params.retryDelay ?? retryDelayMs,
-          }),
-        );
-        if (!shouldRetry) {
-          return false;
-        }
-        continue;
       }
     }
     try {

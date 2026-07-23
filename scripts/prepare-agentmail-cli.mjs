@@ -4,6 +4,7 @@ import { unzipSync } from "fflate";
 import {
   chmodSync,
   copyFileSync,
+  cpSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -21,7 +22,9 @@ const release = JSON.parse(
   readFileSync(new URL("../src/cli/agentmail-cli-release.json", import.meta.url), "utf8"),
 );
 const vendorRoot = join(root, ...release.vendorDirectory.split("/"));
+const vendorParent = dirname(vendorRoot);
 const versionPath = join(vendorRoot, "VERSION");
+const preparationLock = `${vendorRoot}.prepare-lock`;
 const allTargets = Object.keys(release.assets).sort();
 
 function currentTarget() {
@@ -66,10 +69,10 @@ function extract(archive, destination, executableName) {
   }
 }
 
-async function prepareTarget(target, temporaryRoot) {
+async function prepareTarget(target, temporaryRoot, destinationRoot) {
   const metadata = release.assets[target];
   const executableName = metadata.executableName;
-  const destination = join(vendorRoot, target, executableName);
+  const destination = join(destinationRoot, target, executableName);
   if (existsSync(destination)) {
     console.log(`AgentMail CLI ${release.version} already prepared for ${target}.`);
     return;
@@ -105,41 +108,98 @@ async function prepareTarget(target, temporaryRoot) {
   renameSync(stagedDestination, destination);
 }
 
-const existingVersion = existsSync(versionPath)
-  ? readFileSync(versionPath, "utf8").trim()
-  : undefined;
-if (existingVersion !== release.version && existsSync(vendorRoot)) {
-  rmSync(vendorRoot, { recursive: true, force: true });
-}
-mkdirSync(vendorRoot, { recursive: true });
-// A marker represents a fully successful preparation run, not merely a selected release. Remove
-// any prior marker while verifying/filling the requested target set and restore it atomically below.
-rmSync(versionPath, { force: true });
-
-const targets = process.argv.includes("--all") ? allTargets : [currentTarget()];
-const temporaryRoot = mkdtempSync(join(tmpdir(), "agentmail-cli-prepare-"));
-
-try {
-  for (const target of targets) {
-    await prepareTarget(target, temporaryRoot);
+async function main() {
+  mkdirSync(vendorParent, { recursive: true });
+  try {
+    mkdirSync(preparationLock);
+  } catch (error) {
+    if (error?.code === "EEXIST") {
+      throw new Error(
+        `Another AgentMail CLI preparation is already using ${preparationLock}.`,
+      );
+    }
+    throw error;
   }
 
-  const licensePath = join(vendorRoot, "LICENSE");
-  if (!existsSync(licensePath)) {
-    await download(
-      `https://raw.githubusercontent.com/${release.repository}/v${release.version}/LICENSE`,
-      licensePath,
+  let temporaryRoot;
+  let stagingParent;
+  const backupRoot = `${vendorRoot}.backup-${process.pid}`;
+
+  try {
+    const targets = process.argv.includes("--all") ? allTargets : [currentTarget()];
+    temporaryRoot = mkdtempSync(join(tmpdir(), "agentmail-cli-prepare-"));
+    stagingParent = mkdtempSync(join(vendorParent, ".agentmail-cli-stage-"));
+    const stagedVendorRoot = join(stagingParent, basename(vendorRoot));
+    const existingVersion = existsSync(versionPath)
+      ? readFileSync(versionPath, "utf8").trim()
+      : undefined;
+    const requestedTreeIsComplete =
+      existingVersion === release.version &&
+      existsSync(join(vendorRoot, "LICENSE")) &&
+      targets.every((target) => {
+        const metadata = release.assets[target];
+        return existsSync(join(vendorRoot, target, metadata.executableName));
+      });
+    if (requestedTreeIsComplete) {
+      for (const target of targets) {
+        console.log(`AgentMail CLI ${release.version} already prepared for ${target}.`);
+      }
+    } else {
+      // Build a complete replacement tree beside the live one. A failed download, checksum,
+      // extraction, or LICENSE fetch leaves the currently installed tree untouched.
+      if (existingVersion === release.version && existsSync(vendorRoot)) {
+        cpSync(vendorRoot, stagedVendorRoot, { recursive: true });
+      } else {
+        mkdirSync(stagedVendorRoot, { recursive: true });
+      }
+
+      for (const target of targets) {
+        await prepareTarget(target, temporaryRoot, stagedVendorRoot);
+      }
+
+      const licensePath = join(stagedVendorRoot, "LICENSE");
+      if (!existsSync(licensePath)) {
+        const downloadedLicense = join(temporaryRoot, "LICENSE");
+        await download(
+          `https://raw.githubusercontent.com/${release.repository}/v${release.version}/LICENSE`,
+          downloadedLicense,
+        );
+        copyFileSync(downloadedLicense, licensePath);
+      }
+      // The marker lives only in the staged tree and therefore becomes visible with the complete
+      // requested tree, never before its binaries and license.
+      writeFileSync(join(stagedVendorRoot, "VERSION"), `${release.version}\n`);
+
+      let originalMoved = false;
+      try {
+        if (existsSync(vendorRoot)) {
+          renameSync(vendorRoot, backupRoot);
+          originalMoved = true;
+        }
+        renameSync(stagedVendorRoot, vendorRoot);
+      } catch (error) {
+        if (originalMoved && !existsSync(vendorRoot) && existsSync(backupRoot)) {
+          renameSync(backupRoot, vendorRoot);
+        }
+        throw error;
+      }
+      if (originalMoved) {
+        rmSync(backupRoot, { recursive: true, force: true });
+      }
+    }
+
+    console.log(
+      `Prepared AgentMail CLI ${release.version} for ${targets.length} target${targets.length === 1 ? "" : "s"}.`,
     );
+  } finally {
+    if (temporaryRoot) {
+      rmSync(temporaryRoot, { recursive: true, force: true });
+    }
+    if (stagingParent) {
+      rmSync(stagingParent, { recursive: true, force: true });
+    }
+    rmSync(preparationLock, { recursive: true, force: true });
   }
-  // Commit the version marker only after the requested binaries and license are complete. If any
-  // preparation step fails, the absent marker forces the next run to rebuild the partial directory.
-  const stagedVersionPath = `${versionPath}.tmp-${process.pid}`;
-  writeFileSync(stagedVersionPath, `${release.version}\n`);
-  renameSync(stagedVersionPath, versionPath);
-} finally {
-  rmSync(temporaryRoot, { recursive: true, force: true });
 }
 
-console.log(
-  `Prepared AgentMail CLI ${release.version} for ${targets.length} target${targets.length === 1 ? "" : "s"}.`,
-);
+await main();

@@ -9,7 +9,7 @@ Give an OpenClaw agent an email address with [AgentMail](https://www.agentmail.t
 
 ## Requirements
 
-- Node.js 22.22.3+, 24.15+, or 25.9+
+- Node.js 22.22.3–22.x, 24.15.0–24.x, or 25.9.0+
 - OpenClaw 2026.7.2 (beta) or newer
 - An AgentMail API key from the [AgentMail console](https://console.agentmail.to/)
 
@@ -76,7 +76,8 @@ The previous `timeoutSeconds` and `maxRetries` tool settings remain accepted so 
 configurations continue to load, but the bundled CLI does not use them.
 For credential safety, command arguments cannot override `--base-url`; only the
 operator-controlled plugin setting above can select the AgentMail API endpoint. The passthrough
-also rejects `--environment` and removes inherited endpoint-selector environment variables.
+also rejects `--environment` and removes inherited endpoint-selector and standard proxy environment
+variables (`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, and `NO_PROXY`, including lowercase forms).
 
 ### Channel config
 

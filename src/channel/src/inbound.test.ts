@@ -308,7 +308,7 @@ describe("AgentMail REST-authoritative inbound", () => {
     expect(rm).toHaveBeenCalledWith("/tmp/no-op.bin", { force: true });
   });
 
-  it("cleans up attachments when the adoption hook itself fails", async () => {
+  it("preserves adopted attachments when journal completion fails", async () => {
     rm.mockClear();
     loadAgentMailInboundAttachments.mockResolvedValueOnce({
       paths: ["/tmp/b.bin"],
@@ -342,8 +342,9 @@ describe("AgentMail REST-authoritative inbound", () => {
         onTurnAdopted,
       }),
     ).rejects.toThrow("journal.complete failed");
-    // The flag is set only after the hook resolves, so a failed completion still cleans up media.
-    expect(rm).toHaveBeenCalledWith("/tmp/b.bin", { force: true });
+    // Core invoked the hook only after adoption, so its recovery state and tools may still reference
+    // this media even though persisting the ingress completion marker failed.
+    expect(rm).not.toHaveBeenCalled();
   });
 
   it("denies an unauthorized hydrated sender without dispatch", async () => {

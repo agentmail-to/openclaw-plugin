@@ -9,6 +9,48 @@ export type AgentMailCliTarget = {
   executableName: "agentmail" | "agentmail.exe";
 };
 
+export const AGENTMAIL_CLI_ENDPOINT_OPTIONS = ["base-url", "environment"] as const;
+
+const endpointOptions = new Set<string>(AGENTMAIL_CLI_ENDPOINT_OPTIONS);
+const optionsWithSeparateValues = new Set([
+  "api-key",
+  "base-url",
+  "environment",
+  "format",
+  "format-error",
+  "transform",
+  "transform-error",
+]);
+const restrictedEnvironmentKeys = new Set([
+  "AGENTMAIL_BASE_URL",
+  "AGENTMAIL_ENVIRONMENT",
+  "ALL_PROXY",
+  "HTTP_PROXY",
+  "HTTPS_PROXY",
+  "NO_PROXY",
+]);
+
+function parseOptionToken(token: string): {
+  name: string;
+  hasInlineValue: boolean;
+} | null {
+  const option = /^-+(.+)$/.exec(token)?.[1];
+  if (!option) {
+    return null;
+  }
+  const equalsAt = option.indexOf("=");
+  return {
+    name: (equalsAt < 0 ? option : option.slice(0, equalsAt)).toLowerCase(),
+    hasInlineValue: equalsAt >= 0,
+  };
+}
+
+export function resolveAgentMailCliVendorPath(...segments: string[]): string {
+  return fileURLToPath(
+    new URL(`../../${release.vendorDirectory}/${segments.join("/")}`, import.meta.url),
+  );
+}
+
 export function resolveAgentMailCliTarget(
   platform: NodeJS.Platform = process.platform,
   arch: NodeJS.Architecture = process.arch,
@@ -33,30 +75,29 @@ export function resolveAgentMailCliExecutable(
   arch: NodeJS.Architecture = process.arch,
 ): string {
   const target = resolveAgentMailCliTarget(platform, arch);
-  return fileURLToPath(
-    new URL(
-      `../../${release.vendorDirectory}/${target.directory}/${target.executableName}`,
-      import.meta.url,
-    ),
-  );
+  return resolveAgentMailCliVendorPath(target.directory, target.executableName);
 }
 
 export function withConfiguredBaseUrl(
   args: readonly string[],
   baseUrl: string | undefined,
 ): string[] {
-  if (
-    args.some(
-      (arg) =>
-        arg === "--base-url" ||
-        arg.startsWith("--base-url=") ||
-        arg === "--environment" ||
-        arg.startsWith("--environment="),
-    )
-  ) {
-    throw new Error(
-      "AgentMail API endpoint overrides are restricted to the operator-controlled plugin config.",
-    );
+  let consumesNextValue = false;
+  for (const arg of args) {
+    if (consumesNextValue) {
+      consumesNextValue = false;
+      continue;
+    }
+    const option = parseOptionToken(arg);
+    if (!option) {
+      continue;
+    }
+    if (endpointOptions.has(option.name)) {
+      throw new Error(
+        "AgentMail API endpoint overrides are restricted to the operator-controlled plugin config.",
+      );
+    }
+    consumesNextValue = !option.hasInlineValue && optionsWithSeparateValues.has(option.name);
   }
   return baseUrl ? ["--base-url", baseUrl, ...args] : [...args];
 }
@@ -66,10 +107,7 @@ export function sanitizeAgentMailCliEnvironment(
 ): NodeJS.ProcessEnv {
   const sanitized = { ...source };
   for (const key of Object.keys(sanitized)) {
-    if (
-      key.toLocaleUpperCase("en-US") === "AGENTMAIL_BASE_URL" ||
-      key.toLocaleUpperCase("en-US") === "AGENTMAIL_ENVIRONMENT"
-    ) {
+    if (restrictedEnvironmentKeys.has(key.toUpperCase())) {
       delete sanitized[key];
     }
   }

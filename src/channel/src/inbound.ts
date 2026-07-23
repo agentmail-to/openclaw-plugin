@@ -255,13 +255,14 @@ export async function dispatchAgentMailInboundEvent(params: {
   // Adoption fires when core has made recovery-relevant session/run state durable. The ingress row
   // is completed here (via params.onTurnAdopted), closing the crash window before agent tools run;
   // exclusive admission isolates the reply lane per turn, and the abort signal cancels a pre-adoption
-  // turn on shutdown. The local `turnAdopted` flag is set only AFTER the hook resolves so a failed
-  // journal.complete still triggers media cleanup below.
+  // turn on shutdown. Core has already adopted the turn when this observer runs, so record adoption
+  // before journal completion. Even if marker persistence fails, core owns the media referenced by
+  // the adopted turn and the retry path must not delete it.
   const turnAdoptionLifecycle = {
     admission: "exclusive" as const,
     onAdopted: async () => {
-      await params.onTurnAdopted?.();
       turnAdopted = true;
+      await params.onTurnAdopted?.();
     },
     ...(params.abortSignal ? { abortSignal: params.abortSignal } : {}),
   };

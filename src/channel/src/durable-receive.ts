@@ -4,11 +4,21 @@ import { getAgentMailRuntime } from "./runtime.js";
 import type { AgentMailIngressRecord } from "./types.js";
 
 export const AGENTMAIL_DURABLE_PENDING_MAX_ENTRIES = 450;
+// Bound the 30-day dedupe table per account/inbox. This accommodates sustained high-volume use
+// while preventing completed tombstones and their prune scans from growing without limit.
+export const AGENTMAIL_DURABLE_COMPLETED_MAX_ENTRIES = 50_000;
 export const AGENTMAIL_DURABLE_PENDING_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 // Keep completed tombstones for the full pending recovery horizon. REST catch-up may remain behind
 // while durable admission is full; expiring dedupe markers sooner either replays completed mail or
 // forces catch-up to skip never-admitted messages.
 export const AGENTMAIL_DURABLE_COMPLETED_TTL_MS = AGENTMAIL_DURABLE_PENDING_TTL_MS;
+export const AGENTMAIL_DURABLE_RETENTION = {
+  pendingTtlMs: AGENTMAIL_DURABLE_PENDING_TTL_MS,
+  completedTtlMs: AGENTMAIL_DURABLE_COMPLETED_TTL_MS,
+  completedMaxEntries: AGENTMAIL_DURABLE_COMPLETED_MAX_ENTRIES,
+  failedTtlMs: AGENTMAIL_DURABLE_PENDING_TTL_MS,
+  failedMaxEntries: AGENTMAIL_DURABLE_PENDING_MAX_ENTRIES,
+} as const;
 
 /**
  * Raised when durable ingress is already holding the maximum number of pending rows. Transports
@@ -93,12 +103,7 @@ export function createAgentMailDurableInboundReceiveJournal(params: {
   );
   const journal = createDurableInboundReceiveJournalFromQueue({
     queue,
-    retention: {
-      pendingTtlMs: AGENTMAIL_DURABLE_PENDING_TTL_MS,
-      completedTtlMs: AGENTMAIL_DURABLE_COMPLETED_TTL_MS,
-      failedTtlMs: AGENTMAIL_DURABLE_PENDING_TTL_MS,
-      failedMaxEntries: AGENTMAIL_DURABLE_PENDING_MAX_ENTRIES,
-    },
+    retention: AGENTMAIL_DURABLE_RETENTION,
   });
   return withAgentMailIngressCapacity(journal, AGENTMAIL_DURABLE_PENDING_MAX_ENTRIES);
 }

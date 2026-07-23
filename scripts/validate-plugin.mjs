@@ -10,9 +10,7 @@ import { fileURLToPath } from "node:url";
 
 const root = fileURLToPath(new URL("..", import.meta.url));
 const openclaw = fileURLToPath(new URL("../node_modules/.bin/openclaw", import.meta.url));
-const cliRelease = JSON.parse(
-  readFileSync(new URL("../src/cli/agentmail-cli-release.json", import.meta.url), "utf8"),
-);
+const cliRunner = await import(new URL("../dist/cli/runner.js", import.meta.url));
 
 // Run against an isolated, disposable state dir so validation (invoked from prepack during
 // `npm pack`/`npm publish`) never touches the maintainer's real OpenClaw installation or its
@@ -79,9 +77,56 @@ if (/agentmail_list_inboxes/.test(inspect)) {
 }
 
 const expectedCliVersion = readFileSync(
-  join(root, ...cliRelease.vendorDirectory.split("/"), "VERSION"),
+  cliRunner.resolveAgentMailCliVendorPath("VERSION"),
   "utf8",
 ).trim();
+let cliHelp = "";
+try {
+  cliHelp = execFileSync(cliRunner.resolveAgentMailCliExecutable(), ["--help"], {
+    cwd: root,
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+    env: cliRunner.sanitizeAgentMailCliEnvironment(childEnv),
+  });
+} catch (error) {
+  fail(
+    "could not inspect the bundled AgentMail CLI global options",
+    error.stdout || error.stderr || String(error),
+  );
+}
+const endpointOptions = cliHelp
+  .split("\n")
+  .filter((line) => /(base URL|environment for API requests)/i.test(line))
+  .flatMap((line) =>
+    [...line.matchAll(/(?:^|[\s,])-+([a-z][a-z0-9-]*)\b/gi)].map((match) =>
+      match[1].toLowerCase(),
+    ),
+  )
+  .sort();
+const guardedEndpointOptions = [...cliRunner.AGENTMAIL_CLI_ENDPOINT_OPTIONS].sort();
+if (JSON.stringify(endpointOptions) !== JSON.stringify(guardedEndpointOptions)) {
+  fail(
+    "bundled AgentMail CLI endpoint options no longer match the passthrough guard",
+    `CLI: ${endpointOptions.join(", ") || "(none)"}; guard: ${guardedEndpointOptions.join(", ")}`,
+  );
+}
+for (const option of endpointOptions) {
+  for (const prefix of ["-", "--", "---"]) {
+    for (const args of [
+      [`${prefix}${option}`, "untrusted", "inboxes", "list"],
+      [`${prefix}${option}=untrusted`, "inboxes", "list"],
+    ]) {
+      try {
+        cliRunner.withConfiguredBaseUrl(args, undefined);
+        fail(`endpoint guard accepted ${args[0]}`);
+      } catch (error) {
+        if (!String(error).includes("endpoint overrides are restricted")) {
+          throw error;
+        }
+      }
+    }
+  }
+}
 let cliVersion = "";
 try {
   cliVersion = run(["agentmail", "--", "--version"]);

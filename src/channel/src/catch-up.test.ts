@@ -203,6 +203,37 @@ describe("AgentMail durable REST catch-up", () => {
     });
   });
 
+  it("retries legacy cursor cleanup after a transient delete failure", async () => {
+    openKeyedStore.mockReset();
+    const key = sha256Hex("default\ninbox_1");
+    const legacyStore = memoryStore<AgentMailCatchUpCursor>();
+    const accountStore = memoryStore<AgentMailCatchUpCursor>();
+    await legacyStore.register(key, {
+      version: 1,
+      baselineAtMs: 500,
+      highWaterAtMs: 900,
+      established: true,
+    });
+    const deleteLegacy = legacyStore.delete.bind(legacyStore);
+    legacyStore.delete = vi
+      .fn<(key: string) => Promise<boolean>>()
+      .mockRejectedValueOnce(new Error("database busy"))
+      .mockImplementation(deleteLegacy);
+    openKeyedStore.mockImplementation(({ namespace }) =>
+      namespace === AGENTMAIL_REST_CATCH_UP_NAMESPACE ? legacyStore : accountStore,
+    );
+    const warn = vi.fn();
+    const client = { inboxes: { messages: { list: vi.fn() } } } as never;
+
+    await createAgentMailCatchUpSession({ account, client, now: () => 10_000, log: { warn } });
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("could not remove"));
+    expect(await legacyStore.lookup(key)).toBeDefined();
+
+    await createAgentMailCatchUpSession({ account, client, now: () => 11_000, log: { warn } });
+    expect(legacyStore.delete).toHaveBeenCalledTimes(2);
+    expect(await legacyStore.lookup(key)).toBeUndefined();
+  });
+
   it("coalesces recovery requests into one bounded retry supervisor", async () => {
     const run = vi
       .fn<() => Promise<void>>()
@@ -365,34 +396,57 @@ describe("AgentMail durable REST catch-up", () => {
     );
   });
 
-  it("skips malformed timestamps without poisoning the cursor or recovery pass", async () => {
-    const store = memoryStore<never>();
+  it("advances past malformed timestamps and clamps implausibly future timestamps", async () => {
+    const store = memoryStore<AgentMailCatchUpCursor>();
+    const key = sha256Hex("default\ninbox_1");
+    await store.register(key, {
+      version: 1,
+      baselineAtMs: 100_000,
+      highWaterAtMs: 200_000,
+      established: true,
+    });
     const malformed = {
-      ...message({ id: "malformed", timestamp: 1_050 }),
+      ...message({ id: "malformed", timestamp: 900_000 }),
       timestamp: new Date(Number.NaN),
     };
-    const list = vi.fn(async () => ({
-      count: 2,
-      messages: [malformed, message({ id: "message_1", timestamp: 1_100 })],
-    }));
+    const farFuture = message({ id: "future", timestamp: 100_000_000 });
+    const list = vi
+      .fn()
+      .mockResolvedValueOnce({ count: 2, messages: [malformed, farFuture] })
+      .mockResolvedValueOnce({ count: 0, messages: [] });
     const warn = vi.fn();
     const session = await createAgentMailCatchUpSession({
       account,
       client: { inboxes: { messages: { list } } } as never,
-      store: store as never,
-      now: () => 1_000,
+      store,
+      now: () => 1_000_000,
       log: { warn },
     });
     const receive = vi.fn(async () => undefined);
 
-    await expect(
-      session.run({ receive, abortSignal: new AbortController().signal }),
-    ).resolves.toBeUndefined();
-    expect(receive).toHaveBeenCalledOnce();
-    expect(receive).toHaveBeenCalledWith(
-      expect.objectContaining({ messageId: "message_1", receivedAt: 1_100 }),
+    await session.run({ receive, abortSignal: new AbortController().signal });
+    await session.run({ receive, abortSignal: new AbortController().signal });
+
+    expect(receive.mock.calls.map(([record]) => [record.messageId, record.receivedAt])).toEqual([
+      ["malformed", 1_000_000],
+      ["future", 1_000_000 + AGENTMAIL_REST_CATCH_UP_OVERLAP_MS],
+    ]);
+    expect(list).toHaveBeenNthCalledWith(
+      1,
+      "inbox_1",
+      expect.objectContaining({
+        before: new Date(1_000_000 + AGENTMAIL_REST_CATCH_UP_OVERLAP_MS),
+      }),
+      expect.any(Object),
+    );
+    expect(list).toHaveBeenNthCalledWith(
+      2,
+      "inbox_1",
+      expect.objectContaining({ after: new Date(1_000_000) }),
+      expect.any(Object),
     );
     expect(warn).toHaveBeenCalledWith(expect.stringContaining("invalid timestamp"));
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("clamped future timestamp"));
   });
 
   it("pauses the pass when durable ingress reports capacity", async () => {

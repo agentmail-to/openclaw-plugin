@@ -1,8 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
 import {
+  AGENTMAIL_DURABLE_COMPLETED_MAX_ENTRIES,
   AGENTMAIL_DURABLE_COMPLETED_TTL_MS,
   AGENTMAIL_DURABLE_PENDING_MAX_ENTRIES,
   AGENTMAIL_DURABLE_PENDING_TTL_MS,
+  AGENTMAIL_DURABLE_RETENTION,
   createAgentMailDurableInboundId,
   withAgentMailIngressCapacity,
 } from "./durable-receive.js";
@@ -22,6 +24,15 @@ const record: AgentMailIngressRecord = {
 };
 
 describe("AgentMail durable ingress", () => {
+  it("bounds completed tombstones while retaining a high-volume dedupe window", () => {
+    expect(AGENTMAIL_DURABLE_RETENTION.completedMaxEntries).toBe(
+      AGENTMAIL_DURABLE_COMPLETED_MAX_ENTRIES,
+    );
+    expect(AGENTMAIL_DURABLE_COMPLETED_MAX_ENTRIES).toBeGreaterThan(
+      AGENTMAIL_DURABLE_PENDING_MAX_ENTRIES,
+    );
+  });
+
   it("deduplicates the same message across transports", () => {
     expect(createAgentMailDurableInboundId(record)).toBe(
       createAgentMailDurableInboundId({
@@ -372,7 +383,7 @@ describe("AgentMail durable ingress", () => {
     expect(release).not.toHaveBeenCalled();
   });
 
-  it("retries journal adoption before starting the agent turn", async () => {
+  it("retries only the marker when an adopted turn surfaces completion failure", async () => {
     const complete = vi
       .fn<() => Promise<void>>()
       .mockRejectedValueOnce(new Error("database busy"))
@@ -397,9 +408,9 @@ describe("AgentMail durable ingress", () => {
       dispatch,
       retryDelayMs: () => 0,
     });
-    await vi.waitFor(() => expect(agentStarted).toHaveBeenCalledOnce());
-    expect(dispatch).toHaveBeenCalledTimes(2);
-    expect(complete).toHaveBeenCalledTimes(2);
+    await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(2));
+    expect(agentStarted).not.toHaveBeenCalled();
+    expect(dispatch).toHaveBeenCalledOnce();
   });
 
   it("retries only the marker after an irrevocable active-turn adoption", async () => {

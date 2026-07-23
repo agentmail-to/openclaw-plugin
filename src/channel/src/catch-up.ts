@@ -249,29 +249,29 @@ export async function createAgentMailCatchUpSession(params: {
       defaultTtlMs: AGENTMAIL_REST_CATCH_UP_CURSOR_TTL_MS,
     });
     store = accountStore;
-    if (!normalizeCursor(await accountStore.lookup(key))) {
-      // Upgrade migration: the released implementation stored every account in one shared
-      // namespace. Copy its cursor before creating a fresh baseline so mail received between
-      // shutdown and upgraded startup remains inside the recovery window.
-      const legacyStore = state.openKeyedStore<AgentMailCatchUpCursor>({
-        namespace: AGENTMAIL_REST_CATCH_UP_NAMESPACE,
-        maxEntries: AGENTMAIL_REST_CATCH_UP_LEGACY_MAX_ACCOUNTS,
-        overflowPolicy: "reject-new",
+    // Upgrade migration: the released implementation stored every account in one shared namespace.
+    // Probe it even when the replacement cursor already exists so a transient delete failure is
+    // retried on the next startup instead of leaving a TTL-less legacy row permanently behind.
+    const legacyStore = state.openKeyedStore<AgentMailCatchUpCursor>({
+      namespace: AGENTMAIL_REST_CATCH_UP_NAMESPACE,
+      maxEntries: AGENTMAIL_REST_CATCH_UP_LEGACY_MAX_ACCOUNTS,
+      overflowPolicy: "reject-new",
+    });
+    const legacyCursor = normalizeCursor(await legacyStore.lookup(key));
+    if (!normalizeCursor(await accountStore.lookup(key)) && legacyCursor) {
+      // Copy before creating a fresh baseline so mail received between shutdown and upgraded
+      // startup remains inside the recovery window.
+      await accountStore.registerIfAbsent(key, legacyCursor, {
+        ttlMs: AGENTMAIL_REST_CATCH_UP_CURSOR_TTL_MS,
       });
-      const legacyCursor = normalizeCursor(await legacyStore.lookup(key));
-      if (legacyCursor) {
-        await accountStore.registerIfAbsent(key, legacyCursor, {
-          ttlMs: AGENTMAIL_REST_CATCH_UP_CURSOR_TTL_MS,
-        });
-        if (normalizeCursor(await accountStore.lookup(key))) {
-          try {
-            await legacyStore.delete(key);
-          } catch (error) {
-            params.log?.warn?.(
-              `AgentMail could not remove a migrated catch-up cursor: ${errorText(error)}`,
-            );
-          }
-        }
+    }
+    if (legacyCursor && normalizeCursor(await accountStore.lookup(key))) {
+      try {
+        await legacyStore.delete(key);
+      } catch (error) {
+        params.log?.warn?.(
+          `AgentMail could not remove a migrated catch-up cursor: ${errorText(error)}`,
+        );
       }
     }
   }
@@ -302,7 +302,9 @@ export async function createAgentMailCatchUpSession(params: {
       // The deep sweep lists from max(baseline, recoveryFloor): it recovers back-dated mail within
       // the durable retention window and since monitoring began, but deliberately does not scan
       // before the baseline, which would re-inject pre-monitoring history.
-      const recoveryFloorMs = now() - AGENTMAIL_DURABLE_PENDING_TTL_MS;
+      const sweepAtMs = now();
+      const recoveryFloorMs = sweepAtMs - AGENTMAIL_DURABLE_PENDING_TTL_MS;
+      const beforeMs = sweepAtMs + AGENTMAIL_REST_CATCH_UP_OVERLAP_MS;
       const baseAfterMs =
         sinceBaseline || !storedCursor.established
           ? storedCursor.baselineAtMs
@@ -319,6 +321,9 @@ export async function createAgentMailCatchUpSession(params: {
             ...(pageCursor ? { pageToken: pageCursor } : {}),
             labels: [AGENTMAIL_RECEIVED_LABEL],
             after: new Date(afterMs),
+            // Exclude implausibly future provider rows from normal pagination. The per-row clamp
+            // below remains defensive in case a provider projection violates this filter.
+            before: new Date(beforeMs),
             ascending: true,
             includeSpam: false,
             includeBlocked: false,
@@ -335,15 +340,26 @@ export async function createAgentMailCatchUpSession(params: {
           if (!isReceivedMessage(message, params.account.inboxId)) {
             continue;
           }
-          const receivedAt =
+          const providerReceivedAt =
             message.timestamp instanceof Date ? message.timestamp.getTime() : Number.NaN;
-          if (!Number.isFinite(receivedAt) || receivedAt < 0) {
-            // A malformed provider row must not poison high-water state with NaN or crash-loop the
-            // whole recovery pass. Skip it; a later corrected projection can be admitted normally.
+          const arrivedAt = now();
+          const latestSafeReceivedAt = arrivedAt + AGENTMAIL_REST_CATCH_UP_OVERLAP_MS;
+          const receivedAt = validTimestamp(providerReceivedAt)
+            ? Math.min(providerReceivedAt, latestSafeReceivedAt)
+            : arrivedAt;
+          if (!validTimestamp(providerReceivedAt)) {
+            // Use local arrival time so a malformed newest row is admitted once and advances the
+            // cursor instead of being re-listed and warned about forever.
             params.log?.warn?.(
-              `AgentMail catch-up ignored message ${message.messageId} with an invalid timestamp`,
+              `AgentMail catch-up used arrival time for message ${message.messageId} with an invalid timestamp`,
             );
-            continue;
+          } else if (providerReceivedAt > latestSafeReceivedAt) {
+            // Provider clock skew must not push the cursor into the far future and disable periodic
+            // overlap recovery. Preserve the row while clamping its ordering timestamp to the
+            // largest value whose overlap still reaches the current wall clock.
+            params.log?.warn?.(
+              `AgentMail catch-up clamped future timestamp for message ${message.messageId}`,
+            );
           }
           try {
             await receive({
@@ -352,7 +368,7 @@ export async function createAgentMailCatchUpSession(params: {
               messageId: message.messageId,
               transport: "rest",
               receivedAt,
-              arrivedAt: now(),
+              arrivedAt,
             });
           } catch (error) {
             if (error instanceof AgentMailIngressCapacityError) {
