@@ -34,7 +34,7 @@ describe("AgentMail account config", () => {
     expect(account).toMatchObject({
       accountId: "default",
       apiKey: apiVal,
-      inboxId: "agent@agentmail.to",
+      inboxId: "Agent@AgentMail.TO",
       webhookSecret: hookVal,
       webhookPath: "/webhooks/agentmail",
       dmPolicy: "allowlist",

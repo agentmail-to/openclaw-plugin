@@ -416,6 +416,68 @@ describe("AgentMail reply-only outbound", () => {
     expect(reply).not.toHaveBeenCalled();
   });
 
+  it("filters empty rendered media before applying the no-content verdict", async () => {
+    reply.mockClear();
+    const now = 10_000;
+    const result = await reconcileAgentMailUnknownSend(
+      {
+        cfg: {
+          channels: {
+            agentmail: { apiKey: "key", inboxId: "inbox_1", allowFrom: ["sender@example.com"] },
+          },
+        },
+        queueId: "queue_1",
+        channel: "agentmail",
+        to: "message:msg_1",
+        accountId: "default",
+        enqueuedAt: now - 1_000,
+        retryCount: 1,
+        effectiveReplyToId: "msg_1",
+        payloads: [{ text: "   " }],
+        renderedBatchPlan: {
+          payloadCount: 1,
+          textCount: 0,
+          mediaCount: 1,
+          voiceCount: 0,
+          presentationCount: 0,
+          interactiveCount: 0,
+          channelDataCount: 0,
+          items: [{ index: 0, kinds: ["media"], text: "   ", mediaUrls: [""] }],
+        },
+      } as never,
+      { client: client(), now: () => now },
+    );
+
+    expect(result).toEqual({ status: "not_sent" });
+    expect(reply).not.toHaveBeenCalled();
+  });
+
+  it("returns a terminal structured verdict for a malformed recovery target", async () => {
+    const now = 10_000;
+    const result = await reconcileAgentMailUnknownSend(
+      {
+        cfg: {},
+        queueId: "queue_1",
+        channel: "agentmail",
+        to: "person@example.com",
+        accountId: "default",
+        enqueuedAt: now - 1_000,
+        retryCount: 1,
+        effectiveReplyToId: "msg_1",
+        payloads: [{ text: "Hello" }],
+      } as never,
+      { client: client(), now: () => now },
+    );
+
+    expect(result).toEqual({
+      status: "unresolved",
+      error:
+        "AgentMail target must be message:<messageId>; new threads and recipients are not supported.",
+      retryable: false,
+    });
+    expect(reply).not.toHaveBeenCalled();
+  });
+
   it("maps a transient hydration failure to a retryable verdict", async () => {
     reply.mockClear();
     const transientClient = () =>

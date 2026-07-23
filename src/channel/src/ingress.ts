@@ -228,6 +228,25 @@ async function dispatchAgentMailIngressUntilSettled(params: DispatchParams): Pro
           }
           attempts += 1;
           const lastError = "deferred turn abandoned before adoption";
+          if (attempts >= AGENTMAIL_MAX_DISPATCH_ATTEMPTS) {
+            params.log?.error?.(
+              `AgentMail dropping message ${params.record.messageId} after ${attempts} abandoned deferred turns`,
+            );
+            try {
+              if (params.journal.fail) {
+                await params.journal.fail(params.id, {
+                  reason: "dispatch-attempts-exhausted",
+                  message: lastError,
+                });
+              } else {
+                await params.journal.complete(params.id);
+              }
+            } catch {
+              // Best effort: TTL pruning still reclaims the row if the terminal marker cannot
+              // persist.
+            }
+            return true;
+          }
           const released = await params.journal.release(params.id, { lastError });
           if (!released) {
             return true;

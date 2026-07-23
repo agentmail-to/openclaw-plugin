@@ -20,10 +20,11 @@ import type { AgentMailIngressRecord, ResolvedAgentMailAccount } from "./types.j
 import { createAgentMailWebhookHandler, createAgentMailWebhookVerifier } from "./webhook.js";
 import { startAgentMailWebSocket } from "./websocket.js";
 
-type ActiveRoute = { path: string; unregister: () => void };
+type RouteClaim = { accountId: string; generation: symbol; valid: boolean };
+type ActiveRoute = { path: string; unregister: () => void; claim: RouteClaim };
 
 const activeRoutes = new Map<string, ActiveRoute>();
-const routeOwners = new Map<string, string>();
+const routeOwners = new Map<string, RouteClaim>();
 
 // Single source of truth for AgentMail sender-authorization warnings, shared by gateway startup
 // diagnostics and the channel security surface so the two never drift.
@@ -153,21 +154,21 @@ export async function startAgentMailGatewayAccount(params: {
     ? params.account.webhookPath
     : `/${params.account.webhookPath}`;
   const owner = routeOwners.get(path);
-  if (owner && owner !== params.account.accountId) {
+  if (owner && owner.accountId !== params.account.accountId) {
     throw new Error(
-      `AgentMail webhook path ${path} is already registered by account ${owner}; configure a distinct webhookPath.`,
+      `AgentMail webhook path ${path} is already registered by account ${owner.accountId}; configure a distinct webhookPath.`,
     );
   }
   const previousRoute = activeRoutes.get(params.account.accountId);
-  if (previousRoute) {
-    previousRoute.unregister();
-    if (routeOwners.get(previousRoute.path) === params.account.accountId) {
-      routeOwners.delete(previousRoute.path);
-    }
-  }
+  const claim: RouteClaim = {
+    accountId: params.account.accountId,
+    generation: Symbol(params.account.accountId),
+    valid: true,
+  };
   // Claim ownership synchronously here, before the first await, so the check-and-claim is atomic:
-  // two concurrent startups for the same path can no longer both observe it as free.
-  routeOwners.set(path, params.account.accountId);
+  // two concurrent startups for the same path can no longer both observe it as free. Keep the
+  // predecessor registered until the replacement is fully initialized and registered.
+  routeOwners.set(path, claim);
   let catchUpSupervisor: ReturnType<typeof createAgentMailCatchUpSupervisor>;
   let unregister: (() => void) | undefined;
   try {
@@ -176,6 +177,12 @@ export async function startAgentMailGatewayAccount(params: {
       client,
       log: params.log,
     });
+    // A newer overlapping startup claimed this path while initialization awaited. Its generation
+    // owns registration; park this stale invocation until its lifecycle is cancelled.
+    if (routeOwners.get(path) !== claim) {
+      claim.valid = false;
+      return await waitUntilAbort(params.abortSignal);
+    }
     catchUpSupervisor = createAgentMailCatchUpSupervisor({
       session: catchUpSession,
       receive,
@@ -203,17 +210,33 @@ export async function startAgentMailGatewayAccount(params: {
         receive: receiveWithRecovery,
         log: params.log,
       }),
+      // Replacing first is safe: OpenClaw removes the predecessor entry atomically, and its stale
+      // unregister handle becomes a no-op. This avoids a route outage if replacement setup fails.
+      replaceExisting: true,
     });
   } catch (error) {
+    claim.valid = false;
     unregister?.();
-    if (routeOwners.get(path) === params.account.accountId) {
-      routeOwners.delete(path);
+    // A stale startup must never release a newer startup's claim. Restore a still-valid predecessor
+    // on same-path rollback; otherwise release only this exact generation.
+    if (routeOwners.get(path) === claim) {
+      if (owner?.valid) {
+        routeOwners.set(path, owner);
+      } else {
+        routeOwners.delete(path);
+      }
     }
     throw error;
   }
-  const activeRoute = { path, unregister };
+  const activeRoute = { path, unregister, claim };
   activeRoutes.set(params.account.accountId, activeRoute);
-  // Ownership was already claimed synchronously above.
+  if (previousRoute && previousRoute !== activeRoute) {
+    previousRoute.claim.valid = false;
+    previousRoute.unregister();
+    if (routeOwners.get(previousRoute.path) === previousRoute.claim) {
+      routeOwners.delete(previousRoute.path);
+    }
+  }
   params.log?.info?.(
     `Registered AgentMail webhook route ${path} for account ${params.account.accountId}`,
   );
@@ -228,9 +251,10 @@ export async function startAgentMailGatewayAccount(params: {
   await waitUntilAbort(params.abortSignal, () => {
     // A replaced account invocation can abort later; it must not delete the newer registration.
     if (activeRoutes.get(params.account.accountId) === activeRoute) {
+      claim.valid = false;
       unregister();
       activeRoutes.delete(params.account.accountId);
-      if (routeOwners.get(path) === params.account.accountId) {
+      if (routeOwners.get(path) === claim) {
         routeOwners.delete(path);
       }
     }

@@ -250,9 +250,11 @@ describe("AgentMail WebSocket ingress", () => {
     await running;
   });
 
-  it("reports SDK errors and schedules authoritative catch-up", async () => {
+  it("reconnects after an SDK error even when no close event follows", async () => {
     handlers.clear();
     catchUpRun.mockClear();
+    connect.mockClear();
+    close.mockClear();
     const error = vi.fn();
     const controller = new AbortController();
     const running = startAgentMailWebSocket({
@@ -260,6 +262,7 @@ describe("AgentMail WebSocket ingress", () => {
       abortSignal: controller.signal,
       receive: vi.fn(async () => undefined),
       catchUpSession: { run: catchUpRun },
+      reconnectDelayMs: () => 0,
       log: { error },
     });
     await vi.waitFor(() => expect(handlers.has("error")).toBe(true));
@@ -267,6 +270,7 @@ describe("AgentMail WebSocket ingress", () => {
     handlers.get("error")?.(new Error("frame parse failed"));
 
     await vi.waitFor(() => expect(catchUpRun).toHaveBeenCalledOnce());
+    await vi.waitFor(() => expect(connect).toHaveBeenCalledTimes(2));
     expect(error).toHaveBeenCalledWith(
       "AgentMail WebSocket error for account default: frame parse failed",
     );

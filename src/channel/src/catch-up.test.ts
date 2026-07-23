@@ -173,7 +173,7 @@ describe("AgentMail durable REST catch-up", () => {
     );
   });
 
-  it("skips malformed timestamps without poisoning the catch-up cursor", async () => {
+  it("admits malformed timestamps using local time without poisoning the cursor", async () => {
     const store = memoryStore<never>();
     const malformed = message({ id: "bad_timestamp", timestamp: 1_100 }) as AgentMail.MessageItem;
     (malformed as { timestamp: unknown }).timestamp = new Date(Number.NaN);
@@ -186,17 +186,13 @@ describe("AgentMail durable REST catch-up", () => {
     });
     const receive = vi.fn(async () => undefined);
 
-    await expect(
-      session.run({ receive, abortSignal: new AbortController().signal }),
-    ).resolves.toBeUndefined();
-    await expect(
-      session.run({ receive, abortSignal: new AbortController().signal }),
-    ).resolves.toBeUndefined();
-    expect(receive).not.toHaveBeenCalled();
-    expect(list).toHaveBeenLastCalledWith(
-      "inbox_1",
-      expect.objectContaining({ after: new Date(0) }),
-      expect.any(Object),
+    await session.run({ receive, abortSignal: new AbortController().signal });
+    expect(receive).toHaveBeenCalledWith(
+      expect.objectContaining({
+        messageId: "bad_timestamp",
+        receivedAt: 1_000,
+        arrivedAt: 1_000,
+      }),
     );
   });
 

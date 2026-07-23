@@ -83,6 +83,9 @@ describe("AgentMail inbound attachments", () => {
         messageId: "message_1",
         attachments: [
           { attachmentId: "inline", size: 1, contentDisposition: "inline" },
+          // Bare Content-ID parts are embedded HTML media and must not consume the attachment
+          // budget. If accepted, this declared size would reject the whole set.
+          { attachmentId: "embedded-cid", size: 1_000, contentId: "logo@cid" },
           {
             attachmentId: "cid",
             size: 1,

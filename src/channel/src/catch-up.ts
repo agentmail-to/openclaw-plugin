@@ -9,6 +9,7 @@ import {
 } from "./durable-receive.js";
 import {
   AGENTMAIL_RECEIVED_LABEL,
+  isReceivedAgentMailMessage,
   resolveReceivedAgentMailMessageTimestampMs,
 } from "./received-message.js";
 import { createBackoff, waitForRetry } from "./retry.js";
@@ -293,13 +294,13 @@ export async function createAgentMailCatchUpSession(params: {
           if (abortSignal.aborted) {
             return;
           }
-          const messageTimestampMs = resolveReceivedAgentMailMessageTimestampMs(
-            message,
-            params.account.inboxId,
-          );
-          if (messageTimestampMs === null) {
+          if (!isReceivedAgentMailMessage(message, params.account.inboxId)) {
             continue;
           }
+          // Invalid provider time must not turn a missed live event into a permanent drop. Admit
+          // with local observation time; durable message-id dedupe keeps overlap scans safe.
+          const messageTimestampMs =
+            resolveReceivedAgentMailMessageTimestampMs(message, params.account.inboxId) ?? now();
           try {
             await receive({
               accountId: params.account.accountId,

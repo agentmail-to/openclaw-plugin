@@ -1,5 +1,7 @@
 import { AgentMailClient } from "agentmail";
+import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import { Type, type Static } from "typebox";
+import { resolveAgentMailAccount } from "../channel/src/accounts.js";
 
 export const agentMailConfigSchema = Type.Object(
   {
@@ -29,12 +31,19 @@ export const agentMailConfigSchema = Type.Object(
 
 export type AgentMailConfig = Static<typeof agentMailConfigSchema>;
 
-export function createAgentMailClient(config: AgentMailConfig): AgentMailClient {
-  const apiKey = process.env.AGENTMAIL_API_KEY?.trim();
+export function createAgentMailClient(
+  config: AgentMailConfig,
+  hostConfig?: OpenClawConfig,
+): AgentMailClient {
+  // The channel and tools share one plugin. Prefer the resolved channel credential so a secret
+  // entered through channel configuration works for both, while preserving tools-only env setup.
+  const apiKey =
+    (hostConfig ? resolveAgentMailAccount(hostConfig).apiKey : "") ||
+    process.env.AGENTMAIL_API_KEY?.trim();
 
   if (!apiKey) {
     throw new Error(
-      "AgentMail is not configured. Set the AGENTMAIL_API_KEY environment variable and restart OpenClaw.",
+      "AgentMail is not configured. Configure channels.agentmail.apiKey or set AGENTMAIL_API_KEY and restart OpenClaw.",
     );
   }
 

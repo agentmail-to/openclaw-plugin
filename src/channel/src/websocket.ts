@@ -1,4 +1,5 @@
 import type { AgentMail, AgentMailClient } from "agentmail";
+import { waitUntilAbort } from "openclaw/plugin-sdk/channel-outbound";
 import {
   createAgentMailCatchUpSession,
   createAgentMailCatchUpSupervisor,
@@ -204,13 +205,7 @@ export async function startAgentMailWebSocket(params: {
   //
   // One shared abort promise for the whole loop: abort is terminal, so attaching a fresh listener
   // per reconnect would leak closures on the long-lived signal (listener-limit warnings under churn).
-  const aborted = new Promise<void>((resolve) => {
-    if (params.abortSignal.aborted) {
-      resolve();
-      return;
-    }
-    params.abortSignal.addEventListener("abort", () => resolve(), { once: true });
-  });
+  const aborted = waitUntilAbort(params.abortSignal);
   const connectionLoop = (async () => {
     let reconnectAttempt = 0;
     while (!params.abortSignal.aborted) {
@@ -254,14 +249,20 @@ export async function startAgentMailWebSocket(params: {
         catchUpSupervisor.request();
       };
       const closed = new Promise<void>((resolve) => {
+        let settled = false;
+        const settleClosed = () => {
+          if (settled) {
+            return;
+          }
+          settled = true;
+          subscribedForCurrentConnection = false;
+          resolve();
+        };
         socket.on("open", () => {
           reconnectAttempt = 0;
           subscribe();
         });
-        socket.on("close", () => {
-          subscribedForCurrentConnection = false;
-          resolve();
-        });
+        socket.on("close", settleClosed);
         socket.on("error", (error) => {
           params.log?.error?.(
             `AgentMail WebSocket error for account ${params.account.accountId}: ${errorText(error)}`,
@@ -269,6 +270,9 @@ export async function startAgentMailWebSocket(params: {
           // Parsing/transport errors may not close the socket. Recover authoritative events even
           // when the socket stays connected and emits no close.
           catchUpSupervisor.request();
+          // Fatal socket errors do not always emit a later close. Treat either event as terminal
+          // for this connection so the outer loop recreates it.
+          settleClosed();
         });
         socket.on("message", handleMessage);
       });

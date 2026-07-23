@@ -18,9 +18,11 @@ export type AgentMailInboundMedia = {
 export class AgentMailMediaPolicyError extends Error {}
 
 function isAcceptedAttachment(attachment: AgentMail.Attachment): boolean {
-  // Content-ID is not sufficient evidence that a part is inline: ordinary attachment-disposition
-  // parts may also carry one. Honor the explicit disposition and retain all other files.
-  return attachment.contentDisposition?.toLocaleLowerCase("en-US") !== "inline";
+  const disposition = attachment.contentDisposition?.toLocaleLowerCase("en-US");
+  // An explicit attachment disposition wins even when the part also has a Content-ID. A bare
+  // Content-ID is how embedded HTML images are commonly represented, so exclude those from the
+  // user's attachment set and aggregate budget.
+  return disposition === "attachment" || (disposition !== "inline" && !attachment.contentId);
 }
 
 function addAttachmentBytesToBudget(params: {

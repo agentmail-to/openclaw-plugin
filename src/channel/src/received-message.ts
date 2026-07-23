@@ -20,19 +20,24 @@ export function resolveAgentMailTimestampMs(value: unknown): number | null {
   return Number.isFinite(timestampMs) && timestampMs >= 0 ? timestampMs : null;
 }
 
+export function isReceivedAgentMailMessage(
+  message: AgentMail.MessageItem | AgentMail.Message,
+  inboxId: string,
+): boolean {
+  if (!agentMailInboxIdsEqual(message.inboxId, inboxId)) {
+    return false;
+  }
+  const labels = Array.isArray(message.labels) ? message.labels : [];
+  return labels.some(
+    (label) => String(label).toLocaleLowerCase("en-US") === AGENTMAIL_RECEIVED_LABEL,
+  );
+}
+
 export function resolveReceivedAgentMailMessageTimestampMs(
   message: AgentMail.MessageItem | AgentMail.Message,
   inboxId: string,
 ): number | null {
-  if (!agentMailInboxIdsEqual(message.inboxId, inboxId)) {
-    return null;
-  }
-  const labels = Array.isArray(message.labels) ? message.labels : [];
-  if (
-    !labels.some(
-      (label) => String(label).toLocaleLowerCase("en-US") === AGENTMAIL_RECEIVED_LABEL,
-    )
-  ) {
+  if (!isReceivedAgentMailMessage(message, inboxId)) {
     return null;
   }
   return resolveAgentMailTimestampMs(message.timestamp);

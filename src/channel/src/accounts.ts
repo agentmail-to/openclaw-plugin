@@ -148,7 +148,10 @@ export function resolveAgentMailAccount(
     accountId: id,
     enabled: channel.enabled !== false && account?.enabled !== false,
     apiKey: apiVal,
-    inboxId: normalizeAgentMailInboxId(merged.inboxId ?? ""),
+    // Preserve configured spelling as the durable identity. Queue namespaces, catch-up cursor keys,
+    // and conversation ids include this value, so lowercasing it during resolution would strand
+    // persisted state after an upgrade. Normalize provider values only where ids are compared.
+    inboxId: (merged.inboxId ?? "").trim(),
     webhookSecret: hookVal,
     webhookPath:
       configuredPath ||

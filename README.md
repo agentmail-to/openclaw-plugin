@@ -26,7 +26,9 @@ For development, use `openclaw plugins install --link .` so OpenClaw loads this 
 
 ## Configure
 
-Set `AGENTMAIL_API_KEY` in the environment that runs the OpenClaw Gateway. To enable **webhook** ingress for the channel, also set `AGENTMAIL_WEBHOOK_SECRET` (Svix-signed); without it the channel falls back to WebSocket ingress.
+Provide the API key through `AGENTMAIL_API_KEY` in the Gateway environment or as
+`channels.agentmail.apiKey`. To enable **webhook** ingress, also configure
+`AGENTMAIL_WEBHOOK_SECRET` (Svix-signed); without it the channel falls back to WebSocket ingress.
 
 OpenClaw can scope the secrets to this plugin in `~/.openclaw/openclaw.json`:
 
@@ -55,10 +57,9 @@ openclaw plugins inspect agentmail --runtime
 
 ### Tool config (optional SDK settings)
 
-> **Credentials:** the email **tools** authenticate only with the `AGENTMAIL_API_KEY` environment
-> variable, while the **channel** can also take an inline or resolved `apiKey` in `channels.agentmail`.
-> Always set `AGENTMAIL_API_KEY` in the Gateway environment so both surfaces are configured; a
-> channel-only inline key leaves the tools reporting AgentMail as unconfigured.
+> **Credentials:** the email **tools** use the resolved `apiKey` from the default
+> `channels.agentmail` account when configured, with `AGENTMAIL_API_KEY` as the tools-only fallback.
+> This keeps inline and secret-reference channel configuration shared across both surfaces.
 
 Optional AgentMail SDK settings for the **tools** belong under `plugins.entries.agentmail.config`:
 

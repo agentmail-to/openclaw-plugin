@@ -379,6 +379,42 @@ describe("AgentMail durable ingress", () => {
     expect(complete).toHaveBeenCalledOnce();
   });
 
+  it("fails repeatedly abandoned deferred turns at the dispatch ceiling", async () => {
+    const release = vi.fn(async () => true);
+    const fail = vi.fn(async () => true);
+    const dispatch = vi.fn(
+      async (
+        _record: AgentMailIngressRecord,
+        lifecycle: {
+          onTurnDeferred: () => void;
+          onTurnAbandoned: () => Promise<void>;
+        },
+      ) => {
+        lifecycle.onTurnDeferred();
+        await lifecycle.onTurnAbandoned();
+      },
+    );
+    await processAgentMailIngress({
+      journal: {
+        accept: async () => ({ kind: "accepted", duplicate: false, record: {} }),
+        complete: vi.fn(),
+        release,
+        fail,
+      } as never,
+      record,
+      dispatch,
+      retryDelayMs: () => 0,
+    });
+
+    await vi.waitFor(() => expect(fail).toHaveBeenCalledOnce());
+    expect(dispatch).toHaveBeenCalledTimes(50);
+    expect(release).toHaveBeenCalledTimes(49);
+    expect(fail).toHaveBeenCalledWith(createAgentMailDurableInboundId(record), {
+      reason: "dispatch-attempts-exhausted",
+      message: "deferred turn abandoned before adoption",
+    });
+  });
+
   it("fails a completion marker after its retry ceiling without redispatching", async () => {
     const dispatch = vi.fn(async () => undefined);
     const complete = vi.fn(async () => {

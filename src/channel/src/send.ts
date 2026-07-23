@@ -255,7 +255,16 @@ export async function reconcileAgentMailUnknownSend(
     return { status: "not_sent" };
   }
   const rendered = ctx.renderedBatchPlan?.items[0];
-  const triggeringMessageId = parseAgentMailMessageTarget(ctx.to);
+  const normalizedTarget = normalizeAgentMailTarget(ctx.to);
+  if (!normalizedTarget) {
+    return {
+      status: "unresolved",
+      error:
+        "AgentMail target must be message:<messageId>; new threads and recipients are not supported.",
+      retryable: false,
+    };
+  }
+  const triggeringMessageId = normalizedTarget.slice(TARGET_PREFIX.length);
   if (ctx.effectiveReplyToId !== triggeringMessageId) {
     return {
       status: "unresolved",
@@ -274,11 +283,12 @@ export async function reconcileAgentMailUnknownSend(
   }
   // A rendered plan is authoritative even when its media list is empty: capability filtering may
   // intentionally have removed media that still appears on the original queued payload.
-  const mediaUrls = rendered
+  const mediaUrls = (rendered
     ? [...rendered.mediaUrls]
-    : [payload.mediaUrl, ...(payload.mediaUrls ?? [])].filter((value): value is string =>
-        Boolean(value),
-      );
+    : [payload.mediaUrl, ...(payload.mediaUrls ?? [])]
+  ).filter(
+    (value): value is string => typeof value === "string" && value.trim().length > 0,
+  );
   const text = rendered?.text ?? payload.text ?? "";
   const recoveredPayload = { ...payload, text };
   delete recoveredPayload.mediaUrl;
