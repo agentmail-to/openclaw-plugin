@@ -183,6 +183,19 @@ function normalizeCursor(value: unknown): AgentMailCatchUpCursor | null {
   };
 }
 
+function mergeCursor(
+  currentValue: unknown,
+  next: Pick<AgentMailCatchUpCursor, "baselineAtMs" | "highWaterAtMs" | "established">,
+): AgentMailCatchUpCursor {
+  const current = normalizeCursor(currentValue);
+  return {
+    version: CURSOR_VERSION,
+    baselineAtMs: current?.baselineAtMs ?? next.baselineAtMs,
+    highWaterAtMs: Math.max(current?.highWaterAtMs ?? 0, next.highWaterAtMs),
+    established: current?.established === true || next.established,
+  };
+}
+
 function isReceivedMessage(message: AgentMail.MessageItem, inboxId: string): boolean {
   return (
     message.inboxId === inboxId &&
@@ -203,28 +216,14 @@ async function persistCursor(params: {
   if (update) {
     await update(
       params.key,
-      (currentValue) => {
-        const current = normalizeCursor(currentValue);
-        return {
-          version: CURSOR_VERSION,
-          baselineAtMs: current?.baselineAtMs ?? params.baselineAtMs,
-          highWaterAtMs: Math.max(current?.highWaterAtMs ?? 0, params.highWaterAtMs),
-          established: current?.established === true || params.established,
-        };
-      },
+      (currentValue) => mergeCursor(currentValue, params),
       { ttlMs: AGENTMAIL_REST_CATCH_UP_CURSOR_TTL_MS },
     );
     return;
   }
-  const current = normalizeCursor(await params.store.lookup(params.key));
   await params.store.register(
     params.key,
-    {
-      version: CURSOR_VERSION,
-      baselineAtMs: current?.baselineAtMs ?? params.baselineAtMs,
-      highWaterAtMs: Math.max(current?.highWaterAtMs ?? 0, params.highWaterAtMs),
-      established: current?.established === true || params.established,
-    },
+    mergeCursor(await params.store.lookup(params.key), params),
     { ttlMs: AGENTMAIL_REST_CATCH_UP_CURSOR_TTL_MS },
   );
 }
@@ -251,43 +250,28 @@ export async function createAgentMailCatchUpSession(params: {
     });
     store = accountStore;
     if (!normalizeCursor(await accountStore.lookup(key))) {
-      const migrateFrom = async (
-        source: PluginStateKeyedStore<AgentMailCatchUpCursor>,
-      ): Promise<boolean> => {
-        const previousCursor = normalizeCursor(await source.lookup(key));
-        if (!previousCursor) {
-          return false;
-        }
-        await accountStore.registerIfAbsent(key, previousCursor, {
+      // Upgrade migration: the released implementation stored every account in one shared
+      // namespace. Copy its cursor before creating a fresh baseline so mail received between
+      // shutdown and upgraded startup remains inside the recovery window.
+      const legacyStore = state.openKeyedStore<AgentMailCatchUpCursor>({
+        namespace: AGENTMAIL_REST_CATCH_UP_NAMESPACE,
+        maxEntries: AGENTMAIL_REST_CATCH_UP_LEGACY_MAX_ACCOUNTS,
+        overflowPolicy: "reject-new",
+      });
+      const legacyCursor = normalizeCursor(await legacyStore.lookup(key));
+      if (legacyCursor) {
+        await accountStore.registerIfAbsent(key, legacyCursor, {
           ttlMs: AGENTMAIL_REST_CATCH_UP_CURSOR_TTL_MS,
         });
         if (normalizeCursor(await accountStore.lookup(key))) {
           try {
-            await source.delete(key);
+            await legacyStore.delete(key);
           } catch (error) {
             params.log?.warn?.(
               `AgentMail could not remove a migrated catch-up cursor: ${errorText(error)}`,
             );
           }
-          return true;
         }
-        return false;
-      };
-      // Upgrade migration: first check the short-lived per-inbox namespace used by early builds of
-      // this PR, then the original shared namespace. Copy before creating a fresh baseline so mail
-      // received between shutdown and upgraded startup remains inside the recovery window.
-      const previousAccountStore = state.openKeyedStore<AgentMailCatchUpCursor>({
-        namespace: `${AGENTMAIL_REST_CATCH_UP_NAMESPACE}.${key}`,
-        maxEntries: AGENTMAIL_REST_CATCH_UP_MAX_ENTRIES_PER_ACCOUNT,
-        overflowPolicy: "reject-new",
-      });
-      if (!(await migrateFrom(previousAccountStore))) {
-        const legacyStore = state.openKeyedStore<AgentMailCatchUpCursor>({
-          namespace: AGENTMAIL_REST_CATCH_UP_NAMESPACE,
-          maxEntries: AGENTMAIL_REST_CATCH_UP_LEGACY_MAX_ACCOUNTS,
-          overflowPolicy: "reject-new",
-        });
-        await migrateFrom(legacyStore);
       }
     }
   }

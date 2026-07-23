@@ -1,6 +1,7 @@
 {
   "version": "0.7.14",
   "repository": "agentmail-to/agentmail-cli",
+  "vendorDirectory": "vendor/agentmail",
   "assets": {
     "darwin-arm64": {
       "archive": "agentmail_0.7.14_macos_arm64.zip",

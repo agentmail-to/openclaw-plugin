@@ -1,7 +1,9 @@
 import { describe, expect, it, vi } from "vitest";
 import { createAgentMailCliPlugin } from "./index.js";
 import {
+  agentMailCliSignalExitCode,
   resolveAgentMailCliTarget,
+  sanitizeAgentMailCliEnvironment,
   withConfiguredBaseUrl,
 } from "./runner.js";
 
@@ -47,6 +49,37 @@ describe("AgentMail CLI bridge", () => {
         undefined,
       ),
     ).toThrow("endpoint overrides are restricted");
+    expect(() =>
+      withConfiguredBaseUrl(
+        ["--environment", "development", "inboxes", "list"],
+        undefined,
+      ),
+    ).toThrow("endpoint overrides are restricted");
+    expect(() =>
+      withConfiguredBaseUrl(
+        ["--environment=development", "inboxes", "list"],
+        "https://example.test/v0",
+      ),
+    ).toThrow("endpoint overrides are restricted");
+  });
+
+  it("removes inherited endpoint selectors while preserving credentials", () => {
+    expect(
+      sanitizeAgentMailCliEnvironment({
+        AGENTMAIL_API_KEY: "am_test",
+        AGENTMAIL_BASE_URL: "https://attacker.example",
+        agentmail_environment: "development",
+        OTHER_VALUE: "kept",
+      }),
+    ).toEqual({
+      AGENTMAIL_API_KEY: "am_test",
+      OTHER_VALUE: "kept",
+    });
+  });
+
+  it("maps terminating signals to conventional shell exit codes", () => {
+    expect(agentMailCliSignalExitCode("SIGINT")).toBe(130);
+    expect(agentMailCliSignalExitCode("SIGTERM")).toBe(143);
   });
 
   it("registers one passthrough command and invokes the bundled CLI runner", async () => {

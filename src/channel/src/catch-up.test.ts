@@ -115,7 +115,7 @@ describe("AgentMail durable REST catch-up", () => {
       now: () => 1_000,
     });
 
-    expect(openKeyedStore).toHaveBeenCalledTimes(6);
+    expect(openKeyedStore).toHaveBeenCalledTimes(4);
     const options = openKeyedStore.mock.calls.map(([value]) => value);
     const accountOptions = options.filter(
       ({ overflowPolicy }) => overflowPolicy === "evict-oldest",
@@ -201,51 +201,6 @@ describe("AgentMail durable REST catch-up", () => {
       maxEntries: AGENTMAIL_REST_CATCH_UP_LEGACY_MAX_ACCOUNTS,
       overflowPolicy: "reject-new",
     });
-  });
-
-  it("migrates the earlier per-inbox cursor namespace", async () => {
-    openKeyedStore.mockReset();
-    const key = sha256Hex("default\ninbox_1");
-    const previousStore = memoryStore<AgentMailCatchUpCursor>();
-    const accountStore = memoryStore<AgentMailCatchUpCursor>();
-    await previousStore.register(key, {
-      version: 1,
-      baselineAtMs: 600,
-      highWaterAtMs: 1_200,
-      established: true,
-    });
-    previousStore.delete = vi.fn(async () => true);
-    openKeyedStore.mockImplementation(({ namespace }) => {
-      if (namespace === `${AGENTMAIL_REST_CATCH_UP_NAMESPACE}.${key}`) {
-        return previousStore;
-      }
-      return accountStore;
-    });
-    const list = vi.fn(async () => ({ count: 0, messages: [] }));
-
-    const session = await createAgentMailCatchUpSession({
-      account,
-      client: { inboxes: { messages: { list } } } as never,
-      now: () => 10_000,
-    });
-    await session.run({
-      receive: vi.fn(),
-      abortSignal: new AbortController().signal,
-    });
-
-    expect(list).toHaveBeenCalledWith(
-      "inbox_1",
-      expect.objectContaining({
-        after: new Date(Math.max(0, 1_200 - AGENTMAIL_REST_CATCH_UP_OVERLAP_MS)),
-      }),
-      expect.any(Object),
-    );
-    expect(previousStore.delete).toHaveBeenCalledWith(key);
-    expect(
-      openKeyedStore.mock.calls.some(
-        ([options]) => options.namespace === AGENTMAIL_REST_CATCH_UP_NAMESPACE,
-      ),
-    ).toBe(false);
   });
 
   it("coalesces recovery requests into one bounded retry supervisor", async () => {

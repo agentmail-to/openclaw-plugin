@@ -20,8 +20,9 @@ openclaw agentmail -- <agentmail arguments>
 ```
 
 Always put `--` after `agentmail`; it prevents OpenClaw from interpreting AgentMail flags.
-Never pass `--api-key`, `--base-url`, or print the API key. Authentication is inherited from
-`AGENTMAIL_API_KEY`, and only operator-controlled plugin configuration may select the API endpoint.
+Never pass `--api-key`, `--base-url`, `--environment`, or print the API key. Authentication is
+inherited from `AGENTMAIL_API_KEY`, and only operator-controlled plugin configuration may select
+the API endpoint.
 
 Run this command on the OpenClaw host, not inside an agent sandbox. The bundled executable and
 skill-scoped credentials are available only to host execution.
@@ -52,11 +53,11 @@ information needed for the task.
 # Inboxes
 openclaw agentmail -- --format json inboxes list
 openclaw agentmail -- --format json inboxes create --display-name "My Agent"
-openclaw agentmail -- --format json inboxes retrieve --inbox-id <inbox-id>
+openclaw agentmail -- --format json inboxes get --inbox-id <inbox-id>
 
 # Messages
 openclaw agentmail -- --format json inboxes:messages list --inbox-id <inbox-id>
-openclaw agentmail -- --format json inboxes:messages retrieve \
+openclaw agentmail -- --format json inboxes:messages get \
   --inbox-id <inbox-id> --message-id <message-id>
 openclaw agentmail -- --format json inboxes:messages send \
   --inbox-id <inbox-id> \

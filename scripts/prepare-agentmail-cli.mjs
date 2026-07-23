@@ -1,5 +1,6 @@
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
+import { unzipSync } from "fflate";
 import {
   chmodSync,
   copyFileSync,
@@ -19,7 +20,7 @@ const root = fileURLToPath(new URL("..", import.meta.url));
 const release = JSON.parse(
   readFileSync(new URL("../src/cli/agentmail-cli-release.json", import.meta.url), "utf8"),
 );
-const vendorRoot = join(root, "vendor", "agentmail");
+const vendorRoot = join(root, ...release.vendorDirectory.split("/"));
 const versionPath = join(vendorRoot, "VERSION");
 const allTargets = Object.keys(release.assets).sort();
 
@@ -43,30 +44,20 @@ async function download(url, destination) {
   writeFileSync(destination, Buffer.from(await response.arrayBuffer()));
 }
 
-function extract(archive, destination) {
+function extract(archive, destination, executableName) {
   mkdirSync(destination, { recursive: true });
-  const powershellEnv = {
-    ...process.env,
-    AGENTMAIL_CLI_ARCHIVE_PATH: archive,
-    AGENTMAIL_CLI_DESTINATION_PATH: destination,
-  };
-  const result = archive.endsWith(".tar.gz")
-    ? spawnSync("tar", ["-xzf", archive, "-C", destination], { stdio: "inherit" })
-    : process.platform === "win32"
-      ? spawnSync(
-          "powershell",
-          [
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            "Expand-Archive -LiteralPath $env:AGENTMAIL_CLI_ARCHIVE_PATH -DestinationPath $env:AGENTMAIL_CLI_DESTINATION_PATH -Force",
-          ],
-          { env: powershellEnv, stdio: "inherit" },
-        )
-      : spawnSync("unzip", ["-q", "-o", archive, "-d", destination], {
-          stdio: "inherit",
-        });
-
+  if (!archive.endsWith(".tar.gz")) {
+    const entries = unzipSync(new Uint8Array(readFileSync(archive)));
+    const executable = entries[executableName];
+    if (!executable) {
+      throw new Error(`${basename(archive)} did not contain ${executableName} at its root.`);
+    }
+    writeFileSync(join(destination, executableName), executable);
+    return;
+  }
+  const result = spawnSync("tar", ["-xzf", archive, "-C", destination], {
+    stdio: "inherit",
+  });
   if (result.error) {
     throw result.error;
   }
@@ -99,7 +90,7 @@ async function prepareTarget(target, temporaryRoot) {
   }
 
   const extractRoot = join(temporaryRoot, target);
-  extract(archivePath, extractRoot);
+  extract(archivePath, extractRoot, executableName);
   const extractedExecutable = join(extractRoot, executableName);
   if (!existsSync(extractedExecutable)) {
     throw new Error(`${metadata.archive} did not contain ${executableName} at its root.`);

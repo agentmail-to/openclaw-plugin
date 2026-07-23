@@ -10,6 +10,9 @@ import { fileURLToPath } from "node:url";
 
 const root = fileURLToPath(new URL("..", import.meta.url));
 const openclaw = fileURLToPath(new URL("../node_modules/.bin/openclaw", import.meta.url));
+const cliRelease = JSON.parse(
+  readFileSync(new URL("../src/cli/agentmail-cli-release.json", import.meta.url), "utf8"),
+);
 
 // Run against an isolated, disposable state dir so validation (invoked from prepack during
 // `npm pack`/`npm publish`) never touches the maintainer's real OpenClaw installation or its
@@ -76,7 +79,7 @@ if (/agentmail_list_inboxes/.test(inspect)) {
 }
 
 const expectedCliVersion = readFileSync(
-  new URL("../vendor/agentmail/VERSION", import.meta.url),
+  join(root, ...cliRelease.vendorDirectory.split("/"), "VERSION"),
   "utf8",
 ).trim();
 let cliVersion = "";

@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
 import { accessSync, constants } from "node:fs";
+import { constants as osConstants } from "node:os";
 import { fileURLToPath } from "node:url";
 import release from "./agentmail-cli-release.json" with { type: "json" };
 
@@ -33,7 +34,10 @@ export function resolveAgentMailCliExecutable(
 ): string {
   const target = resolveAgentMailCliTarget(platform, arch);
   return fileURLToPath(
-    new URL(`../../vendor/agentmail/${target.directory}/${target.executableName}`, import.meta.url),
+    new URL(
+      `../../${release.vendorDirectory}/${target.directory}/${target.executableName}`,
+      import.meta.url,
+    ),
   );
 }
 
@@ -41,12 +45,40 @@ export function withConfiguredBaseUrl(
   args: readonly string[],
   baseUrl: string | undefined,
 ): string[] {
-  if (args.some((arg) => arg === "--base-url" || arg.startsWith("--base-url="))) {
+  if (
+    args.some(
+      (arg) =>
+        arg === "--base-url" ||
+        arg.startsWith("--base-url=") ||
+        arg === "--environment" ||
+        arg.startsWith("--environment="),
+    )
+  ) {
     throw new Error(
       "AgentMail API endpoint overrides are restricted to the operator-controlled plugin config.",
     );
   }
   return baseUrl ? ["--base-url", baseUrl, ...args] : [...args];
+}
+
+export function sanitizeAgentMailCliEnvironment(
+  source: NodeJS.ProcessEnv,
+): NodeJS.ProcessEnv {
+  const sanitized = { ...source };
+  for (const key of Object.keys(sanitized)) {
+    if (
+      key.toLocaleUpperCase("en-US") === "AGENTMAIL_BASE_URL" ||
+      key.toLocaleUpperCase("en-US") === "AGENTMAIL_ENVIRONMENT"
+    ) {
+      delete sanitized[key];
+    }
+  }
+  return sanitized;
+}
+
+export function agentMailCliSignalExitCode(signal: NodeJS.Signals): number {
+  const signalNumber = osConstants.signals[signal];
+  return typeof signalNumber === "number" ? 128 + signalNumber : 1;
 }
 
 export async function runAgentMailCli(
@@ -69,7 +101,7 @@ export async function runAgentMailCli(
 
   return await new Promise<number>((resolve, reject) => {
     const child = spawn(executable, [...args], {
-      env: options.env ?? process.env,
+      env: sanitizeAgentMailCliEnvironment(options.env ?? process.env),
       stdio: "inherit",
       windowsHide: false,
     });
@@ -83,7 +115,7 @@ export async function runAgentMailCli(
     });
     child.once("exit", (code, signal) => {
       if (signal) {
-        reject(new Error(`The bundled AgentMail CLI exited after receiving ${signal}.`));
+        resolve(agentMailCliSignalExitCode(signal));
         return;
       }
       resolve(code ?? 1);
