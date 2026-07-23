@@ -112,6 +112,40 @@ describe("AgentMail WebSocket ingress", () => {
     expect(waitForOpen).not.toHaveBeenCalled();
   });
 
+  it("durably admits message.received frames before the received label projects", async () => {
+    handlers.clear();
+    const receive = vi.fn(async () => undefined);
+    const controller = new AbortController();
+    const running = startAgentMailWebSocket({
+      account,
+      abortSignal: controller.signal,
+      receive,
+      catchUpSession: { run: catchUpRun },
+    });
+    await vi.waitFor(() => expect(handlers.has("message")).toBe(true));
+    handlers.get("message")?.({
+      type: "event",
+      eventType: "message.received",
+      message: {
+        inboxId: "inbox_1",
+        messageId: "message_label_pending",
+        labels: [],
+        timestamp: new Date(1_234),
+      },
+    });
+
+    await vi.waitFor(() => expect(receive).toHaveBeenCalledOnce());
+    expect(receive).toHaveBeenCalledWith(
+      expect.objectContaining({
+        messageId: "message_label_pending",
+        transport: "websocket",
+        receivedAt: 1_234,
+      }),
+    );
+    controller.abort();
+    await running;
+  });
+
   it("retries until a WebSocket event is durably admitted", async () => {
     handlers.clear();
     const receive = vi

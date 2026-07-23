@@ -254,6 +254,7 @@ export async function createAgentMailCatchUpSession(params: {
         throw new Error("AgentMail WebSocket catch-up cursor is unavailable");
       }
       const runAtMs = now();
+      const scanUpperBoundAtMs = runAtMs;
       const effectiveHighWaterAtMs = Math.min(storedCursor.highWaterAtMs, runAtMs);
       // Never scan below the dedupe horizon on ANY sweep. Completed-message tombstones expire after
       // AGENTMAIL_DURABLE_COMPLETED_TTL_MS; once they do, a message still in scan range would be
@@ -284,7 +285,7 @@ export async function createAgentMailCatchUpSession(params: {
             // Do not repeatedly scan provider-clock-skewed future messages. Add one millisecond so
             // an exclusive provider bound includes messages stamped exactly at runAtMs and so a
             // fresh cursor never sends identical after/before values.
-            before: new Date(runAtMs + 1),
+            before: new Date(scanUpperBoundAtMs + 1),
             ascending: true,
             includeSpam: false,
             includeBlocked: false,
@@ -304,7 +305,8 @@ export async function createAgentMailCatchUpSession(params: {
           // Invalid provider time must not turn a missed live event into a permanent drop. Admit
           // with local observation time; durable message-id dedupe keeps overlap scans safe.
           const messageTimestampMs =
-            resolveReceivedAgentMailMessageTimestampMs(message, params.account.inboxId) ?? now();
+            resolveReceivedAgentMailMessageTimestampMs(message, params.account.inboxId) ??
+            scanUpperBoundAtMs;
           try {
             await receive({
               accountId: params.account.accountId,
@@ -327,7 +329,10 @@ export async function createAgentMailCatchUpSession(params: {
             throw error;
           }
           admitted += 1;
-          highWaterAtMs = Math.max(highWaterAtMs, Math.min(messageTimestampMs, now()));
+          highWaterAtMs = Math.max(
+            highWaterAtMs,
+            Math.min(messageTimestampMs, scanUpperBoundAtMs),
+          );
           pageAdvanced = true;
         }
         if (pageAdvanced) {
@@ -338,7 +343,7 @@ export async function createAgentMailCatchUpSession(params: {
             key,
             baselineAtMs: storedCursor.baselineAtMs,
             highWaterAtMs,
-            upperBoundAtMs: now(),
+            upperBoundAtMs: scanUpperBoundAtMs,
             established: false,
           });
         }
@@ -353,7 +358,7 @@ export async function createAgentMailCatchUpSession(params: {
         key,
         baselineAtMs: storedCursor.baselineAtMs,
         highWaterAtMs,
-        upperBoundAtMs: now(),
+        upperBoundAtMs: scanUpperBoundAtMs,
         established: true,
       });
       if (admitted > 0) {

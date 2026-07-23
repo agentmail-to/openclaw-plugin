@@ -61,17 +61,26 @@ describe("AgentMail durable ingress", () => {
     expect(deletePending).toHaveBeenCalledWith(id);
   });
 
-  it("preserves capacity backpressure when overflow deletion fails", async () => {
+  it("keeps an overflow row retryable when rollback deletion fails", async () => {
     const id = createAgentMailDurableInboundId(record);
     const fail = vi.fn(async () => true);
+    const accept = vi
+      .fn()
+      .mockResolvedValueOnce({ kind: "accepted", duplicate: false, record: { id } })
+      .mockResolvedValueOnce({
+        kind: "pending",
+        duplicate: true,
+        record: { id, payload: record, attempts: 0 },
+      });
+    const complete = vi.fn(async () => undefined);
     const journal = withAgentMailIngressCapacity(
       {
-        accept: vi.fn(async () => ({ kind: "accepted", duplicate: false, record: {} })),
+        accept,
         pending: vi.fn(async () => [
           { id: "other", payload: record, attempts: 0 },
           { id, payload: record, attempts: 0 },
         ]),
-        complete: vi.fn(),
+        complete,
         release: vi.fn(),
         deletePending: vi.fn(async () => {
           throw new Error("queue delete unavailable");
@@ -84,10 +93,14 @@ describe("AgentMail durable ingress", () => {
     await expect(
       processAgentMailIngress({ journal: journal as never, record, dispatch: vi.fn() }),
     ).rejects.toBeInstanceOf(AgentMailIngressCapacityError);
-    expect(fail).toHaveBeenCalledWith(id, {
-      reason: "capacity-overflow",
-      message: "AgentMail rejected this ingress row because capacity was full",
-    });
+
+    const dispatch = vi.fn(async () => undefined);
+    await expect(
+      processAgentMailIngress({ journal: journal as never, record, dispatch }),
+    ).resolves.toBe("accepted");
+    await vi.waitFor(() => expect(complete).toHaveBeenCalledWith(id));
+    expect(dispatch).toHaveBeenCalledOnce();
+    expect(fail).not.toHaveBeenCalled();
   });
 
   it("accepts a completed duplicate at capacity without applying backpressure", async () => {

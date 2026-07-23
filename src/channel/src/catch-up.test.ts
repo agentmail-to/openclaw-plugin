@@ -196,6 +196,39 @@ describe("AgentMail durable REST catch-up", () => {
     );
   });
 
+  it("does not advance the cursor beyond the sweep's fixed upper bound", async () => {
+    const store = memoryStore<never>();
+    const malformed = message({ id: "bad_timestamp", timestamp: 1_100 }) as AgentMail.MessageItem;
+    (malformed as { timestamp: unknown }).timestamp = new Date(Number.NaN);
+    const list = vi
+      .fn()
+      .mockResolvedValueOnce({ count: 1, messages: [malformed] })
+      .mockResolvedValueOnce({ count: 0, messages: [] });
+    let nowMs = 1_000_000;
+    const session = await createAgentMailCatchUpSession({
+      account,
+      client: { inboxes: { messages: { list } } } as never,
+      store: store as never,
+      now: () => nowMs,
+    });
+    nowMs = 2_000_000;
+    await session.run({
+      receive: async () => {
+        nowMs = 3_000_000;
+      },
+      abortSignal: new AbortController().signal,
+    });
+
+    await session.run({ receive: vi.fn(), abortSignal: new AbortController().signal });
+    expect(list).toHaveBeenLastCalledWith(
+      "inbox_1",
+      expect.objectContaining({
+        after: new Date(2_000_000 - AGENTMAIL_REST_CATCH_UP_OVERLAP_MS),
+      }),
+      expect.any(Object),
+    );
+  });
+
   it("clamps a future message timestamp before advancing the high-water cursor", async () => {
     const store = memoryStore<never>();
     const nowMs = 1_000_000;

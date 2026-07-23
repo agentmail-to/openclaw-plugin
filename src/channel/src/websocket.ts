@@ -12,7 +12,7 @@ import { AgentMailIngressCapacityError } from "./ingress.js";
 import { createBackoff, waitForRetry } from "./retry.js";
 import {
   agentMailInboxIdsEqual,
-  resolveReceivedAgentMailMessageTimestampMs,
+  resolveAgentMailTimestampMs,
 } from "./received-message.js";
 import type { AgentMailIngressRecord, ResolvedAgentMailAccount } from "./types.js";
 
@@ -169,11 +169,12 @@ export async function startAgentMailWebSocket(params: {
       params.log?.warn?.("AgentMail WebSocket ignored an event for the wrong inbox");
       return;
     }
-    const messageTimestampMs = resolveReceivedAgentMailMessageTimestampMs(
-      event.message,
-      params.account.inboxId,
-    );
+    // The event type itself is authoritative for live receipt. Provider label projection can lag
+    // the WebSocket frame; durable hydration already retries that condition safely.
+    const messageTimestampMs = resolveAgentMailTimestampMs(event.message.timestamp);
     if (messageTimestampMs === null) {
+      params.log?.warn?.("AgentMail WebSocket received an event with an invalid timestamp");
+      catchUpSupervisor.request();
       return;
     }
     if (queuedMessageIds.has(event.message.messageId)) {
