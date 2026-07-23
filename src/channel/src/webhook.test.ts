@@ -81,6 +81,32 @@ describe("AgentMail webhook", () => {
     );
   });
 
+  it("rejects far-future signed timestamps before durable admission", async () => {
+    const now = Date.now();
+    const dateNow = vi.spyOn(Date, "now").mockReturnValue(now);
+    const receive = vi.fn(async () => undefined);
+    const body = JSON.stringify({
+      type: "event",
+      event_type: "message.received",
+      message: {
+        inbox_id: "inbox_1",
+        message_id: "message_future",
+        timestamp: new Date(now + 365 * 24 * 60 * 60_000).toISOString(),
+      },
+    });
+    try {
+      const res = response();
+      await createAgentMailWebhookHandler({ account: account(), verifier, receive })(
+        request(body, signed(body)),
+        res,
+      );
+      expect(res.statusCode).toBe(200);
+      expect(receive).not.toHaveBeenCalled();
+    } finally {
+      dateNow.mockRestore();
+    }
+  });
+
   it("acknowledges but ignores a signed event with empty identifiers", async () => {
     const receive = vi.fn(async () => undefined);
     const body = JSON.stringify({

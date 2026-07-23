@@ -5,7 +5,11 @@ import {
 } from "openclaw/plugin-sdk/webhook-ingress";
 import { Webhook } from "svix";
 import { type AgentMailLog, errorText } from "./log.js";
-import { agentMailInboxIdsEqual, resolveAgentMailTimestampMs } from "./received-message.js";
+import {
+  agentMailInboxIdsEqual,
+  isAgentMailProviderTimestampWithinFutureSkew,
+  resolveAgentMailTimestampMs,
+} from "./received-message.js";
 import type { AgentMailIngressRecord, ResolvedAgentMailAccount } from "./types.js";
 
 const MAX_WEBHOOK_BODY_BYTES = 1024 * 1024;
@@ -117,6 +121,15 @@ export function createAgentMailWebhookHandler(params: {
     }
     try {
       const nowMs = Date.now();
+      if (
+        event.receivedAt !== undefined &&
+        !isAgentMailProviderTimestampWithinFutureSkew(event.receivedAt, nowMs)
+      ) {
+        // Acknowledging a signed but policy-invalid event prevents provider retry amplification.
+        // REST catch-up will admit it only if its provider time later enters the bounded window.
+        params.log?.warn?.("AgentMail webhook ignored an event timestamped too far in the future");
+        return respond(res, 200);
+      }
       await params.receive({
         accountId: params.account.accountId,
         inboxId: params.account.inboxId,

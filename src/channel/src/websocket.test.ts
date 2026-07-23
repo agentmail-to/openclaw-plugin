@@ -112,6 +112,75 @@ describe("AgentMail WebSocket ingress", () => {
     expect(waitForOpen).not.toHaveBeenCalled();
   });
 
+  it("resets reconnect backoff when connect returns an already-open socket", async () => {
+    handlers.clear();
+    connect.mockClear();
+    sendSubscribe.mockClear();
+    const reconnectDelayMs = vi.fn(() => 0);
+    const alreadyOpenSocket = {
+      on: (event: string, handler: (value?: unknown) => void) => handlers.set(event, handler),
+      sendSubscribe,
+      waitForOpen,
+      readyState: 1,
+      close,
+    };
+    connect
+      .mockRejectedValueOnce(new Error("initial connect failed"))
+      .mockResolvedValueOnce(alreadyOpenSocket);
+    const controller = new AbortController();
+    const running = startAgentMailWebSocket({
+      account,
+      abortSignal: controller.signal,
+      receive: vi.fn(async () => undefined),
+      catchUpSession: { run: catchUpRun },
+      reconnectDelayMs,
+    });
+
+    await vi.waitFor(() => expect(connect).toHaveBeenCalledTimes(2));
+    await vi.waitFor(() => expect(sendSubscribe).toHaveBeenCalled());
+    handlers.get("close")?.();
+    await vi.waitFor(() => expect(connect).toHaveBeenCalledTimes(3));
+    expect(reconnectDelayMs.mock.calls.map(([attempt]) => attempt)).toEqual([1, 1]);
+
+    controller.abort();
+    await running;
+  });
+
+  it("rejects far-future provider timestamps before durable admission", async () => {
+    handlers.clear();
+    const now = 1_000_000;
+    const dateNow = vi.spyOn(Date, "now").mockReturnValue(now);
+    const receive = vi.fn(async () => undefined);
+    const controller = new AbortController();
+    const running = startAgentMailWebSocket({
+      account,
+      abortSignal: controller.signal,
+      receive,
+      catchUpSession: { run: catchUpRun },
+    });
+    try {
+      await vi.waitFor(() => expect(handlers.has("message")).toBe(true));
+      catchUpRun.mockClear();
+      handlers.get("message")?.({
+        type: "event",
+        eventType: "message.received",
+        message: {
+          inboxId: "inbox_1",
+          messageId: "message_future",
+          labels: ["received"],
+          timestamp: new Date(now + 365 * 24 * 60 * 60_000),
+        },
+      });
+
+      await vi.waitFor(() => expect(catchUpRun).toHaveBeenCalled());
+      expect(receive).not.toHaveBeenCalled();
+    } finally {
+      controller.abort();
+      await running;
+      dateNow.mockRestore();
+    }
+  });
+
   it("durably admits message.received frames before the received label projects", async () => {
     handlers.clear();
     const receive = vi.fn(async () => undefined);

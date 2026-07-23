@@ -2,6 +2,7 @@ import { type AgentMailLog, errorText } from "./log.js";
 import type { createAgentMailDurableInboundReceiveJournal } from "./durable-receive.js";
 import { AgentMailIngressCapacityError, createAgentMailDurableInboundId } from "./durable-receive.js";
 import { HYDRATION_NOT_FOUND_RETRY_WINDOW_MS } from "./inbound.js";
+import { capAgentMailProviderTimestampForRetention } from "./received-message.js";
 import { createBackoff, waitForRetry } from "./retry.js";
 import type { AgentMailIngressRecord } from "./types.js";
 
@@ -82,10 +83,14 @@ async function completeAgentMailIngress(params: {
   // tombstone until seven days after that provider time, or it can re-enter the scan window only
   // after a locally-timestamped completion marker has already expired.
   const completedAt = Date.now();
-  const providerReceivedAt =
+  const rawProviderReceivedAt =
     Number.isFinite(params.record.receivedAt) && params.record.receivedAt >= 0
       ? params.record.receivedAt
       : completedAt;
+  const providerReceivedAt = capAgentMailProviderTimestampForRetention(
+    rawProviderReceivedAt,
+    completedAt,
+  );
   await params.journal.complete(params.id, {
     completedAt: Math.max(completedAt, providerReceivedAt),
   });

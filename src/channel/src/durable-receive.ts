@@ -62,7 +62,8 @@ export function withAgentMailIngressCapacity(
   // concurrent transports (live WebSocket + REST catch-up) could otherwise both observe free space
   // and push past the bound. Chaining admissions makes the count-then-accept step atomic across
   // every facade for the queue; the chain never rejects so one failed admission cannot poison
-  // later ones.
+  // later ones. This intentionally introduces brief head-of-line coupling for facades sharing one
+  // queue; each critical section contains only the queue admission and occasional capacity scan.
   const state = coordinationKey
     ? (capacityAdmissionStates.get(coordinationKey) ?? {
         admissionChain: Promise.resolve(),

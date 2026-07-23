@@ -13,6 +13,7 @@ import { sha256Hex } from "./digest.js";
 import { isAgentMailSenderAllowed, parseSingleFromMailbox } from "./mailbox.js";
 import { AgentMailMediaPolicyError, loadAgentMailOutboundAttachments } from "./media.js";
 import { agentMailInboxIdsEqual } from "./received-message.js";
+import { resolveAgentMailTriggerArrival } from "./reply-metadata.js";
 import { HYDRATION_NOT_FOUND_RETRY_WINDOW_MS } from "./inbound.js";
 
 // A media-size policy violation is genuinely terminal: the same payload will always exceed the
@@ -272,9 +273,10 @@ export async function reconcileAgentMailUnknownSend(
       retryable: false,
     };
   }
-  const recoveryReferenceAt = ctx.platformSendStartedAt ?? ctx.enqueuedAt;
-  const recoveryAgeMs = Math.max(0, (options.now?.() ?? Date.now()) - recoveryReferenceAt);
-  if (recoveryAgeMs >= AGENTMAIL_UNKNOWN_SEND_MAX_AGE_MS) {
+  const nowMs = options.now?.() ?? Date.now();
+  const sendRecoveryReferenceAt = ctx.platformSendStartedAt ?? ctx.enqueuedAt;
+  const sendRecoveryAgeMs = Math.max(0, nowMs - sendRecoveryReferenceAt);
+  if (sendRecoveryAgeMs >= AGENTMAIL_UNKNOWN_SEND_MAX_AGE_MS) {
     return {
       status: "unresolved",
       error: "AgentMail recovery is too close to the provider idempotency-key expiry",
@@ -290,6 +292,8 @@ export async function reconcileAgentMailUnknownSend(
     (value): value is string => typeof value === "string" && value.trim().length > 0,
   );
   const text = rendered?.text ?? payload.text ?? "";
+  const triggerArrivedAt = resolveAgentMailTriggerArrival(payload, ctx.enqueuedAt);
+  const triggerAgeMs = Math.max(0, nowMs - triggerArrivedAt);
   const recoveredPayload = { ...payload, text };
   delete recoveredPayload.mediaUrl;
   delete recoveredPayload.mediaUrls;
@@ -322,7 +326,7 @@ export async function reconcileAgentMailUnknownSend(
     if (isTerminalMediaPolicyFailure(error)) {
       return { status: "unresolved", error: error.message, retryable: false };
     }
-    if (isDeletedTriggerFailure(error, recoveryAgeMs)) {
+    if (isDeletedTriggerFailure(error, triggerAgeMs)) {
       // A 404 that persists beyond the provider projection window is treated as deletion.
       return { status: "unresolved", error: errorText(error), retryable: false };
     }

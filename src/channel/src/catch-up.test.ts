@@ -298,6 +298,26 @@ describe("AgentMail durable REST catch-up", () => {
     );
   });
 
+  it("does not admit a provider timestamp beyond the bounded future-skew window", async () => {
+    const store = memoryStore<never>();
+    const nowMs = 1_000_000;
+    const list = vi.fn(async () => ({
+      count: 1,
+      messages: [message({ id: "far_future", timestamp: nowMs + 365 * 24 * 60 * 60_000 })],
+    }));
+    const session = await createAgentMailCatchUpSession({
+      account,
+      client: { inboxes: { messages: { list } } } as never,
+      store: store as never,
+      now: () => nowMs,
+    });
+    const receive = vi.fn(async () => undefined);
+
+    await session.run({ receive, abortSignal: new AbortController().signal });
+
+    expect(receive).not.toHaveBeenCalled();
+  });
+
   it("lists from the monitoring baseline on a deep sweep", async () => {
     const store = memoryStore<never>();
     const list = vi.fn(async () => ({

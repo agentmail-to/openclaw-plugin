@@ -550,6 +550,49 @@ describe("AgentMail reply-only outbound", () => {
     expect(reply).not.toHaveBeenCalled();
   });
 
+  it("uses persisted inbound arrival time to classify a 404 after restart", async () => {
+    reply.mockClear();
+    const unavailableClient = {
+      inboxes: {
+        messages: {
+          get: vi.fn(async () => {
+            throw new AgentMailError({ message: "not projected", statusCode: 404 });
+          }),
+          reply,
+        },
+      },
+    } as never;
+    const now = 10 * 60_000;
+    const result = await reconcileAgentMailUnknownSend(
+      {
+        cfg: {
+          channels: {
+            agentmail: { apiKey: "key", inboxId: "inbox_1", allowFrom: ["sender@example.com"] },
+          },
+        },
+        queueId: "queue_1",
+        channel: "agentmail",
+        to: "message:msg_1",
+        accountId: "default",
+        // The recovered queue timestamp can be stale after restart; the durable inbound metadata
+        // remains the authoritative projection-window reference.
+        enqueuedAt: 0,
+        retryCount: 2,
+        effectiveReplyToId: "msg_1",
+        payloads: [
+          {
+            text: "Hello",
+            channelData: { agentmail: { triggerArrivedAt: now - 1_000 } },
+          },
+        ],
+      } as never,
+      { client: unavailableClient, now: () => now },
+    );
+
+    expect(result).toMatchObject({ status: "unresolved", retryable: true });
+    expect(reply).not.toHaveBeenCalled();
+  });
+
   it("treats a triggering-message 404 as terminal after the projection window", async () => {
     const now = 10 * 60_000;
     const client = {

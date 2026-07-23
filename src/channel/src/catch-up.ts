@@ -9,6 +9,7 @@ import {
 } from "./durable-receive.js";
 import {
   AGENTMAIL_RECEIVED_LABEL,
+  isAgentMailProviderTimestampWithinFutureSkew,
   isReceivedAgentMailMessage,
   resolveReceivedAgentMailMessageTimestampMs,
 } from "./received-message.js";
@@ -294,10 +295,23 @@ export async function createAgentMailCatchUpSession(params: {
           }
           // Invalid provider time must not turn a missed live event into a permanent drop. Admit
           // with local observation time; durable message-id dedupe keeps overlap scans safe.
-          const providerTimestampMs = resolveReceivedAgentMailMessageTimestampMs(
+          const rawProviderTimestampMs = resolveReceivedAgentMailMessageTimestampMs(
             message,
             params.account.inboxId,
           );
+          if (
+            rawProviderTimestampMs !== null &&
+            !isAgentMailProviderTimestampWithinFutureSkew(
+              rawProviderTimestampMs,
+              scanUpperBoundAtMs,
+            )
+          ) {
+            params.log?.warn?.(
+              `AgentMail catch-up ignored message ${message.messageId} timestamped too far in the future`,
+            );
+            continue;
+          }
+          const providerTimestampMs = rawProviderTimestampMs;
           const admissionTimestampMs = providerTimestampMs ?? scanUpperBoundAtMs;
           try {
             await receive({

@@ -6,6 +6,7 @@ import {
   createAgentMailDurableInboundId,
   withAgentMailIngressCapacity,
 } from "./durable-receive.js";
+import { AGENTMAIL_PROVIDER_FUTURE_SKEW_MAX_MS } from "./received-message.js";
 import {
   AgentMailIngressCapacityError,
   processAgentMailIngress,
@@ -256,23 +257,29 @@ describe("AgentMail durable ingress", () => {
   });
 
   it("retains future-dated completion tombstones through the provider scan horizon", async () => {
-    const futureReceivedAt = Date.now() + 24 * 60 * 60 * 1000;
+    const now = 1_000_000;
+    const futureReceivedAt = now + 365 * 24 * 60 * 60 * 1000;
+    const dateNow = vi.spyOn(Date, "now").mockReturnValue(now);
     const complete = vi.fn(async () => undefined);
-    await processAgentMailIngress({
-      journal: {
-        accept: async () => ({ kind: "accepted", duplicate: false, record: {} }),
-        complete,
-        release: vi.fn(),
-      } as never,
-      record: { ...record, receivedAt: futureReceivedAt },
-      dispatch: vi.fn(async () => undefined),
-    });
+    try {
+      await processAgentMailIngress({
+        journal: {
+          accept: async () => ({ kind: "accepted", duplicate: false, record: {} }),
+          complete,
+          release: vi.fn(),
+        } as never,
+        record: { ...record, receivedAt: futureReceivedAt },
+        dispatch: vi.fn(async () => undefined),
+      });
 
-    await vi.waitFor(() =>
-      expect(complete).toHaveBeenCalledWith(createAgentMailDurableInboundId(record), {
-        completedAt: futureReceivedAt,
-      }),
-    );
+      await vi.waitFor(() =>
+        expect(complete).toHaveBeenCalledWith(createAgentMailDurableInboundId(record), {
+          completedAt: now + AGENTMAIL_PROVIDER_FUTURE_SKEW_MAX_MS,
+        }),
+      );
+    } finally {
+      dateNow.mockRestore();
+    }
   });
 
   it("returns after durable admission without waiting for agent dispatch", async () => {

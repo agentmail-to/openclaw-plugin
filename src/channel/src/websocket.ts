@@ -12,6 +12,7 @@ import { AgentMailIngressCapacityError } from "./ingress.js";
 import { createBackoff, waitForRetry } from "./retry.js";
 import {
   agentMailInboxIdsEqual,
+  isAgentMailProviderTimestampWithinFutureSkew,
   resolveAgentMailTimestampMs,
 } from "./received-message.js";
 import type { AgentMailIngressRecord, ResolvedAgentMailAccount } from "./types.js";
@@ -187,6 +188,14 @@ export async function startAgentMailWebSocket(params: {
       catchUpSupervisor.request();
       return;
     }
+    const arrivedAt = Date.now();
+    if (!isAgentMailProviderTimestampWithinFutureSkew(messageTimestampMs, arrivedAt)) {
+      params.log?.warn?.(
+        "AgentMail WebSocket ignored an event timestamped too far in the future",
+      );
+      catchUpSupervisor.request();
+      return;
+    }
     queuedMessageIds.add(event.message.messageId);
     liveQueue.push({
       accountId: params.account.accountId,
@@ -194,7 +203,7 @@ export async function startAgentMailWebSocket(params: {
       messageId: event.message.messageId,
       transport: "websocket",
       receivedAt: messageTimestampMs,
-      arrivedAt: Date.now(),
+      arrivedAt,
     });
     runLiveWorker();
   };
@@ -280,6 +289,7 @@ export async function startAgentMailWebSocket(params: {
       // waitForOpen() does not settle on an aborted initial connection; close the already-open race
       // from readyState instead.
       if (socket.readyState === 1) {
+        reconnectAttempt = 0;
         subscribe();
       }
       await Promise.race([closed, aborted]);

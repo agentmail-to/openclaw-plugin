@@ -13,6 +13,7 @@ import {
   agentMailInboxIdsEqual,
   resolveAgentMailTimestampMs,
 } from "./received-message.js";
+import { withAgentMailTriggerArrival } from "./reply-metadata.js";
 import type { AgentMailIngressRecord, ResolvedAgentMailAccount } from "./types.js";
 
 const CHANNEL_ID = "agentmail";
@@ -394,7 +395,10 @@ export async function dispatchAgentMailInboundEvent(params: {
             // implicit id owned by the durable delivery contract below, so remove those derived
             // payload directives immediately before delivery.
             preparePayload: (payload) => {
-              const prepared = { ...payload };
+              const prepared = withAgentMailTriggerArrival(
+                payload,
+                params.record.arrivedAt ?? params.record.receivedAt,
+              );
               delete prepared.replyToId;
               delete prepared.replyToTag;
               delete prepared.replyToCurrent;

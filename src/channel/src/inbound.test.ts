@@ -256,8 +256,15 @@ describe("AgentMail REST-authoritative inbound", () => {
         replyToId: "message_1",
         replyToTag: false,
         replyToCurrent: true,
+        channelData: { existing: true, agentmail: { existingAgentMail: true } },
       }),
-    ).toEqual({ text: "reply" });
+    ).toEqual({
+      text: "reply",
+      channelData: {
+        existing: true,
+        agentmail: { existingAgentMail: true, triggerArrivedAt: 1 },
+      },
+    });
     expect(delivery.durable()).toMatchObject({
       to: "message:message_1",
       replyToId: "message_1",
