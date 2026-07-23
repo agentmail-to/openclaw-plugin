@@ -182,7 +182,10 @@ export async function dispatchAgentMailInboundEvent(params: {
     }
     throw new AgentMailLabelPendingError(params.record.messageId);
   }
-  const sender = parseSingleFromMailbox(message.from);
+  // Although the SDK type declares `from` as a string, hydrated provider data is an external trust
+  // boundary. Do not let a malformed non-string value poison-retry the durable row.
+  const sender =
+    typeof message.from === "string" ? parseSingleFromMailbox(message.from) : null;
   if (!sender) {
     params.log?.warn?.(
       `AgentMail rejected message ${message.messageId} with an ambiguous From mailbox`,
@@ -360,13 +363,12 @@ export async function dispatchAgentMailInboundEvent(params: {
   });
   try {
     await runPromise;
-  } catch (error) {
+  } finally {
     if (!turnAdopted && inboundMedia.paths.length > 0) {
-      // The turn never adopted, so core did not take ownership of these freshly-saved attachment
-      // files. Remove them so a durable retry (which re-downloads a clean set) does not leak one
-      // copy per attempt.
+      // The turn never adopted, so core did not take ownership of these freshly-saved files. This
+      // includes both failures and successful no-op runs; remove them so retries or terminal
+      // settlement do not leak one copy per attachment.
       await Promise.allSettled(inboundMedia.paths.map((path) => rm(path, { force: true })));
     }
-    throw error;
   }
 }

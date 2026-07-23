@@ -4,7 +4,7 @@ import { type AgentMailLog, errorText } from "./log.js";
 import { createAgentMailClient } from "./client.js";
 import { sha256Hex } from "./digest.js";
 import {
-  AGENTMAIL_DURABLE_COMPLETED_TTL_MS,
+  AGENTMAIL_DURABLE_PENDING_TTL_MS,
   AgentMailIngressCapacityError,
 } from "./durable-receive.js";
 import { AGENTMAIL_RECEIVED_LABEL } from "./inbound.js";
@@ -16,7 +16,7 @@ const CURSOR_VERSION = 1;
 const PAGE_LIMIT = 100;
 
 export const AGENTMAIL_REST_CATCH_UP_NAMESPACE = "agentmail.rest-catch-up";
-export const AGENTMAIL_REST_CATCH_UP_MAX_ACCOUNTS = 1_000;
+export const AGENTMAIL_REST_CATCH_UP_MAX_ENTRIES_PER_ACCOUNT = 1;
 export const AGENTMAIL_REST_CATCH_UP_OVERLAP_MS = 5 * 60_000;
 // Periodic overlap covers half-open sockets and provider webhook gaps; the less frequent deep sweep
 // lists from the baseline so back-dated mail below the overlap window is still recovered. Both run
@@ -221,14 +221,17 @@ export async function createAgentMailCatchUpSession(params: {
   log?: AgentMailLog;
 }): Promise<AgentMailCatchUpSession> {
   const now = params.now ?? Date.now;
+  const key = cursorKey(params.account);
   const store =
     params.store ??
     getAgentMailRuntime().state.openKeyedStore<AgentMailCatchUpCursor>({
-      namespace: AGENTMAIL_REST_CATCH_UP_NAMESPACE,
-      maxEntries: AGENTMAIL_REST_CATCH_UP_MAX_ACCOUNTS,
+      // Isolate each account in its own one-entry namespace. A shared reject-new namespace capped
+      // at 1,000 entries left every later account without a cursor and made its supervisor retry
+      // forever. The hashed suffix keeps account and inbox identifiers out of state paths.
+      namespace: `${AGENTMAIL_REST_CATCH_UP_NAMESPACE}.${key}`,
+      maxEntries: AGENTMAIL_REST_CATCH_UP_MAX_ENTRIES_PER_ACCOUNT,
       overflowPolicy: "reject-new",
     });
-  const key = cursorKey(params.account);
   const initialAtMs = now();
   const initialCursor: AgentMailCatchUpCursor = {
     version: CURSOR_VERSION,
@@ -245,21 +248,21 @@ export async function createAgentMailCatchUpSession(params: {
       if (!storedCursor) {
         throw new Error("AgentMail WebSocket catch-up cursor is unavailable");
       }
-      // Never scan below the dedupe horizon on ANY sweep. Completed-message tombstones expire after
-      // AGENTMAIL_DURABLE_COMPLETED_TTL_MS; once they do, a message still in scan range would be
-      // re-admitted as a duplicate turn. The floor is applied to the normal high-water sweep too:
-      // an idle inbox's high-water stops advancing, so without it the same pre-horizon messages
-      // would become eligible again after their tombstones expire.
+      // Never scan below the durable recovery horizon on any sweep. Pending work and completed
+      // tombstones share this retention period, so catch-up can recover mail throughout the entire
+      // time the durable queue promises to retain it without re-admitting expired tombstones.
+      // Using the shorter historical completed-only horizon could skip never-admitted mail while
+      // ingress remained backpressured.
       //
-      // The deep sweep lists from max(baseline, dedupeFloor): it recovers back-dated mail within the
-      // dedupe window and since monitoring began, but deliberately does not scan before the baseline,
-      // which would re-inject pre-monitoring history that has no tombstone protection.
-      const dedupeFloorMs = now() - AGENTMAIL_DURABLE_COMPLETED_TTL_MS;
+      // The deep sweep lists from max(baseline, recoveryFloor): it recovers back-dated mail within
+      // the durable retention window and since monitoring began, but deliberately does not scan
+      // before the baseline, which would re-inject pre-monitoring history.
+      const recoveryFloorMs = now() - AGENTMAIL_DURABLE_PENDING_TTL_MS;
       const baseAfterMs =
         sinceBaseline || !storedCursor.established
           ? storedCursor.baselineAtMs
           : storedCursor.highWaterAtMs - AGENTMAIL_REST_CATCH_UP_OVERLAP_MS;
-      const afterMs = Math.max(0, baseAfterMs, dedupeFloorMs);
+      const afterMs = Math.max(0, baseAfterMs, recoveryFloorMs);
       let highWaterAtMs = storedCursor.highWaterAtMs;
       let pageCursor: string | undefined;
       let admitted = 0;
@@ -287,13 +290,23 @@ export async function createAgentMailCatchUpSession(params: {
           if (!isReceivedMessage(message, params.account.inboxId)) {
             continue;
           }
+          const receivedAt =
+            message.timestamp instanceof Date ? message.timestamp.getTime() : Number.NaN;
+          if (!Number.isFinite(receivedAt) || receivedAt < 0) {
+            // A malformed provider row must not poison high-water state with NaN or crash-loop the
+            // whole recovery pass. Skip it; a later corrected projection can be admitted normally.
+            params.log?.warn?.(
+              `AgentMail catch-up ignored message ${message.messageId} with an invalid timestamp`,
+            );
+            continue;
+          }
           try {
             await receive({
               accountId: params.account.accountId,
               inboxId: params.account.inboxId,
               messageId: message.messageId,
               transport: "rest",
-              receivedAt: message.timestamp.getTime(),
+              receivedAt,
               arrivedAt: now(),
             });
           } catch (error) {
@@ -309,7 +322,7 @@ export async function createAgentMailCatchUpSession(params: {
             throw error;
           }
           admitted += 1;
-          highWaterAtMs = Math.max(highWaterAtMs, message.timestamp.getTime());
+          highWaterAtMs = Math.max(highWaterAtMs, receivedAt);
           pageAdvanced = true;
         }
         if (pageAdvanced) {

@@ -5,12 +5,22 @@ import type {
 } from "openclaw/plugin-sdk/plugin-state-runtime";
 import { describe, expect, it, vi } from "vitest";
 import {
+  AGENTMAIL_REST_CATCH_UP_MAX_ENTRIES_PER_ACCOUNT,
+  AGENTMAIL_REST_CATCH_UP_NAMESPACE,
   AGENTMAIL_REST_CATCH_UP_OVERLAP_MS,
   createAgentMailCatchUpSession,
   createAgentMailCatchUpSupervisor,
 } from "./catch-up.js";
-import { AgentMailIngressCapacityError } from "./durable-receive.js";
+import {
+  AGENTMAIL_DURABLE_PENDING_TTL_MS,
+  AgentMailIngressCapacityError,
+} from "./durable-receive.js";
 import type { AgentMailIngressRecord, ResolvedAgentMailAccount } from "./types.js";
+
+const openKeyedStore = vi.hoisted(() => vi.fn());
+vi.mock("./runtime.js", () => ({
+  getAgentMailRuntime: () => ({ state: { openKeyedStore } }),
+}));
 
 const account: ResolvedAgentMailAccount = {
   accountId: "default",
@@ -86,6 +96,30 @@ function message(params: {
 }
 
 describe("AgentMail durable REST catch-up", () => {
+  it("isolates each account cursor in a one-entry state namespace", async () => {
+    openKeyedStore.mockReset();
+    openKeyedStore.mockImplementation(() => memoryStore());
+    const client = { inboxes: { messages: { list: vi.fn() } } } as never;
+
+    await createAgentMailCatchUpSession({ account, client, now: () => 1_000 });
+    await createAgentMailCatchUpSession({
+      account: { ...account, accountId: "support", inboxId: "inbox_2" },
+      client,
+      now: () => 1_000,
+    });
+
+    expect(openKeyedStore).toHaveBeenCalledTimes(2);
+    const options = openKeyedStore.mock.calls.map(([value]) => value);
+    expect(options[0]).toMatchObject({
+      maxEntries: AGENTMAIL_REST_CATCH_UP_MAX_ENTRIES_PER_ACCOUNT,
+      overflowPolicy: "reject-new",
+    });
+    expect(options[0].namespace).toMatch(
+      new RegExp(`^${AGENTMAIL_REST_CATCH_UP_NAMESPACE}\\.`),
+    );
+    expect(options[1].namespace).not.toBe(options[0].namespace);
+  });
+
   it("coalesces recovery requests into one bounded retry supervisor", async () => {
     const run = vi
       .fn<() => Promise<void>>()
@@ -202,7 +236,7 @@ describe("AgentMail durable REST catch-up", () => {
     );
   });
 
-  it("floors a deep sweep at the dedupe horizon instead of the permanent baseline", async () => {
+  it("keeps deep recovery at the baseline beyond the former seven-day horizon", async () => {
     const store = memoryStore<never>();
     const list = vi.fn(async () => ({ count: 0, messages: [] }));
     let nowMs = 1_000;
@@ -216,16 +250,15 @@ describe("AgentMail durable REST catch-up", () => {
     await session.run({ receive, abortSignal: new AbortController().signal }); // baseline = 1_000
     nowMs = 1_000 + 8 * 24 * 60 * 60 * 1000; // 8 days later
     await session.run({ receive, abortSignal: new AbortController().signal, sinceBaseline: true });
-    // Older than the 7-day completed-tombstone TTL is not scanned, so the floor is now - 7d, not 1_000.
-    const expectedFloor = nowMs - 7 * 24 * 60 * 60 * 1000;
+    // Recovery remains at the monitoring baseline because pending ingress is retained for 30 days.
     expect(list).toHaveBeenLastCalledWith(
       "inbox_1",
-      expect.objectContaining({ after: new Date(expectedFloor) }),
+      expect.objectContaining({ after: new Date(1_000) }),
       expect.any(Object),
     );
   });
 
-  it("floors an idle high-water sweep at the dedupe horizon", async () => {
+  it("floors an idle high-water sweep at the durable recovery horizon", async () => {
     const store = memoryStore<never>();
     const list = vi.fn(async () => ({ count: 0, messages: [] }));
     let nowMs = 1_000;
@@ -237,16 +270,46 @@ describe("AgentMail durable REST catch-up", () => {
     });
     const receive = vi.fn(async () => undefined);
     await session.run({ receive, abortSignal: new AbortController().signal }); // establish, highWater≈1_000
-    nowMs = 1_000 + 8 * 24 * 60 * 60 * 1000; // 8 days later, inbox stayed idle
+    nowMs = 1_000 + AGENTMAIL_DURABLE_PENDING_TTL_MS + 24 * 60 * 60 * 1000;
     await session.run({ receive, abortSignal: new AbortController().signal }); // normal high-water sweep
-    // The high-water cursor never advanced, so without a floor the sweep would re-scan pre-horizon
-    // mail; it must instead query from now - 7d.
-    const expectedFloor = nowMs - 7 * 24 * 60 * 60 * 1000;
+    // The high-water cursor never advanced, so the sweep is bounded by the same 30-day horizon as
+    // durable pending ingress and completed tombstones.
+    const expectedFloor = nowMs - AGENTMAIL_DURABLE_PENDING_TTL_MS;
     expect(list).toHaveBeenLastCalledWith(
       "inbox_1",
       expect.objectContaining({ after: new Date(expectedFloor) }),
       expect.any(Object),
     );
+  });
+
+  it("skips malformed timestamps without poisoning the cursor or recovery pass", async () => {
+    const store = memoryStore<never>();
+    const malformed = {
+      ...message({ id: "malformed", timestamp: 1_050 }),
+      timestamp: new Date(Number.NaN),
+    };
+    const list = vi.fn(async () => ({
+      count: 2,
+      messages: [malformed, message({ id: "message_1", timestamp: 1_100 })],
+    }));
+    const warn = vi.fn();
+    const session = await createAgentMailCatchUpSession({
+      account,
+      client: { inboxes: { messages: { list } } } as never,
+      store: store as never,
+      now: () => 1_000,
+      log: { warn },
+    });
+    const receive = vi.fn(async () => undefined);
+
+    await expect(
+      session.run({ receive, abortSignal: new AbortController().signal }),
+    ).resolves.toBeUndefined();
+    expect(receive).toHaveBeenCalledOnce();
+    expect(receive).toHaveBeenCalledWith(
+      expect.objectContaining({ messageId: "message_1", receivedAt: 1_100 }),
+    );
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("invalid timestamp"));
   });
 
   it("pauses the pass when durable ingress reports capacity", async () => {

@@ -66,8 +66,19 @@ describe("AgentMail inbound attachments", () => {
     expect(saveMediaBuffer).not.toHaveBeenCalled();
   });
 
-  it("skips inline and CID parts", async () => {
-    const getAttachment = vi.fn();
+  it("skips only explicit inline parts and keeps downloadable CID attachments", async () => {
+    loadWebMediaRaw.mockResolvedValueOnce({
+      buffer: Buffer.from("download"),
+      contentType: "application/octet-stream",
+    });
+    saveMediaBuffer.mockResolvedValueOnce({
+      path: "/tmp/download.bin",
+      contentType: "application/octet-stream",
+    });
+    const getAttachment = vi.fn(async () => ({
+      downloadUrl: "https://download.example/cid",
+      filename: "download.bin",
+    }));
     await expect(
       loadAgentMailInboundAttachments({
         client: { inboxes: { messages: { getAttachment } } } as never,
@@ -75,12 +86,21 @@ describe("AgentMail inbound attachments", () => {
         messageId: "message_1",
         attachments: [
           { attachmentId: "inline", size: 1, contentDisposition: "inline" },
-          { attachmentId: "cid", size: 1, contentId: "image@cid" },
+          {
+            attachmentId: "cid",
+            size: 8,
+            contentId: "download@cid",
+            contentDisposition: "attachment",
+          },
         ],
         maxBytes: 100,
       }),
-    ).resolves.toEqual({ paths: [], types: [] });
-    expect(getAttachment).not.toHaveBeenCalled();
+    ).resolves.toEqual({
+      paths: ["/tmp/download.bin"],
+      types: ["application/octet-stream"],
+    });
+    expect(getAttachment).toHaveBeenCalledOnce();
+    expect(getAttachment).toHaveBeenCalledWith("inbox_1", "message_1", "cid");
   });
 
   it("classifies static attachment size violations as terminal policy rejections", async () => {

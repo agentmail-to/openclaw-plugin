@@ -284,6 +284,30 @@ describe("AgentMail REST-authoritative inbound", () => {
     expect(rm).toHaveBeenCalledWith("/tmp/a.bin", { force: true });
   });
 
+  it("removes freshly-saved attachments when a successful run never adopts the turn", async () => {
+    rm.mockClear();
+    loadAgentMailInboundAttachments.mockResolvedValueOnce({
+      paths: ["/tmp/no-op.bin"],
+      types: ["application/octet-stream"],
+    });
+    await dispatchAgentMailInboundEvent({
+      cfg: {},
+      account,
+      record,
+      channelRuntime: {
+        routing: { resolveAgentRoute: () => ({ agentId: "agent-1" }) },
+        inbound: {
+          buildContext: (ctx: Record<string, unknown>) => ctx,
+          run: async () => undefined,
+        },
+        session: { resolveStorePath: () => "/tmp/s.json", recordInboundSession: vi.fn() },
+        reply: { dispatchReplyWithBufferedBlockDispatcher: vi.fn() },
+      } as never,
+      client: { inboxes: { messages: { get: vi.fn(async () => message()) } } } as never,
+    });
+    expect(rm).toHaveBeenCalledWith("/tmp/no-op.bin", { force: true });
+  });
+
   it("cleans up attachments when the adoption hook itself fails", async () => {
     rm.mockClear();
     loadAgentMailInboundAttachments.mockResolvedValueOnce({
@@ -336,6 +360,27 @@ describe("AgentMail REST-authoritative inbound", () => {
       } as never,
     });
     expect(run).not.toHaveBeenCalled();
+  });
+
+  it("settles a malformed non-string From value without poison retries", async () => {
+    const run = vi.fn();
+    const warn = vi.fn();
+    await expect(
+      dispatchAgentMailInboundEvent({
+        cfg: {},
+        account,
+        record,
+        channelRuntime: { inbound: { run } } as never,
+        client: {
+          inboxes: {
+            messages: { get: vi.fn(async () => message({ from: 42 as never })) },
+          },
+        } as never,
+        log: { warn },
+      }),
+    ).resolves.toBeUndefined();
+    expect(run).not.toHaveBeenCalled();
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("ambiguous From mailbox"));
   });
 
   it("settles permanently unsafe hydrated messages without dispatch", async () => {

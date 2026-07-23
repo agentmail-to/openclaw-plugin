@@ -190,6 +190,33 @@ describe("AgentMail durable ingress", () => {
     expect(dispatch).toHaveBeenCalledTimes(2);
   });
 
+  it("stops a permanently failing journal release loop and frees the worker", async () => {
+    const release = vi.fn(async () => {
+      throw new Error("storage unavailable");
+    });
+    const dispatch = vi.fn(async () => {
+      throw new Error("temporary hydration failure");
+    });
+    const error = vi.fn();
+    await processAgentMailIngress({
+      journal: {
+        accept: async () => ({ kind: "accepted", duplicate: false, record: {} }),
+        complete: vi.fn(),
+        release,
+      } as never,
+      record,
+      dispatch,
+      retryDelayMs: () => 0,
+      log: { error },
+    });
+
+    await vi.waitFor(() =>
+      expect(error).toHaveBeenCalledWith(expect.stringContaining("stopped releasing message")),
+    );
+    expect(release).toHaveBeenCalledTimes(50);
+    expect(dispatch).toHaveBeenCalledOnce();
+  });
+
   it("drops a poison message after the dispatch ceiling instead of blocking the queue", async () => {
     const complete = vi.fn(async () => undefined);
     const release = vi.fn(async () => true);
@@ -469,9 +496,9 @@ describe("AgentMail durable ingress", () => {
     expect(complete).toHaveBeenCalledWith(createAgentMailDurableInboundId(record));
   });
 
-  it("keeps WhatsApp-aligned retention values", () => {
+  it("keeps pending and completed retention horizons aligned", () => {
     expect(AGENTMAIL_DURABLE_PENDING_TTL_MS).toBe(30 * 24 * 60 * 60 * 1000);
-    expect(AGENTMAIL_DURABLE_COMPLETED_TTL_MS).toBe(7 * 24 * 60 * 60 * 1000);
+    expect(AGENTMAIL_DURABLE_COMPLETED_TTL_MS).toBe(AGENTMAIL_DURABLE_PENDING_TTL_MS);
     expect(AGENTMAIL_DURABLE_PENDING_MAX_ENTRIES).toBe(450);
   });
 

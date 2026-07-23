@@ -24,6 +24,7 @@ function respond(res: ServerResponse, status: number, body = ""): true {
 function parseVerifiedEvent(payload: unknown): {
   inboxId: string;
   messageId: string;
+  receivedAt: number;
 } | null {
   if (!payload || typeof payload !== "object") {
     return null;
@@ -36,11 +37,14 @@ function parseVerifiedEvent(payload: unknown): {
   const mail = message as Record<string, unknown>;
   const inboxId = typeof mail.inbox_id === "string" ? mail.inbox_id.trim() : "";
   const messageId = typeof mail.message_id === "string" ? mail.message_id.trim() : "";
-  // Require both identifiers to be present and non-empty; an empty id cannot address a message.
-  if (!inboxId || !messageId) {
+  const receivedAt =
+    typeof mail.timestamp === "string" ? Date.parse(mail.timestamp) : Number.NaN;
+  // Require identifiers and the provider-reported message timestamp. Local receipt time is tracked
+  // separately as arrivedAt and must not replace provider ordering/retention semantics.
+  if (!inboxId || !messageId || !Number.isFinite(receivedAt) || receivedAt < 0) {
     return null;
   }
-  return { inboxId, messageId };
+  return { inboxId, messageId, receivedAt };
 }
 
 /**
@@ -61,6 +65,7 @@ export function createAgentMailWebhookHandler(params: {
   verifier: Webhook;
   receive: (record: AgentMailIngressRecord) => Promise<void>;
   log?: AgentMailLog;
+  now?: () => number;
 }) {
   const verifier = params.verifier;
   return async (req: IncomingMessage, res: ServerResponse) => {
@@ -113,13 +118,13 @@ export function createAgentMailWebhookHandler(params: {
       return respond(res, 200);
     }
     try {
-      const nowMs = Date.now();
+      const nowMs = params.now?.() ?? Date.now();
       await params.receive({
         accountId: params.account.accountId,
         inboxId: event.inboxId,
         messageId: event.messageId,
         transport: "webhook",
-        receivedAt: nowMs,
+        receivedAt: event.receivedAt,
         arrivedAt: nowMs,
       });
       return respond(res, 200);

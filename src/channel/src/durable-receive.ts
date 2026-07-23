@@ -5,7 +5,10 @@ import type { AgentMailIngressRecord } from "./types.js";
 
 export const AGENTMAIL_DURABLE_PENDING_MAX_ENTRIES = 450;
 export const AGENTMAIL_DURABLE_PENDING_TTL_MS = 30 * 24 * 60 * 60 * 1000;
-export const AGENTMAIL_DURABLE_COMPLETED_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+// Keep completed tombstones for the full pending recovery horizon. REST catch-up may remain behind
+// while durable admission is full; expiring dedupe markers sooner either replays completed mail or
+// forces catch-up to skip never-admitted messages.
+export const AGENTMAIL_DURABLE_COMPLETED_TTL_MS = AGENTMAIL_DURABLE_PENDING_TTL_MS;
 
 /**
  * Raised when durable ingress is already holding the maximum number of pending rows. Transports

@@ -33,6 +33,7 @@ export type AgentMailIngressDispatch = (
 // occupying an admission slot. The journal exposes no distinct `fail` op, so completion is the
 // terminal marker. Comfortably above the legitimate transient-retry budget the tests exercise.
 const AGENTMAIL_MAX_DISPATCH_ATTEMPTS = 50;
+const AGENTMAIL_MAX_JOURNAL_RELEASE_ATTEMPTS = 50;
 
 type ActiveDispatch = {
   task: Promise<boolean>;
@@ -189,6 +190,7 @@ async function dispatchAgentMailIngressUntilSettled(params: DispatchParams): Pro
           return true;
         }
         const lastError = errorText(error);
+        let releaseAttempts = 0;
         while (!params.abortSignal?.aborted) {
           try {
             const released = await params.journal.release(params.id, { lastError });
@@ -198,11 +200,21 @@ async function dispatchAgentMailIngressUntilSettled(params: DispatchParams): Pro
               return true;
             }
             break;
-          } catch {
+          } catch (releaseError) {
+            releaseAttempts += 1;
+            if (releaseAttempts >= AGENTMAIL_MAX_JOURNAL_RELEASE_ATTEMPTS) {
+              // Do not retain an immortal active-dispatch entry and successor chain when storage is
+              // persistently unavailable. The durable row remains pending for replay on restart or
+              // a later duplicate delivery.
+              params.log?.error?.(
+                `AgentMail stopped releasing message ${params.record.messageId} after ${releaseAttempts} failed journal attempts: ${errorText(releaseError)}`,
+              );
+              return false;
+            }
             if (
               !(await waitForRetry(
                 params.abortSignal,
-                (params.retryDelay ?? retryDelayMs)(attempts),
+                (params.retryDelay ?? retryDelayMs)(releaseAttempts),
               ))
             ) {
               return false;

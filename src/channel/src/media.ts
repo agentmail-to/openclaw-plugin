@@ -18,7 +18,9 @@ export type AgentMailInboundMedia = {
 export class AgentMailMediaPolicyError extends Error {}
 
 function isAcceptedAttachment(attachment: AgentMail.Attachment): boolean {
-  return attachment.contentDisposition !== "inline" && !attachment.contentId;
+  // Content-ID does not imply inline disposition: Outlook, Apple Mail, and forwarded messages can
+  // attach a CID to ordinary downloads. Only an explicit inline disposition is safe to omit.
+  return attachment.contentDisposition !== "inline";
 }
 
 export async function loadAgentMailInboundAttachments(params: {
