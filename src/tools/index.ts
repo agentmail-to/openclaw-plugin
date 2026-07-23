@@ -97,7 +97,7 @@ export default defineToolPlugin({
         ),
       }, { additionalProperties: false }),
       execute: async (params, config, context) => {
-        const client = createAgentMailClient(config);
+        const client = createAgentMailClient(config, context.api.config);
         return client.inboxes.list(params, requestOptions(context.signal));
       },
     }),
@@ -123,7 +123,7 @@ export default defineToolPlugin({
         { additionalProperties: false },
       ),
       execute: async (params, config, context) => {
-        const client = createAgentMailClient(config);
+        const client = createAgentMailClient(config, context.api.config);
         return client.inboxes.create(params, requestOptions(context.signal));
       },
     }),
@@ -170,7 +170,7 @@ export default defineToolPlugin({
         { additionalProperties: false },
       ),
       execute: async ({ inboxId, before, after, ...params }, config, context) => {
-        const client = createAgentMailClient(config);
+        const client = createAgentMailClient(config, context.api.config);
         return client.inboxes.messages.list(
           inboxId,
           {
@@ -201,7 +201,7 @@ export default defineToolPlugin({
         { additionalProperties: false },
       ),
       execute: async ({ inboxId, query, before, after, ...params }, config, context) => {
-        const client = createAgentMailClient(config);
+        const client = createAgentMailClient(config, context.api.config);
         return client.inboxes.messages.search(
           inboxId,
           {
@@ -221,7 +221,7 @@ export default defineToolPlugin({
         "Get one complete AgentMail message. Prefer extractedText or extractedHtml when processing a reply without quoted history.",
       parameters: Type.Object(messageLocationFields, { additionalProperties: false }),
       execute: async ({ inboxId, messageId }, config, context) => {
-        const client = createAgentMailClient(config);
+        const client = createAgentMailClient(config, context.api.config);
         return client.inboxes.messages.get(
           inboxId,
           messageId,
@@ -257,7 +257,7 @@ export default defineToolPlugin({
         { additionalProperties: false },
       ),
       execute: async ({ inboxId, idempotencyKey, ...message }, config, context) => {
-        const client = createAgentMailClient(config);
+        const client = createAgentMailClient(config, context.api.config);
         return client.inboxes.messages.send(inboxId, message, {
           ...requestOptions(context.signal),
           ...(idempotencyKey ? { idempotencyKey } : {}),
@@ -293,7 +293,7 @@ export default defineToolPlugin({
         config,
         context,
       ) => {
-        const client = createAgentMailClient(config);
+        const client = createAgentMailClient(config, context.api.config);
         return client.inboxes.messages.reply(inboxId, messageId, message, {
           ...requestOptions(context.signal),
           ...(idempotencyKey ? { idempotencyKey } : {}),
@@ -331,7 +331,7 @@ export default defineToolPlugin({
         config,
         context,
       ) => {
-        const client = createAgentMailClient(config);
+        const client = createAgentMailClient(config, context.api.config);
         return client.inboxes.messages.forward(inboxId, messageId, message, {
           ...requestOptions(context.signal),
           ...(idempotencyKey ? { idempotencyKey } : {}),
@@ -364,7 +364,7 @@ export default defineToolPlugin({
           throw new Error("Provide addLabels or removeLabels.");
         }
 
-        const client = createAgentMailClient(config);
+        const client = createAgentMailClient(config, context.api.config);
         return client.inboxes.messages.update(
           inboxId,
           messageId,

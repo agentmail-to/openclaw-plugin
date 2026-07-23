@@ -113,7 +113,7 @@ describe("AgentMail durable REST catch-up", () => {
       .mockResolvedValueOnce({
         count: 2,
         messages: [
-          message({ id: "message_1", timestamp: 1_100 }),
+          message({ id: "message_1", timestamp: 1_100, inboxId: "INBOX_1" }),
           message({ id: "sent_1", timestamp: 1_150, labels: ["sent"] }),
         ],
         nextPageToken: "page_2",
@@ -170,6 +170,97 @@ describe("AgentMail durable REST catch-up", () => {
     );
     expect(receive).toHaveBeenLastCalledWith(
       expect.objectContaining({ messageId: "message_3", transport: "rest" }),
+    );
+  });
+
+  it("admits malformed timestamps using local time without poisoning the cursor", async () => {
+    const store = memoryStore<never>();
+    const malformed = message({ id: "bad_timestamp", timestamp: 1_100 }) as AgentMail.MessageItem;
+    (malformed as { timestamp: unknown }).timestamp = new Date(Number.NaN);
+    const list = vi.fn(async () => ({ count: 1, messages: [malformed] }));
+    const session = await createAgentMailCatchUpSession({
+      account,
+      client: { inboxes: { messages: { list } } } as never,
+      store: store as never,
+      now: () => 1_000,
+    });
+    const receive = vi.fn(async () => undefined);
+
+    await session.run({ receive, abortSignal: new AbortController().signal });
+    expect(receive).toHaveBeenCalledWith(
+      expect.objectContaining({
+        messageId: "bad_timestamp",
+        receivedAt: 1_000,
+        arrivedAt: 1_000,
+      }),
+    );
+  });
+
+  it("does not advance the cursor beyond the sweep's fixed upper bound", async () => {
+    const store = memoryStore<never>();
+    const malformed = message({ id: "bad_timestamp", timestamp: 1_100 }) as AgentMail.MessageItem;
+    (malformed as { timestamp: unknown }).timestamp = new Date(Number.NaN);
+    const list = vi
+      .fn()
+      .mockResolvedValueOnce({ count: 1, messages: [malformed] })
+      .mockResolvedValueOnce({ count: 0, messages: [] });
+    let nowMs = 1_000_000;
+    const session = await createAgentMailCatchUpSession({
+      account,
+      client: { inboxes: { messages: { list } } } as never,
+      store: store as never,
+      now: () => nowMs,
+    });
+    nowMs = 2_000_000;
+    await session.run({
+      receive: async () => {
+        nowMs = 3_000_000;
+      },
+      abortSignal: new AbortController().signal,
+    });
+
+    await session.run({ receive: vi.fn(), abortSignal: new AbortController().signal });
+    expect(list).toHaveBeenLastCalledWith(
+      "inbox_1",
+      expect.objectContaining({
+        after: new Date(2_000_000 - AGENTMAIL_REST_CATCH_UP_OVERLAP_MS),
+      }),
+      expect.any(Object),
+    );
+  });
+
+  it("clamps a future message timestamp before advancing the high-water cursor", async () => {
+    const store = memoryStore<never>();
+    const nowMs = 1_000_000;
+    const list = vi
+      .fn()
+      .mockResolvedValueOnce({
+        count: 1,
+        messages: [message({ id: "future", timestamp: nowMs + 60 * 60_000 })],
+      })
+      .mockResolvedValueOnce({ count: 0, messages: [] });
+    const session = await createAgentMailCatchUpSession({
+      account,
+      client: { inboxes: { messages: { list } } } as never,
+      store: store as never,
+      now: () => nowMs,
+    });
+    const receive = vi.fn(async () => undefined);
+
+    await session.run({ receive, abortSignal: new AbortController().signal });
+    expect(list).toHaveBeenNthCalledWith(
+      1,
+      "inbox_1",
+      expect.objectContaining({ before: new Date(nowMs + 1) }),
+      expect.any(Object),
+    );
+    await session.run({ receive, abortSignal: new AbortController().signal });
+    expect(list).toHaveBeenLastCalledWith(
+      "inbox_1",
+      expect.objectContaining({
+        after: new Date(nowMs - AGENTMAIL_REST_CATCH_UP_OVERLAP_MS),
+      }),
+      expect.any(Object),
     );
   });
 

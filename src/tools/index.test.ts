@@ -45,7 +45,10 @@ type RegisteredTool = {
   ) => Promise<unknown>;
 };
 
-function registerTools(pluginConfig: Record<string, unknown> = {}): RegisteredTool[] {
+function registerTools(
+  pluginConfig: Record<string, unknown> = {},
+  hostConfig: Record<string, unknown> = {},
+): RegisteredTool[] {
   const registered: RegisteredTool[] = [];
   const register = entry.register as unknown as (api: {
     pluginConfig: Record<string, unknown>;
@@ -54,16 +57,21 @@ function registerTools(pluginConfig: Record<string, unknown> = {}): RegisteredTo
 
   register({
     pluginConfig,
+    config: hostConfig,
     registerTool(tool) {
       registered.push(tool);
     },
-  });
+  } as never);
 
   return registered;
 }
 
-function findTool(name: string, config?: Record<string, unknown>): RegisteredTool {
-  const found = registerTools(config).find((tool) => tool.name === name);
+function findTool(
+  name: string,
+  config?: Record<string, unknown>,
+  hostConfig?: Record<string, unknown>,
+): RegisteredTool {
+  const found = registerTools(config, hostConfig).find((tool) => tool.name === name);
   if (!found) {
     throw new Error(`Tool not registered: ${name}`);
   }
@@ -115,6 +123,52 @@ describe("agentmail", () => {
       { limit: 5 },
       { abortSignal: signal },
     );
+  });
+
+  it("uses the channel-configured API key when the environment is unset", async () => {
+    vi.stubEnv("AGENTMAIL_API_KEY", "   ");
+    sdk.inboxes.list.mockResolvedValue({ count: 0, inboxes: [] });
+    const tool = findTool(
+      "agentmail_list_inboxes",
+      {},
+      {
+        channels: {
+          agentmail: {
+            apiKey: "am_channel",
+            inboxId: "Agent@AgentMail.TO",
+          },
+        },
+      },
+    );
+
+    await tool.execute("call-channel-key", {});
+
+    expect(sdk.constructor).toHaveBeenCalledWith({ apiKey: "am_channel" });
+  });
+
+  it("falls back to the environment when channel secret resolution is unavailable", async () => {
+    vi.stubEnv("AGENTMAIL_API_KEY", "am_env_fallback");
+    sdk.inboxes.list.mockResolvedValue({ count: 0, inboxes: [] });
+    const tool = findTool(
+      "agentmail_list_inboxes",
+      {},
+      {
+        channels: {
+          agentmail: {
+            apiKey: {
+              source: "env",
+              provider: "agentmail",
+              id: "UNRESOLVED_AGENTMAIL_API_KEY",
+            },
+            inboxId: "agent@agentmail.to",
+          },
+        },
+      },
+    );
+
+    await tool.execute("call-secret-fallback", {});
+
+    expect(sdk.constructor).toHaveBeenCalledWith({ apiKey: "am_env_fallback" });
   });
 
   it("sends a message with idempotency and cancellation options", async () => {
@@ -170,7 +224,7 @@ describe("agentmail", () => {
     const tool = findTool("agentmail_list_inboxes");
 
     await expect(tool.execute("call-4", {})).rejects.toThrow(
-      "Set the AGENTMAIL_API_KEY environment variable",
+      "Configure channels.agentmail.apiKey or set AGENTMAIL_API_KEY",
     );
     expect(sdk.constructor).not.toHaveBeenCalled();
   });

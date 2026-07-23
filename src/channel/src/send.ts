@@ -12,6 +12,8 @@ import { createAgentMailClient } from "./client.js";
 import { sha256Hex } from "./digest.js";
 import { isAgentMailSenderAllowed, parseSingleFromMailbox } from "./mailbox.js";
 import { AgentMailMediaPolicyError, loadAgentMailOutboundAttachments } from "./media.js";
+import { agentMailInboxIdsEqual } from "./received-message.js";
+import { HYDRATION_NOT_FOUND_RETRY_WINDOW_MS } from "./inbound.js";
 
 // A media-size policy violation is genuinely terminal: the same payload will always exceed the
 // limit, so retrying the reply is pointless.
@@ -33,8 +35,12 @@ function isHostLocalMediaFailure(error: unknown): boolean {
 
 // A 404 while re-hydrating the triggering message means it was deleted; the reply can never be sent,
 // so fail fast instead of consuming the bounded retry budget before dead-lettering.
-function isDeletedTriggerFailure(error: unknown): boolean {
-  return error instanceof AgentMailError && error.statusCode === 404;
+function isDeletedTriggerFailure(error: unknown, recoveryAgeMs: number): boolean {
+  return (
+    error instanceof AgentMailError &&
+    error.statusCode === 404 &&
+    recoveryAgeMs >= HYDRATION_NOT_FOUND_RETRY_WINDOW_MS
+  );
 }
 
 // Transient failures during reconciliation (provider 5xx/throttling or network) resolve on their
@@ -156,7 +162,7 @@ async function sendBoundAgentMailReply(
   // inbound, preventing an allowlisted sender from redirecting the agent reply.
   const triggeringMessage = await client.inboxes.messages.get(account.inboxId, triggeringMessageId);
   if (
-    triggeringMessage.inboxId !== account.inboxId ||
+    !agentMailInboxIdsEqual(triggeringMessage.inboxId, account.inboxId) ||
     triggeringMessage.messageId !== triggeringMessageId
   ) {
     throw new Error("AgentMail reply target did not hydrate to the configured inbox and message.");
@@ -249,7 +255,16 @@ export async function reconcileAgentMailUnknownSend(
     return { status: "not_sent" };
   }
   const rendered = ctx.renderedBatchPlan?.items[0];
-  const triggeringMessageId = parseAgentMailMessageTarget(ctx.to);
+  const normalizedTarget = normalizeAgentMailTarget(ctx.to);
+  if (!normalizedTarget) {
+    return {
+      status: "unresolved",
+      error:
+        "AgentMail target must be message:<messageId>; new threads and recipients are not supported.",
+      retryable: false,
+    };
+  }
+  const triggeringMessageId = normalizedTarget.slice(TARGET_PREFIX.length);
   if (ctx.effectiveReplyToId !== triggeringMessageId) {
     return {
       status: "unresolved",
@@ -268,11 +283,12 @@ export async function reconcileAgentMailUnknownSend(
   }
   // A rendered plan is authoritative even when its media list is empty: capability filtering may
   // intentionally have removed media that still appears on the original queued payload.
-  const mediaUrls = rendered
+  const mediaUrls = (rendered
     ? [...rendered.mediaUrls]
-    : [payload.mediaUrl, ...(payload.mediaUrls ?? [])].filter((value): value is string =>
-        Boolean(value),
-      );
+    : [payload.mediaUrl, ...(payload.mediaUrls ?? [])]
+  ).filter(
+    (value): value is string => typeof value === "string" && value.trim().length > 0,
+  );
   const text = rendered?.text ?? payload.text ?? "";
   const recoveredPayload = { ...payload, text };
   delete recoveredPayload.mediaUrl;
@@ -306,13 +322,17 @@ export async function reconcileAgentMailUnknownSend(
     if (isTerminalMediaPolicyFailure(error)) {
       return { status: "unresolved", error: error.message, retryable: false };
     }
-    if (isDeletedTriggerFailure(error)) {
-      // The triggering message is gone; retrying cannot succeed. Fail fast.
+    if (isDeletedTriggerFailure(error, recoveryAgeMs)) {
+      // A 404 that persists beyond the provider projection window is treated as deletion.
       return { status: "unresolved", error: errorText(error), retryable: false };
     }
     // Host-local media access (dropped recovery handles) and transient hydration/provider failures
     // both resolve on a later attempt, so keep the queue retrying rather than throwing out.
-    if (isHostLocalMediaFailure(error) || isTransientReplyFailure(error)) {
+    if (
+      isHostLocalMediaFailure(error) ||
+      isTransientReplyFailure(error) ||
+      (error instanceof AgentMailError && error.statusCode === 404)
+    ) {
       return { status: "unresolved", error: errorText(error), retryable: true };
     }
     throw error;

@@ -6,12 +6,18 @@ import {
 import type { ResolvedAgentMailAccount } from "./types.js";
 
 const mocks = vi.hoisted(() => ({
-  routes: [] as Array<{ path: string; unregister: ReturnType<typeof vi.fn> }>,
+  routes: [] as Array<{
+    path: string;
+    replaceExisting?: boolean;
+    unregister: ReturnType<typeof vi.fn>;
+  }>,
   startWebSocket: vi.fn(async () => undefined),
   processIngress: vi.fn(async () => "accepted"),
   catchUpRun: vi.fn(async () => undefined),
   catchUpRequest: vi.fn(),
   catchUpSettle: vi.fn(async () => undefined),
+  createCatchUpSession: vi.fn(async () => ({ run: vi.fn(async () => undefined) })),
+  registerError: false,
   webhookReceives: [] as Array<(record: unknown) => Promise<void>>,
 }));
 const apiVal = "key";
@@ -32,9 +38,18 @@ vi.mock("openclaw/plugin-sdk/channel-outbound", () => ({
 }));
 
 vi.mock("openclaw/plugin-sdk/webhook-ingress", () => ({
-  registerPluginHttpRoute: ({ path }: { path: string }) => {
+  registerPluginHttpRoute: ({
+    path,
+    replaceExisting,
+  }: {
+    path: string;
+    replaceExisting?: boolean;
+  }) => {
+    if (mocks.registerError) {
+      throw new Error("route registration failed");
+    }
     const unregister = vi.fn();
-    mocks.routes.push({ path, unregister });
+    mocks.routes.push({ path, replaceExisting, unregister });
     return unregister;
   },
 }));
@@ -44,7 +59,7 @@ vi.mock("./durable-receive.js", () => ({
 }));
 
 vi.mock("./catch-up.js", () => ({
-  createAgentMailCatchUpSession: vi.fn(async () => ({ run: mocks.catchUpRun })),
+  createAgentMailCatchUpSession: mocks.createCatchUpSession,
   createAgentMailCatchUpSupervisor: vi.fn(() => ({
     request: mocks.catchUpRequest,
     requestDeep: mocks.catchUpRequest,
@@ -196,6 +211,7 @@ describe("AgentMail gateway route ownership", () => {
       abortSignal: secondAbort.signal,
     });
     await vi.waitFor(() => expect(mocks.routes).toHaveLength(2));
+    expect(mocks.routes[1]?.replaceExisting).toBe(true);
     expect(mocks.routes[0]?.unregister).toHaveBeenCalledOnce();
 
     firstAbort.abort();
@@ -212,6 +228,173 @@ describe("AgentMail gateway route ownership", () => {
     secondAbort.abort();
     thirdAbort.abort();
     await Promise.all([second, third]);
+  });
+
+  it.each(["initialization", "registration"])(
+    "releases route ownership when webhook %s fails",
+    async (failure) => {
+      mocks.routes.length = 0;
+      mocks.registerError = failure === "registration";
+      mocks.createCatchUpSession.mockReset();
+      mocks.createCatchUpSession.mockResolvedValue({ run: mocks.catchUpRun });
+      if (failure === "initialization") {
+        mocks.createCatchUpSession.mockRejectedValueOnce(new Error("state store unavailable"));
+      }
+      const path = `/webhooks/agentmail/failure-${failure}`;
+      await expect(
+        startAgentMailGatewayAccount({
+          cfg: {},
+          account: account("first-owner", path),
+          channelRuntime: {} as never,
+          abortSignal: new AbortController().signal,
+        }),
+      ).rejects.toThrow();
+
+      mocks.registerError = false;
+      const controller = new AbortController();
+      const replacement = startAgentMailGatewayAccount({
+        cfg: {},
+        account: account("replacement-owner", path),
+        channelRuntime: {} as never,
+        abortSignal: controller.signal,
+      });
+      await vi.waitFor(() => expect(mocks.routes.some((route) => route.path === path)).toBe(true));
+      controller.abort();
+      await replacement;
+    },
+  );
+
+  it.each(["initialization", "registration"])(
+    "keeps the predecessor route active when replacement %s fails",
+    async (failure) => {
+      mocks.routes.length = 0;
+      mocks.registerError = false;
+      mocks.createCatchUpSession.mockReset();
+      mocks.createCatchUpSession.mockResolvedValue({ run: mocks.catchUpRun });
+      const controller = new AbortController();
+      const running = startAgentMailGatewayAccount({
+        cfg: {},
+        account: account("support", "/webhooks/agentmail/stable"),
+        channelRuntime: {} as never,
+        abortSignal: controller.signal,
+      });
+      await vi.waitFor(() => expect(mocks.routes).toHaveLength(1));
+
+      if (failure === "initialization") {
+        mocks.createCatchUpSession.mockRejectedValueOnce(new Error("state store unavailable"));
+      } else {
+        mocks.registerError = true;
+      }
+      await expect(
+        startAgentMailGatewayAccount({
+          cfg: {},
+          account: account("support", "/webhooks/agentmail/replacement"),
+          channelRuntime: {} as never,
+          abortSignal: new AbortController().signal,
+        }),
+      ).rejects.toThrow();
+      mocks.registerError = false;
+      expect(mocks.routes[0]?.unregister).not.toHaveBeenCalled();
+
+      controller.abort();
+      await running;
+      expect(mocks.routes[0]?.unregister).toHaveBeenCalledOnce();
+    },
+  );
+
+  it("lets a newer startup proceed after an older concurrent startup fails", async () => {
+    mocks.routes.length = 0;
+    mocks.registerError = false;
+    mocks.createCatchUpSession.mockReset();
+    let rejectOlder!: (error: Error) => void;
+    mocks.createCatchUpSession
+      .mockImplementationOnce(
+        async () =>
+          await new Promise<never>((_resolve, reject) => {
+            rejectOlder = reject;
+          }),
+      )
+      .mockResolvedValueOnce({ run: mocks.catchUpRun });
+
+    const olderAbort = new AbortController();
+    const newerAbort = new AbortController();
+    const older = startAgentMailGatewayAccount({
+      cfg: {},
+      account: account("support", "/webhooks/agentmail/race"),
+      channelRuntime: {} as never,
+      abortSignal: olderAbort.signal,
+    });
+    const olderResult = older.catch((error: unknown) => error);
+    await vi.waitFor(() => expect(mocks.createCatchUpSession).toHaveBeenCalledTimes(1));
+    const newer = startAgentMailGatewayAccount({
+      cfg: {},
+      account: account("support", "/webhooks/agentmail/race"),
+      channelRuntime: {} as never,
+      abortSignal: newerAbort.signal,
+    });
+    // Per-account startup is serialized: the replacement cannot overtake the unresolved older
+    // initialization and leave both invocations parked.
+    expect(mocks.routes).toHaveLength(0);
+
+    rejectOlder(new Error("older startup failed"));
+    await expect(olderResult).resolves.toEqual(
+      expect.objectContaining({ message: "older startup failed" }),
+    );
+    await vi.waitFor(() => expect(mocks.routes).toHaveLength(1));
+    await expect(
+      startAgentMailGatewayAccount({
+        cfg: {},
+        account: account("billing", "/webhooks/agentmail/race"),
+        channelRuntime: {} as never,
+        abortSignal: new AbortController().signal,
+      }),
+    ).rejects.toThrow("already registered by account support");
+
+    olderAbort.abort();
+    newerAbort.abort();
+    await newer;
+  });
+
+  it("serializes different-path replacements without leaking the older route", async () => {
+    mocks.routes.length = 0;
+    mocks.registerError = false;
+    mocks.createCatchUpSession.mockReset();
+    let resolveOlder!: (session: { run: typeof mocks.catchUpRun }) => void;
+    mocks.createCatchUpSession
+      .mockImplementationOnce(
+        async () =>
+          await new Promise<{ run: typeof mocks.catchUpRun }>((resolve) => {
+            resolveOlder = resolve;
+          }),
+      )
+      .mockResolvedValueOnce({ run: mocks.catchUpRun });
+
+    const olderAbort = new AbortController();
+    const newerAbort = new AbortController();
+    const older = startAgentMailGatewayAccount({
+      cfg: {},
+      account: account("support", "/webhooks/agentmail/older"),
+      channelRuntime: {} as never,
+      abortSignal: olderAbort.signal,
+    });
+    await vi.waitFor(() => expect(mocks.createCatchUpSession).toHaveBeenCalledTimes(1));
+    const newer = startAgentMailGatewayAccount({
+      cfg: {},
+      account: account("support", "/webhooks/agentmail/newer"),
+      channelRuntime: {} as never,
+      abortSignal: newerAbort.signal,
+    });
+    expect(mocks.createCatchUpSession).toHaveBeenCalledTimes(1);
+
+    resolveOlder({ run: mocks.catchUpRun });
+    await vi.waitFor(() => expect(mocks.routes).toHaveLength(2));
+    expect(mocks.routes[0]?.unregister).toHaveBeenCalledOnce();
+
+    olderAbort.abort();
+    newerAbort.abort();
+    await Promise.all([older, newer]);
+    expect(mocks.routes[0]?.unregister).toHaveBeenCalledOnce();
+    expect(mocks.routes[1]?.unregister).toHaveBeenCalledOnce();
   });
 });
 

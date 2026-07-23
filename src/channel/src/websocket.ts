@@ -1,4 +1,5 @@
 import type { AgentMail, AgentMailClient } from "agentmail";
+import { waitUntilAbort } from "openclaw/plugin-sdk/channel-outbound";
 import {
   createAgentMailCatchUpSession,
   createAgentMailCatchUpSupervisor,
@@ -9,6 +10,10 @@ import { type AgentMailLog, errorText } from "./log.js";
 import { createAgentMailClient } from "./client.js";
 import { AgentMailIngressCapacityError } from "./ingress.js";
 import { createBackoff, waitForRetry } from "./retry.js";
+import {
+  agentMailInboxIdsEqual,
+  resolveAgentMailTimestampMs,
+} from "./received-message.js";
 import type { AgentMailIngressRecord, ResolvedAgentMailAccount } from "./types.js";
 
 const AGENTMAIL_WEBSOCKET_LIVE_QUEUE_MAX = 32;
@@ -25,16 +30,13 @@ function isReceivedEvent(value: unknown): value is AgentMail.MessageReceivedEven
   if (event.type !== "event" || event.eventType !== "message.received") {
     return false;
   }
-  // Fully validate the message shape here so downstream field access (inboxId, messageId,
-  // timestamp.getTime()) cannot throw on a malformed frame. A malformed live event is ignored; REST
-  // catch-up still recovers the message from the provider.
+  // Validate the stable identifier shape here. The shared received-message predicate below owns
+  // inbox, label, and timestamp validation for both WebSocket and REST recovery.
   const message = event.message as Partial<AgentMail.Message> | undefined;
   return Boolean(
     message &&
       typeof message.inboxId === "string" &&
-      typeof message.messageId === "string" &&
-      message.timestamp instanceof Date &&
-      !Number.isNaN(message.timestamp.getTime()),
+      typeof message.messageId === "string",
   );
 }
 
@@ -163,8 +165,16 @@ export async function startAgentMailWebSocket(params: {
     if (!isReceivedEvent(event)) {
       return;
     }
-    if (event.message.inboxId !== params.account.inboxId) {
+    if (!agentMailInboxIdsEqual(event.message.inboxId, params.account.inboxId)) {
       params.log?.warn?.("AgentMail WebSocket ignored an event for the wrong inbox");
+      return;
+    }
+    // The event type itself is authoritative for live receipt. Provider label projection can lag
+    // the WebSocket frame; durable hydration already retries that condition safely.
+    const messageTimestampMs = resolveAgentMailTimestampMs(event.message.timestamp);
+    if (messageTimestampMs === null) {
+      params.log?.warn?.("AgentMail WebSocket received an event with an invalid timestamp");
+      catchUpSupervisor.request();
       return;
     }
     if (queuedMessageIds.has(event.message.messageId)) {
@@ -180,10 +190,10 @@ export async function startAgentMailWebSocket(params: {
     queuedMessageIds.add(event.message.messageId);
     liveQueue.push({
       accountId: params.account.accountId,
-      inboxId: event.message.inboxId,
+      inboxId: params.account.inboxId,
       messageId: event.message.messageId,
       transport: "websocket",
-      receivedAt: event.message.timestamp.getTime(),
+      receivedAt: messageTimestampMs,
       arrivedAt: Date.now(),
     });
     runLiveWorker();
@@ -196,13 +206,7 @@ export async function startAgentMailWebSocket(params: {
   //
   // One shared abort promise for the whole loop: abort is terminal, so attaching a fresh listener
   // per reconnect would leak closures on the long-lived signal (listener-limit warnings under churn).
-  const aborted = new Promise<void>((resolve) => {
-    if (params.abortSignal.aborted) {
-      resolve();
-      return;
-    }
-    params.abortSignal.addEventListener("abort", () => resolve(), { once: true });
-  });
+  const aborted = waitUntilAbort(params.abortSignal);
   const connectionLoop = (async () => {
     let reconnectAttempt = 0;
     while (!params.abortSignal.aborted) {
@@ -246,14 +250,20 @@ export async function startAgentMailWebSocket(params: {
         catchUpSupervisor.request();
       };
       const closed = new Promise<void>((resolve) => {
+        let settled = false;
+        const settleClosed = () => {
+          if (settled) {
+            return;
+          }
+          settled = true;
+          subscribedForCurrentConnection = false;
+          resolve();
+        };
         socket.on("open", () => {
           reconnectAttempt = 0;
           subscribe();
         });
-        socket.on("close", () => {
-          subscribedForCurrentConnection = false;
-          resolve();
-        });
+        socket.on("close", settleClosed);
         socket.on("error", (error) => {
           params.log?.error?.(
             `AgentMail WebSocket error for account ${params.account.accountId}: ${errorText(error)}`,
@@ -261,6 +271,9 @@ export async function startAgentMailWebSocket(params: {
           // Parsing/transport errors may not close the socket. Recover authoritative events even
           // when the socket stays connected and emits no close.
           catchUpSupervisor.request();
+          // Fatal socket errors do not always emit a later close. Treat either event as terminal
+          // for this connection so the outer loop recreates it.
+          settleClosed();
         });
         socket.on("message", handleMessage);
       });

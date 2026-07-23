@@ -7,7 +7,11 @@ import {
   AGENTMAIL_DURABLE_COMPLETED_TTL_MS,
   AgentMailIngressCapacityError,
 } from "./durable-receive.js";
-import { AGENTMAIL_RECEIVED_LABEL } from "./inbound.js";
+import {
+  AGENTMAIL_RECEIVED_LABEL,
+  isReceivedAgentMailMessage,
+  resolveReceivedAgentMailMessageTimestampMs,
+} from "./received-message.js";
 import { createBackoff, waitForRetry } from "./retry.js";
 import { getAgentMailRuntime } from "./runtime.js";
 import type { AgentMailIngressRecord, ResolvedAgentMailAccount } from "./types.js";
@@ -175,20 +179,12 @@ function normalizeCursor(value: unknown): AgentMailCatchUpCursor | null {
   };
 }
 
-function isReceivedMessage(message: AgentMail.MessageItem, inboxId: string): boolean {
-  return (
-    message.inboxId === inboxId &&
-    (Array.isArray(message.labels) ? message.labels : []).some(
-      (label) => String(label).toLocaleLowerCase("en-US") === AGENTMAIL_RECEIVED_LABEL,
-    )
-  );
-}
-
 async function persistCursor(params: {
   store: PluginStateKeyedStore<AgentMailCatchUpCursor>;
   key: string;
   baselineAtMs: number;
   highWaterAtMs: number;
+  upperBoundAtMs: number;
   established: boolean;
 }): Promise<void> {
   const update = params.store.update;
@@ -198,7 +194,13 @@ async function persistCursor(params: {
       return {
         version: CURSOR_VERSION,
         baselineAtMs: current?.baselineAtMs ?? params.baselineAtMs,
-        highWaterAtMs: Math.max(current?.highWaterAtMs ?? 0, params.highWaterAtMs),
+        highWaterAtMs: Math.max(
+          current?.baselineAtMs ?? params.baselineAtMs,
+          Math.min(
+            params.upperBoundAtMs,
+            Math.max(current?.highWaterAtMs ?? 0, params.highWaterAtMs),
+          ),
+        ),
         established: current?.established === true || params.established,
       };
     });
@@ -208,7 +210,13 @@ async function persistCursor(params: {
   await params.store.register(params.key, {
     version: CURSOR_VERSION,
     baselineAtMs: current?.baselineAtMs ?? params.baselineAtMs,
-    highWaterAtMs: Math.max(current?.highWaterAtMs ?? 0, params.highWaterAtMs),
+    highWaterAtMs: Math.max(
+      current?.baselineAtMs ?? params.baselineAtMs,
+      Math.min(
+        params.upperBoundAtMs,
+        Math.max(current?.highWaterAtMs ?? 0, params.highWaterAtMs),
+      ),
+    ),
     established: current?.established === true || params.established,
   });
 }
@@ -245,6 +253,9 @@ export async function createAgentMailCatchUpSession(params: {
       if (!storedCursor) {
         throw new Error("AgentMail WebSocket catch-up cursor is unavailable");
       }
+      const runAtMs = now();
+      const scanUpperBoundAtMs = runAtMs;
+      const effectiveHighWaterAtMs = Math.min(storedCursor.highWaterAtMs, runAtMs);
       // Never scan below the dedupe horizon on ANY sweep. Completed-message tombstones expire after
       // AGENTMAIL_DURABLE_COMPLETED_TTL_MS; once they do, a message still in scan range would be
       // re-admitted as a duplicate turn. The floor is applied to the normal high-water sweep too:
@@ -254,13 +265,13 @@ export async function createAgentMailCatchUpSession(params: {
       // The deep sweep lists from max(baseline, dedupeFloor): it recovers back-dated mail within the
       // dedupe window and since monitoring began, but deliberately does not scan before the baseline,
       // which would re-inject pre-monitoring history that has no tombstone protection.
-      const dedupeFloorMs = now() - AGENTMAIL_DURABLE_COMPLETED_TTL_MS;
+      const dedupeFloorMs = runAtMs - AGENTMAIL_DURABLE_COMPLETED_TTL_MS;
       const baseAfterMs =
         sinceBaseline || !storedCursor.established
           ? storedCursor.baselineAtMs
-          : storedCursor.highWaterAtMs - AGENTMAIL_REST_CATCH_UP_OVERLAP_MS;
+          : effectiveHighWaterAtMs - AGENTMAIL_REST_CATCH_UP_OVERLAP_MS;
       const afterMs = Math.max(0, baseAfterMs, dedupeFloorMs);
-      let highWaterAtMs = storedCursor.highWaterAtMs;
+      let highWaterAtMs = effectiveHighWaterAtMs;
       let pageCursor: string | undefined;
       let admitted = 0;
       do {
@@ -271,6 +282,10 @@ export async function createAgentMailCatchUpSession(params: {
             ...(pageCursor ? { pageToken: pageCursor } : {}),
             labels: [AGENTMAIL_RECEIVED_LABEL],
             after: new Date(afterMs),
+            // Do not repeatedly scan provider-clock-skewed future messages. Add one millisecond so
+            // an exclusive provider bound includes messages stamped exactly at runAtMs and so a
+            // fresh cursor never sends identical after/before values.
+            before: new Date(scanUpperBoundAtMs + 1),
             ascending: true,
             includeSpam: false,
             includeBlocked: false,
@@ -284,16 +299,21 @@ export async function createAgentMailCatchUpSession(params: {
           if (abortSignal.aborted) {
             return;
           }
-          if (!isReceivedMessage(message, params.account.inboxId)) {
+          if (!isReceivedAgentMailMessage(message, params.account.inboxId)) {
             continue;
           }
+          // Invalid provider time must not turn a missed live event into a permanent drop. Admit
+          // with local observation time; durable message-id dedupe keeps overlap scans safe.
+          const messageTimestampMs =
+            resolveReceivedAgentMailMessageTimestampMs(message, params.account.inboxId) ??
+            scanUpperBoundAtMs;
           try {
             await receive({
               accountId: params.account.accountId,
               inboxId: params.account.inboxId,
               messageId: message.messageId,
               transport: "rest",
-              receivedAt: message.timestamp.getTime(),
+              receivedAt: messageTimestampMs,
               arrivedAt: now(),
             });
           } catch (error) {
@@ -309,7 +329,10 @@ export async function createAgentMailCatchUpSession(params: {
             throw error;
           }
           admitted += 1;
-          highWaterAtMs = Math.max(highWaterAtMs, message.timestamp.getTime());
+          highWaterAtMs = Math.max(
+            highWaterAtMs,
+            Math.min(messageTimestampMs, scanUpperBoundAtMs),
+          );
           pageAdvanced = true;
         }
         if (pageAdvanced) {
@@ -320,6 +343,7 @@ export async function createAgentMailCatchUpSession(params: {
             key,
             baselineAtMs: storedCursor.baselineAtMs,
             highWaterAtMs,
+            upperBoundAtMs: scanUpperBoundAtMs,
             established: false,
           });
         }
@@ -334,6 +358,7 @@ export async function createAgentMailCatchUpSession(params: {
         key,
         baselineAtMs: storedCursor.baselineAtMs,
         highWaterAtMs,
+        upperBoundAtMs: scanUpperBoundAtMs,
         established: true,
       });
       if (admitted > 0) {

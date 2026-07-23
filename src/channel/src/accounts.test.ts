@@ -25,7 +25,7 @@ describe("AgentMail account config", () => {
       channels: {
         agentmail: {
           apiKey: paddedApi,
-          inboxId: " inbox_123 ",
+          inboxId: " Agent@AgentMail.TO ",
           webhookSecret: paddedHook,
         },
       },
@@ -34,7 +34,7 @@ describe("AgentMail account config", () => {
     expect(account).toMatchObject({
       accountId: "default",
       apiKey: apiVal,
-      inboxId: "inbox_123",
+      inboxId: "Agent@AgentMail.TO",
       webhookSecret: hookVal,
       webhookPath: "/webhooks/agentmail",
       dmPolicy: "allowlist",
