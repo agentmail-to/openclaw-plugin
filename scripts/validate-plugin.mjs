@@ -1,11 +1,11 @@
 // Real OpenClaw host validation: link-install the built plugin and confirm the host actually loads
-// it with both capabilities (the AgentMail channel and all declared tools). This catches invalid
-// manifest/contract/schema shapes that a pure staleness check cannot — they would otherwise only
-// surface at user startup. Kept separate from `plugin:check` (manifest staleness).
+// its AgentMail channel and CLI command, then execute the packaged CLI. This catches invalid
+// manifest/schema/command shapes and missing executables that a pure staleness check cannot.
+// Kept separate from `plugin:check` (manifest staleness).
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { delimiter, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const root = fileURLToPath(new URL("..", import.meta.url));
@@ -17,9 +17,11 @@ const openclaw = fileURLToPath(new URL("../node_modules/.bin/openclaw", import.m
 const stateDir = mkdtempSync(join(tmpdir(), "agentmail-plugin-validate-"));
 const childEnv = {
   ...process.env,
+  AGENTMAIL_API_KEY: process.env.AGENTMAIL_API_KEY || "am_plugin_validation",
   OPENCLAW_STATE_DIR: stateDir,
   OPENCLAW_CONFIG_DIR: stateDir,
   OPENCLAW_HOME: stateDir,
+  PATH: `${dirname(openclaw)}${delimiter}${process.env.PATH || ""}`,
 };
 
 function run(args) {
@@ -66,15 +68,44 @@ if (!/Status:\s*loaded/.test(inspect)) {
 if (!/channel:\s*agentmail/.test(inspect)) {
   fail("plugin manifest did not register the agentmail channel", inspect);
 }
-const requiredTools = [
-  "agentmail_list_inboxes",
-  "agentmail_create_inbox",
-  "agentmail_send_message",
-  "agentmail_reply_to_message",
-];
-const missing = requiredTools.filter((tool) => !inspect.includes(tool));
-if (missing.length > 0) {
-  fail(`plugin did not register expected tools: ${missing.join(", ")}`, inspect);
+if (!/CLI commands:\s*[\s\S]*\bagentmail\b/.test(inspect)) {
+  fail("plugin runtime did not register the agentmail CLI command", inspect);
+}
+if (/agentmail_list_inboxes/.test(inspect)) {
+  fail("plugin still registered the retired fixed AgentMail tool surface", inspect);
+}
+
+const expectedCliVersion = readFileSync(
+  new URL("../vendor/agentmail/VERSION", import.meta.url),
+  "utf8",
+).trim();
+let cliVersion = "";
+try {
+  cliVersion = run(["agentmail", "--", "--version"]);
+} catch (error) {
+  fail(
+    "openclaw could not execute the bundled AgentMail CLI",
+    error.stdout || error.stderr || String(error),
+  );
+}
+if (!cliVersion.includes(expectedCliVersion)) {
+  fail(
+    `bundled AgentMail CLI version did not match ${expectedCliVersion}`,
+    cliVersion,
+  );
+}
+
+let skills = "";
+try {
+  skills = run(["skills", "list", "--eligible"]);
+} catch (error) {
+  fail(
+    "openclaw could not list eligible skills",
+    error.stdout || error.stderr || String(error),
+  );
+}
+if (!/\bagentmail\b/i.test(skills)) {
+  fail("plugin did not expose its AgentMail CLI skill", skills);
 }
 
 // Surface any load diagnostics the host reports for this plugin.
@@ -90,4 +121,6 @@ try {
   // doctor is best-effort; the inspect assertions above are the authoritative gate.
 }
 
-console.log("plugin:validate OK — host loaded the AgentMail channel and tools.");
+console.log(
+  `plugin:validate OK — host loaded the AgentMail channel and AgentMail CLI ${expectedCliVersion}.`,
+);

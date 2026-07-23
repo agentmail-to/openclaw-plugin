@@ -1,36 +1,31 @@
-// Generates openclaw.plugin.json for the combined AgentMail plugin (tool extension + channel
-// extension). The stock `openclaw plugins build` codegen only understands tool-plugin metadata, so
-// it cannot own a manifest that also declares a channel. This script derives the tool half from the
-// compiled tool entry's metadata and merges the channel declarations (channels, channelEnvVars,
-// channelConfigs) so both surfaces load from one manifest.
+// Generates openclaw.plugin.json for the combined AgentMail plugin (CLI-backed skill + channel
+// extension). The stock `openclaw plugins build` codegen only understands tool-plugin metadata,
+// while this plugin intentionally exposes the evolving AgentMail API through its bundled CLI.
+// This script owns the manifest so the CLI config, plugin skill, and channel declarations remain
+// one installable unit.
 //
 // Usage:
 //   node scripts/build-manifest.mjs            # write openclaw.plugin.json
 //   node scripts/build-manifest.mjs --check    # fail if the on-disk manifest is out of date
 import { readFileSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { getToolPluginMetadata } from "openclaw/plugin-sdk/tool-plugin";
-import toolEntry from "../dist/tools/index.js";
+import { agentMailCliConfigJsonSchema } from "../dist/cli/config.js";
 import { AgentMailChannelConfigSchema } from "../dist/channel/src/config-schema.js";
 
 const MANIFEST_PATH = fileURLToPath(new URL("../openclaw.plugin.json", import.meta.url));
 
 const DESCRIPTION =
-  "AgentMail for OpenClaw: email tools plus a durable, allowlisted, reply-only email channel.";
-
-const toolMetadata = getToolPluginMetadata(toolEntry);
-if (!toolMetadata) {
-  throw new Error("Tool plugin metadata is unavailable from ./dist/tools/index.js");
-}
+  "AgentMail for OpenClaw: a CLI-backed skill plus a durable, allowlisted, reply-only email channel.";
 
 const manifest = {
-  id: toolMetadata.id,
-  name: toolMetadata.name,
+  id: "agentmail",
+  name: "AgentMail",
   description: DESCRIPTION,
   version: JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")).version,
-  configSchema: toolMetadata.configSchema,
-  activation: toolMetadata.activation ?? { onStartup: true },
+  configSchema: agentMailCliConfigJsonSchema,
+  activation: { onStartup: true },
   channels: ["agentmail"],
+  skills: ["./skills"],
   channelEnvVars: {
     agentmail: ["AGENTMAIL_API_KEY", "AGENTMAIL_WEBHOOK_SECRET"],
   },
@@ -41,9 +36,6 @@ const manifest = {
       description: DESCRIPTION,
       uiHints: AgentMailChannelConfigSchema.uiHints,
     },
-  },
-  contracts: {
-    tools: toolMetadata.tools.map((tool) => tool.name),
   },
 };
 

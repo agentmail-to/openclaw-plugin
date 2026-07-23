@@ -1,7 +1,7 @@
 {
   "name": "@agentmail/agentmail",
   "version": "0.1.0",
-  "description": "AgentMail for OpenClaw: email tools plus a durable, allowlisted, reply-only email channel.",
+  "description": "AgentMail for OpenClaw: a CLI-backed skill plus a durable, allowlisted, reply-only email channel.",
   "type": "module",
   "private": false,
   "license": "MIT",
@@ -22,25 +22,27 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "plugin:build": "npm run build && node scripts/build-manifest.mjs",
+    "cli:prepare": "node scripts/prepare-agentmail-cli.mjs",
+    "plugin:build": "npm run build && npm run cli:prepare && node scripts/build-manifest.mjs",
     "plugin:check": "node scripts/build-manifest.mjs --check",
-    "plugin:validate": "npm run build && node scripts/build-manifest.mjs --check && node scripts/validate-plugin.mjs",
-    "prepack": "npm run plugin:validate",
+    "plugin:validate": "npm run build && npm run cli:prepare && node scripts/build-manifest.mjs --check && node scripts/validate-plugin.mjs",
+    "prepack": "npm run cli:prepare -- --all && npm run plugin:validate",
     "test": "vitest run --config ./vitest.config.ts"
   },
   "files": [
     "dist",
+    "skills",
+    "vendor",
     "openclaw.plugin.json",
-    "README.md"
+    "README.md",
+    "THIRD_PARTY_NOTICES.md"
   ],
   "peerDependencies": {
     "openclaw": ">=2026.7.2-beta.3"
   },
   "dependencies": {
     "agentmail": "^0.5.16",
-    "svix": "^1.96.1",
-    "typebox": "^1.1.38",
-    "zod": "^4.4.3"
+    "svix": "^1.96.1"
   },
   "devDependencies": {
     "openclaw": "2026.7.2-beta.3",
@@ -49,7 +51,7 @@
   },
   "openclaw": {
     "extensions": [
-      "./dist/tools/index.js",
+      "./dist/cli/index.js",
       "./dist/channel/index.js"
     ],
     "channel": {

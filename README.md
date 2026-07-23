@@ -2,7 +2,9 @@
 
 Give an OpenClaw agent an email address with [AgentMail](https://www.agentmail.to/). This package ships **two capabilities in one plugin**:
 
-- **Email tools** — the agent can create inboxes and read, search, send, reply, forward, and label email on demand.
+- **A CLI-backed AgentMail skill** — the agent uses the official AgentMail CLI bundled with the
+  plugin. It can discover and use new AgentMail API resources without waiting for this plugin to
+  add another fixed tool schema.
 - **An email channel** — a durable, allowlisted, **reply-only** email channel. Inbound email drives agent turns; the agent replies within the AgentMail thread. Ingress is committed durably before acknowledgement, senders are authorized against a default-deny allowlist, and replies stay bound to the triggering message (`replyAll: false`, no proactive threads, no arbitrary recipients).
 
 ## Requirements
@@ -10,6 +12,9 @@ Give an OpenClaw agent an email address with [AgentMail](https://www.agentmail.t
 - Node.js 22.22.3+, 24.15+, or 25.9+
 - OpenClaw 2026.7.2 (beta) or newer
 - An AgentMail API key from the [AgentMail console](https://console.agentmail.to/)
+
+The published plugin includes the official AgentMail CLI for supported macOS, Linux, and Windows
+architectures. A separate global CLI installation is not required.
 
 ## Install
 
@@ -28,22 +33,12 @@ For development, use `openclaw plugins install --link .` so OpenClaw loads this 
 
 Set `AGENTMAIL_API_KEY` in the environment that runs the OpenClaw Gateway. To enable **webhook** ingress for the channel, also set `AGENTMAIL_WEBHOOK_SECRET` (Svix-signed); without it the channel falls back to WebSocket ingress.
 
-OpenClaw can scope the secrets to this plugin in `~/.openclaw/openclaw.json`:
+For a managed Gateway, put them in `~/.openclaw/.env` so the channel and agent turns inherit the
+same credentials:
 
-```json5
-{
-  plugins: {
-    entries: {
-      agentmail: {
-        enabled: true,
-        env: {
-          AGENTMAIL_API_KEY: "am_...",
-          AGENTMAIL_WEBHOOK_SECRET: "whsec_...", // optional; enables webhook ingress
-        },
-      },
-    },
-  },
-}
+```dotenv
+AGENTMAIL_API_KEY=am_...
+AGENTMAIL_WEBHOOK_SECRET=whsec_...
 ```
 
 Keep keys out of source control. Restart the Gateway after installing or changing configuration:
@@ -53,14 +48,15 @@ openclaw gateway restart
 openclaw plugins inspect agentmail --runtime
 ```
 
-### Tool config (optional SDK settings)
+### CLI config
 
-> **Credentials:** the email **tools** authenticate only with the `AGENTMAIL_API_KEY` environment
-> variable, while the **channel** can also take an inline or resolved `apiKey` in `channels.agentmail`.
-> Always set `AGENTMAIL_API_KEY` in the Gateway environment so both surfaces are configured; a
-> channel-only inline key leaves the tools reporting AgentMail as unconfigured.
+> **Credentials:** the bundled CLI authenticates only with the `AGENTMAIL_API_KEY` environment
+> variable, while the **channel** can also take an inline or resolved `apiKey` in
+> `channels.agentmail`. Always set `AGENTMAIL_API_KEY` in the Gateway environment so both surfaces
+> are configured; a channel-only inline key leaves the CLI-backed skill unavailable.
 
-Optional AgentMail SDK settings for the **tools** belong under `plugins.entries.agentmail.config`:
+An optional API base URL override for the bundled CLI belongs under
+`plugins.entries.agentmail.config`:
 
 ```json5
 {
@@ -68,15 +64,16 @@ Optional AgentMail SDK settings for the **tools** belong under `plugins.entries.
     entries: {
       agentmail: {
         config: {
-          timeoutSeconds: 30,
-          maxRetries: 2,
-          // baseUrl: "https://api.agentmail.to/v0",
+          baseUrl: "https://api.agentmail.to/v0",
         },
       },
     },
   },
 }
 ```
+
+The previous `timeoutSeconds` and `maxRetries` tool settings remain accepted so existing
+configurations continue to load, but the bundled CLI does not use them.
 
 ### Channel config
 
@@ -103,33 +100,44 @@ Security defaults worth knowing:
 - `dmPolicy: "open"` requires `allowFrom` to include `"*"`.
 - Every reply re-hydrates the triggering message and re-authorizes its `From`, so an untrusted `Reply-To` cannot redirect delivery.
 
-## Tools
+## CLI-backed skill
 
-| Tool | Purpose |
-| --- | --- |
-| `agentmail_list_inboxes` | List available inboxes |
-| `agentmail_create_inbox` | Create an inbox, with optional idempotent `clientId` |
-| `agentmail_list_messages` | List and filter messages in an inbox |
-| `agentmail_search_messages` | Full-text search messages |
-| `agentmail_get_message` | Retrieve a complete message |
-| `agentmail_send_message` | Send text/HTML email with optional attachments |
-| `agentmail_reply_to_message` | Reply or reply-all in an existing thread |
-| `agentmail_forward_message` | Forward an existing message |
-| `agentmail_update_message_labels` | Add or remove labels, including `read`/`unread` |
+The plugin registers a passthrough command:
 
-Send, reply, and forward accept an optional `idempotencyKey` to make retries safe. Attachments can use Base64-encoded `content` or a public `url`.
+```bash
+openclaw agentmail -- --help
+openclaw agentmail -- --format json inboxes list
+openclaw agentmail -- --format json inboxes:messages send \
+  --inbox-id agent@agentmail.to \
+  --to person@example.com \
+  --subject "Hello" \
+  --text "Hello from OpenClaw"
+```
+
+Keep the `--` separator so OpenClaw forwards all following flags to AgentMail. The included skill
+uses JSON output, consults CLI help instead of guessing flags, and covers inboxes, messages,
+threads, drafts, webhooks, domains, pods, API keys, and future CLI resources.
+
+The CLI skill runs on the OpenClaw host because that is where its executable and credentials are
+installed. Sandboxed agents need permission to execute this host command.
 
 ## Develop
 
 ```bash
 npm install
 npm run build          # tsc
-npm run plugin:build   # build + regenerate openclaw.plugin.json
+npm run cli:prepare    # fetch + verify the current platform's pinned AgentMail CLI
+npm run plugin:build   # build + prepare CLI + regenerate openclaw.plugin.json
 npm run plugin:check   # fail if the manifest is stale
 npm test               # vitest
 ```
 
-`plugin:build` compiles TypeScript and regenerates `openclaw.plugin.json` (tool metadata + channel declarations) via `scripts/build-manifest.mjs`. Commit manifest changes whenever tool metadata or the channel config schema changes.
+`plugin:build` compiles TypeScript, downloads the pinned CLI release for the current platform,
+verifies its SHA-256 checksum, and regenerates `openclaw.plugin.json`. `npm pack` prepares every
+supported CLI target so installation never runs lifecycle scripts or downloads executables.
+
+CLI release version and checksum pins live in `scripts/agentmail-cli-release.json`. Update that file
+when intentionally adopting a new AgentMail CLI release.
 
 ## License
 

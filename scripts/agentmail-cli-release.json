@@ -1,0 +1,38 @@
+{
+  "version": "0.7.14",
+  "repository": "agentmail-to/agentmail-cli",
+  "assets": {
+    "darwin-arm64": {
+      "archive": "agentmail_0.7.14_macos_arm64.zip",
+      "sha256": "3e4bdd699826dfbe043b3c1b3da330d7ab09aee81498fd194c2448cf8002da59"
+    },
+    "darwin-x64": {
+      "archive": "agentmail_0.7.14_macos_amd64.zip",
+      "sha256": "2ad6a3d0e03441997c78424e03516b314d464933ebd5a882aeed31e5a6e0bf0c"
+    },
+    "linux-arm64": {
+      "archive": "agentmail_0.7.14_linux_arm64.tar.gz",
+      "sha256": "3aaaa675793c6c182ce5877205e7211ed490ec92fcfef1da8ca555dd402d4a6e"
+    },
+    "linux-ia32": {
+      "archive": "agentmail_0.7.14_linux_386.tar.gz",
+      "sha256": "d4ef844be2993363985388d59adfe6b3534ae071a879eafdd2978add795b2675"
+    },
+    "linux-x64": {
+      "archive": "agentmail_0.7.14_linux_amd64.tar.gz",
+      "sha256": "8b5304be5b29d2457234a7a3655eba87ff2b89e5c57d01a51788fdafe63b2b65"
+    },
+    "win32-arm64": {
+      "archive": "agentmail_0.7.14_windows_arm64.zip",
+      "sha256": "5d06ccf7235d4c11cdf19f3916f9db79e6cd926757a6110ddac1603fe3f09260"
+    },
+    "win32-ia32": {
+      "archive": "agentmail_0.7.14_windows_386.zip",
+      "sha256": "c313faede4952bf28bc6a1a8ba381845b376c8136ecf0a0e459ab092f101a088"
+    },
+    "win32-x64": {
+      "archive": "agentmail_0.7.14_windows_amd64.zip",
+      "sha256": "1beabaa0c855b5f1091bdc3455dcce13141cf52a37d1d93644b000874af83d4d"
+    }
+  }
+}
