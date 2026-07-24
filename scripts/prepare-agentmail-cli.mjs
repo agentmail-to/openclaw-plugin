@@ -128,6 +128,19 @@ function sha256(path) {
   return createHash("sha256").update(readFileSync(path)).digest("hex");
 }
 
+function preparedTargetIsValid(target, destinationRoot) {
+  const metadata = release.assets[target];
+  const executable = join(destinationRoot, target, metadata.executableName);
+  if (
+    !existsSync(executable) ||
+    typeof metadata.executableSha256 !== "string" ||
+    sha256(executable) !== metadata.executableSha256
+  ) {
+    return false;
+  }
+  return target.startsWith("win32-") || (statSync(executable).mode & 0o111) !== 0;
+}
+
 async function download(url, destination) {
   const response = await fetch(url, { redirect: "follow" });
   if (!response.ok || !response.body) {
@@ -162,10 +175,13 @@ async function prepareTarget(target, temporaryRoot, destinationRoot) {
   const metadata = release.assets[target];
   const executableName = metadata.executableName;
   const destination = join(destinationRoot, target, executableName);
-  if (existsSync(destination)) {
+  if (preparedTargetIsValid(target, destinationRoot)) {
     console.log(`AgentMail CLI ${release.version} already prepared for ${target}.`);
     return;
   }
+  // A stale version marker must not bless a corrupt, wrong, or non-executable cached binary.
+  // Remove only this staged target; the live vendor tree remains untouched until the full swap.
+  rmSync(destination, { force: true });
 
   const archivePath = join(temporaryRoot, metadata.archive);
   const url =
@@ -195,6 +211,9 @@ async function prepareTarget(target, temporaryRoot, destinationRoot) {
     chmodSync(stagedDestination, 0o755);
   }
   renameSync(stagedDestination, destination);
+  if (!preparedTargetIsValid(target, destinationRoot)) {
+    throw new Error(`Prepared AgentMail CLI executable failed validation for ${target}.`);
+  }
 }
 
 async function main() {
@@ -216,10 +235,7 @@ async function main() {
     const requestedTreeIsComplete =
       existingVersion === release.version &&
       existsSync(join(vendorRoot, "LICENSE")) &&
-      targets.every((target) => {
-        const metadata = release.assets[target];
-        return existsSync(join(vendorRoot, target, metadata.executableName));
-      });
+      targets.every((target) => preparedTargetIsValid(target, vendorRoot));
     if (requestedTreeIsComplete) {
       for (const target of targets) {
         console.log(`AgentMail CLI ${release.version} already prepared for ${target}.`);

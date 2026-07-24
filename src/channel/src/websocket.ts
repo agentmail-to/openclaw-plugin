@@ -164,13 +164,13 @@ export async function startAgentMailWebSocket(params: {
     });
   };
 
-  const handleMessage = (event: unknown) => {
+  const handleMessage = (event: unknown): boolean => {
     if (!isReceivedEvent(event)) {
-      return;
+      return false;
     }
     if (!agentMailInboxIdsEqual(event.message.inboxId, params.account.inboxId)) {
       params.log?.warn?.("AgentMail WebSocket ignored an event for the wrong inbox");
-      return;
+      return false;
     }
     // The event type itself is authoritative for live receipt. Provider label projection can lag
     // the WebSocket frame; durable hydration already retries that condition safely.
@@ -178,17 +178,17 @@ export async function startAgentMailWebSocket(params: {
     if (messageTimestampMs === null) {
       params.log?.warn?.("AgentMail WebSocket received an event with an invalid timestamp");
       catchUpSupervisor.request();
-      return;
+      return false;
     }
     if (queuedMessageIds.has(event.message.messageId)) {
-      return;
+      return true;
     }
     if (queuedMessageIds.size >= liveQueueMax) {
       // Keep the process-local backlog bounded. REST catch-up remains the authoritative recovery
       // source for events dropped while durable admission is backpressured.
       params.log?.warn?.("AgentMail WebSocket live admission is full; scheduling REST catch-up");
       catchUpSupervisor.request();
-      return;
+      return true;
     }
     queuedMessageIds.add(event.message.messageId);
     liveQueue.push({
@@ -200,6 +200,7 @@ export async function startAgentMailWebSocket(params: {
       arrivedAt: Date.now(),
     });
     runLiveWorker();
+    return true;
   };
 
   // Own reconnection. The pinned agentmail@0.5.16 can synthesize a normal close, disable its
@@ -279,7 +280,13 @@ export async function startAgentMailWebSocket(params: {
           // for this connection so the outer loop recreates it.
           settleClosed();
         });
-        socket.on("message", handleMessage);
+        socket.on("message", (event) => {
+          if (handleMessage(event)) {
+            // A valid event proves the subscription is productive even when an intermediary
+            // recycles it before the 30-second stability threshold.
+            reconnectAttempt = 0;
+          }
+        });
       });
       // waitForOpen() does not settle on an aborted initial connection; close the already-open race
       // from readyState instead.

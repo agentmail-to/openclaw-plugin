@@ -208,7 +208,7 @@ export function findConflictingAgentMailInboxOwner(
   const owner = resolveAgentMailInboxOwners(cfg).get(
     normalizeAgentMailInboxId(account.inboxId),
   );
-  return owner && owner !== account.accountId && owner < account.accountId ? owner : null;
+  return owner && owner < account.accountId ? owner : null;
 }
 
 export function inspectAgentMailAccount(cfg: OpenClawConfig, accountId?: string | null) {

@@ -38,17 +38,26 @@ const account: ResolvedAgentMailAccount = {
   mediaMaxBytes: 20 * 1024 * 1024,
 };
 
-function memoryStore<T>(): PluginStateKeyedStore<T> {
+function memoryStore<T>(maxEntries = Number.POSITIVE_INFINITY): PluginStateKeyedStore<T> {
   const values = new Map<string, PluginStateEntry<T>>();
+  const setValue = (key: string, value: T) => {
+    if (!values.has(key) && values.size >= maxEntries) {
+      const oldestKey = values.keys().next().value;
+      if (oldestKey !== undefined) {
+        values.delete(oldestKey);
+      }
+    }
+    values.set(key, { key, value, createdAt: Date.now() });
+  };
   return {
     async register(key, value) {
-      values.set(key, { key, value, createdAt: Date.now() });
+      setValue(key, value);
     },
     async registerIfAbsent(key, value) {
       if (values.has(key)) {
         return false;
       }
-      values.set(key, { key, value, createdAt: Date.now() });
+      setValue(key, value);
       return true;
     },
     async update(key, updateValue) {
@@ -56,7 +65,7 @@ function memoryStore<T>(): PluginStateKeyedStore<T> {
       if (next === undefined) {
         return false;
       }
-      values.set(key, { key, value: next, createdAt: Date.now() });
+      setValue(key, next);
       return true;
     },
     async lookup(key) {
@@ -159,6 +168,80 @@ describe("AgentMail durable REST catch-up", () => {
       .map(({ namespace }) => namespace);
     expect(accountNamespaces).toHaveLength(2);
     expect(new Set(accountNamespaces).size).toBe(1);
+  });
+
+  it("fences an overlapping session after a replacement claims the cursor", async () => {
+    const store = memoryStore<AgentMailCatchUpCursor>();
+    const list = vi.fn(async () => ({ count: 0, messages: [] }));
+    const client = { inboxes: { messages: { list } } } as never;
+    const oldSession = await createAgentMailCatchUpSession({
+      account,
+      client,
+      store,
+      now: () => 1_000,
+    });
+    const replacement = await createAgentMailCatchUpSession({
+      account,
+      client,
+      store,
+      now: () => 2_000,
+    });
+
+    await oldSession.run({ receive: vi.fn(), abortSignal: new AbortController().signal });
+    expect(list).not.toHaveBeenCalled();
+
+    await replacement.run({ receive: vi.fn(), abortSignal: new AbortController().signal });
+    expect(list).toHaveBeenCalledOnce();
+  });
+
+  it("prevents a late old-inbox write from evicting the rotated inbox cursor", async () => {
+    const store = memoryStore<AgentMailCatchUpCursor>(1);
+    let finishOldPage!: (page: {
+      count: number;
+      messages: AgentMail.MessageItem[];
+    }) => void;
+    const oldList = vi.fn(
+      async () =>
+        await new Promise<{ count: number; messages: AgentMail.MessageItem[] }>((resolve) => {
+          finishOldPage = resolve;
+        }),
+    );
+    const oldSession = await createAgentMailCatchUpSession({
+      account,
+      client: { inboxes: { messages: { list: oldList } } } as never,
+      store,
+      now: () => 1_000,
+    });
+    const oldRun = oldSession.run({
+      receive: vi.fn(async () => undefined),
+      abortSignal: new AbortController().signal,
+    });
+    await vi.waitFor(() => expect(oldList).toHaveBeenCalledOnce());
+
+    const rotatedAccount = { ...account, inboxId: "inbox_2" };
+    const replacementList = vi.fn(async () => ({ count: 0, messages: [] }));
+    const replacement = await createAgentMailCatchUpSession({
+      account: rotatedAccount,
+      client: { inboxes: { messages: { list: replacementList } } } as never,
+      store,
+      now: () => 2_000,
+    });
+    finishOldPage({
+      count: 1,
+      messages: [message({ id: "late_old", timestamp: 1_500 })],
+    });
+    await oldRun;
+
+    await expect(
+      replacement.run({
+        receive: vi.fn(),
+        abortSignal: new AbortController().signal,
+      }),
+    ).resolves.toBeUndefined();
+    expect(replacementList).toHaveBeenCalledOnce();
+    expect((await store.entries()).map((entry) => entry.key)).toEqual([
+      sha256Hex("default\ninbox_2"),
+    ]);
   });
 
   it("migrates a legacy shared cursor before establishing a new baseline", async () => {
@@ -649,7 +732,7 @@ describe("AgentMail durable REST catch-up", () => {
     ]);
   });
 
-  it("does not commit a page cursor before every page is durably admitted", async () => {
+  it("resumes a saved continuation after capacity pauses a later page", async () => {
     const store = memoryStore<AgentMailCatchUpCursor>();
     const key = sha256Hex("default\ninbox_1");
     await store.register(key, {
@@ -678,32 +761,77 @@ describe("AgentMail durable REST catch-up", () => {
       store,
       now: () => 1_000_000,
     });
+    let capacityPause = true;
     const receive = vi.fn(async (record: AgentMailIngressRecord) => {
-      if (record.messageId === "backdated") {
-        throw new Error("durable store unavailable");
+      if (record.messageId === "backdated" && capacityPause) {
+        capacityPause = false;
+        throw new AgentMailIngressCapacityError();
       }
     });
 
-    await expect(
-      session.run({ receive, abortSignal: new AbortController().signal }),
-    ).rejects.toThrow("durable store unavailable");
-    await expect(
-      session.run({ receive, abortSignal: new AbortController().signal }),
-    ).rejects.toThrow("durable store unavailable");
+    await session.run({ receive, abortSignal: new AbortController().signal });
+    await session.run({ receive, abortSignal: new AbortController().signal });
 
     expect(list).toHaveBeenNthCalledWith(
       3,
       "inbox_1",
       expect.objectContaining({
         after: new Date(400_000 - AGENTMAIL_REST_CATCH_UP_OVERLAP_MS),
+        pageToken: "page_2",
       }),
       expect.any(Object),
     );
     expect(receive.mock.calls.map(([value]) => value.messageId)).toEqual([
       "newer",
       "backdated",
-      "newer",
       "backdated",
+    ]);
+  });
+
+  it("resumes the last completed page after a mid-page abort", async () => {
+    const store = memoryStore<AgentMailCatchUpCursor>();
+    const key = sha256Hex("default\ninbox_1");
+    await store.register(key, {
+      version: 1,
+      baselineAtMs: 100_000,
+      highWaterAtMs: 400_000,
+      established: true,
+    });
+    const list = vi.fn(async (_inboxId: string, options: { pageToken?: string }) =>
+      options.pageToken
+        ? { count: 1, messages: [message({ id: "page_2", timestamp: 600_000 })] }
+        : {
+            count: 1,
+            messages: [message({ id: "page_1", timestamp: 500_000 })],
+            nextPageToken: "page_2",
+          },
+    );
+    const session = await createAgentMailCatchUpSession({
+      account,
+      client: { inboxes: { messages: { list } } } as never,
+      store,
+      now: () => 1_000_000,
+    });
+    const firstController = new AbortController();
+    const receive = vi.fn(async (record: AgentMailIngressRecord) => {
+      if (record.messageId === "page_2" && !firstController.signal.aborted) {
+        firstController.abort();
+      }
+    });
+
+    await session.run({ receive, abortSignal: firstController.signal });
+    await session.run({ receive, abortSignal: new AbortController().signal });
+
+    expect(list).toHaveBeenNthCalledWith(
+      3,
+      "inbox_1",
+      expect.objectContaining({ pageToken: "page_2" }),
+      expect.any(Object),
+    );
+    expect(receive.mock.calls.map(([value]) => value.messageId)).toEqual([
+      "page_1",
+      "page_2",
+      "page_2",
     ]);
   });
 });

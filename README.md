@@ -74,10 +74,11 @@ An optional API base URL override for the bundled CLI belongs under
 
 The previous `timeoutSeconds` and `maxRetries` tool settings remain accepted so existing
 configurations continue to load, but the bundled CLI does not use them.
-For credential safety, command arguments cannot override `--base-url`; only the
-operator-controlled plugin setting above can select the AgentMail API endpoint. The passthrough
-also rejects `--environment` and removes inherited endpoint-selector and standard proxy environment
-variables (`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, and `NO_PROXY`, including lowercase forms).
+For credential safety, command arguments cannot override `--api-key`, `--base-url`, or
+`--environment`; only inherited credentials and the operator-controlled plugin setting above can
+select the AgentMail identity and API endpoint. The passthrough also removes inherited
+endpoint-selector and standard proxy environment variables (`HTTP_PROXY`, `HTTPS_PROXY`,
+`ALL_PROXY`, and `NO_PROXY`, including lowercase forms).
 If a command value must literally begin with `--base-url` or `--environment`, use the CLI's
 `--option=value` form (for example, `--subject=--base-url-is-restricted`). The endpoint guard fails
 closed for unrecognized separate-value options.
@@ -141,10 +142,13 @@ npm test               # vitest
 
 `plugin:build` compiles TypeScript, downloads the pinned CLI release for the current platform,
 verifies its SHA-256 checksum, and regenerates `openclaw.plugin.json`. `npm pack` prepares every
-supported CLI target so installation never runs lifecycle scripts or downloads executables.
+supported CLI target so installation never runs lifecycle scripts or downloads executables. Do not
+publish with lifecycle scripts disabled (`--ignore-scripts`), because `prepack` is what assembles
+and validates the complete eight-platform vendor tree.
 
-CLI release version and checksum pins live in `src/cli/agentmail-cli-release.json`. Update that file
-when intentionally adopting a new AgentMail CLI release.
+CLI release version, archive checksums, and extracted-executable checksums live in
+`src/cli/agentmail-cli-release.json`. Update that file when intentionally adopting a new AgentMail
+CLI release.
 
 ## License
 

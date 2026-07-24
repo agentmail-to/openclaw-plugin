@@ -6,41 +6,49 @@
     "darwin-arm64": {
       "archive": "agentmail_0.7.14_macos_arm64.zip",
       "sha256": "3e4bdd699826dfbe043b3c1b3da330d7ab09aee81498fd194c2448cf8002da59",
+      "executableSha256": "5ed06a8071fa3269f7b45726a6c11d8bc09a6fe5c7fa6c4d94760494be8c9bb9",
       "executableName": "agentmail"
     },
     "darwin-x64": {
       "archive": "agentmail_0.7.14_macos_amd64.zip",
       "sha256": "2ad6a3d0e03441997c78424e03516b314d464933ebd5a882aeed31e5a6e0bf0c",
+      "executableSha256": "0a09b38f270123299bcbd30fde1faf9d28ecd4a9e9e820c6707c11d9b22c1574",
       "executableName": "agentmail"
     },
     "linux-arm64": {
       "archive": "agentmail_0.7.14_linux_arm64.tar.gz",
       "sha256": "3aaaa675793c6c182ce5877205e7211ed490ec92fcfef1da8ca555dd402d4a6e",
+      "executableSha256": "0793dc1a7913addc893e8aeb5717e2576dcdb2f12438299ee853756f78b1f280",
       "executableName": "agentmail"
     },
     "linux-ia32": {
       "archive": "agentmail_0.7.14_linux_386.tar.gz",
       "sha256": "d4ef844be2993363985388d59adfe6b3534ae071a879eafdd2978add795b2675",
+      "executableSha256": "22a5810bb85c6eff2cf69d00e569f50a64ee3c66fd1c9c522974881e70fe2259",
       "executableName": "agentmail"
     },
     "linux-x64": {
       "archive": "agentmail_0.7.14_linux_amd64.tar.gz",
       "sha256": "8b5304be5b29d2457234a7a3655eba87ff2b89e5c57d01a51788fdafe63b2b65",
+      "executableSha256": "b90acaaf52a3f5b77c8812e6092db1dfc66148b39300bacc84c74635cf991bd5",
       "executableName": "agentmail"
     },
     "win32-arm64": {
       "archive": "agentmail_0.7.14_windows_arm64.zip",
       "sha256": "5d06ccf7235d4c11cdf19f3916f9db79e6cd926757a6110ddac1603fe3f09260",
+      "executableSha256": "2c23a9576303a9e50a6b5ca8209348a594ef9b33d4f3ded0483abf967516d7c3",
       "executableName": "agentmail.exe"
     },
     "win32-ia32": {
       "archive": "agentmail_0.7.14_windows_386.zip",
       "sha256": "c313faede4952bf28bc6a1a8ba381845b376c8136ecf0a0e459ab092f101a088",
+      "executableSha256": "326e24592efe5feb8436a4aa72b75ace01d43432aec1d267700c0219efd20077",
       "executableName": "agentmail.exe"
     },
     "win32-x64": {
       "archive": "agentmail_0.7.14_windows_amd64.zip",
       "sha256": "1beabaa0c855b5f1091bdc3455dcce13141cf52a37d1d93644b000874af83d4d",
+      "executableSha256": "ad1b1c8d4b547dfbb10149687da02c07ba78b0660b200b413c08f55eeea5b15a",
       "executableName": "agentmail.exe"
     }
   }

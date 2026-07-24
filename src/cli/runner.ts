@@ -10,12 +10,13 @@ export type AgentMailCliTarget = {
 };
 
 export const AGENTMAIL_CLI_ENDPOINT_OPTIONS = ["base-url", "environment"] as const;
-
-const endpointOptions = new Set<string>(AGENTMAIL_CLI_ENDPOINT_OPTIONS);
-const optionsWithSeparateValues = new Set([
+export const AGENTMAIL_CLI_RESTRICTED_OPTIONS = [
   "api-key",
-  "base-url",
-  "environment",
+  ...AGENTMAIL_CLI_ENDPOINT_OPTIONS,
+] as const;
+
+const restrictedOptions = new Set<string>(AGENTMAIL_CLI_RESTRICTED_OPTIONS);
+const optionsWithSeparateValues = new Set([
   "format",
   "format-error",
   "transform",
@@ -93,9 +94,9 @@ export function withConfiguredBaseUrl(
     if (!option) {
       continue;
     }
-    if (endpointOptions.has(option.name)) {
+    if (restrictedOptions.has(option.name)) {
       throw new Error(
-        "AgentMail API endpoint overrides are restricted to the operator-controlled plugin config.",
+        "AgentMail API credential and endpoint overrides are restricted to operator-controlled configuration.",
       );
     }
     consumesNextValue = !option.hasInlineValue && optionsWithSeparateValues.has(option.name);

@@ -1,4 +1,5 @@
 import type { AgentMailClient } from "agentmail";
+import { randomUUID } from "node:crypto";
 import type { PluginStateKeyedStore } from "openclaw/plugin-sdk/plugin-state-runtime";
 import { type AgentMailLog, errorText } from "./log.js";
 import { createAgentMailClient } from "./client.js";
@@ -30,11 +31,21 @@ export const AGENTMAIL_REST_CATCH_UP_OVERLAP_MS = 5 * 60_000;
 export const AGENTMAIL_CATCH_UP_INTERVAL_MS = 60_000;
 export const AGENTMAIL_DEEP_SWEEP_INTERVAL_MS = 15 * 60_000;
 
+export type AgentMailCatchUpCheckpoint = {
+  afterAtMs: number;
+  beforeAtMs: number;
+  pageToken: string;
+  highWaterAtMs: number;
+  sinceBaseline: boolean;
+};
+
 export type AgentMailCatchUpCursor = {
   version: typeof CURSOR_VERSION;
   baselineAtMs: number;
   highWaterAtMs: number;
   established: boolean;
+  generation?: string;
+  checkpoint?: AgentMailCatchUpCheckpoint;
 };
 
 export type AgentMailCatchUpSession = {
@@ -157,13 +168,38 @@ function cursorKey(account: ResolvedAgentMailAccount): string {
 }
 
 function cursorNamespace(account: ResolvedAgentMailAccount): string {
-  // Namespace by account rather than inbox so rotation reuses the bounded store and evicts the old
-  // inbox cursor. The hash keeps operator-provided account ids out of state paths.
+  // Reuse one bounded namespace per account across inbox rotations. persistCursor fences every
+  // write by key and claimed generation, so an evicted old inbox key can never be reinserted.
   return `${AGENTMAIL_REST_CATCH_UP_NAMESPACE}.${sha256Hex(account.accountId)}`;
 }
 
 function validTimestamp(value: unknown): value is number {
   return typeof value === "number" && Number.isFinite(value) && value >= 0;
+}
+
+function normalizeCheckpoint(value: unknown): AgentMailCatchUpCheckpoint | undefined {
+  if (!value || typeof value !== "object") {
+    return undefined;
+  }
+  const checkpoint = value as Partial<AgentMailCatchUpCheckpoint>;
+  if (
+    !validTimestamp(checkpoint.afterAtMs) ||
+    !validTimestamp(checkpoint.beforeAtMs) ||
+    checkpoint.beforeAtMs < checkpoint.afterAtMs ||
+    typeof checkpoint.pageToken !== "string" ||
+    checkpoint.pageToken.length === 0 ||
+    !validTimestamp(checkpoint.highWaterAtMs) ||
+    typeof checkpoint.sinceBaseline !== "boolean"
+  ) {
+    return undefined;
+  }
+  return {
+    afterAtMs: checkpoint.afterAtMs,
+    beforeAtMs: checkpoint.beforeAtMs,
+    pageToken: checkpoint.pageToken,
+    highWaterAtMs: checkpoint.highWaterAtMs,
+    sinceBaseline: checkpoint.sinceBaseline,
+  };
 }
 
 function normalizeCursor(value: unknown): AgentMailCatchUpCursor | null {
@@ -179,11 +215,16 @@ function normalizeCursor(value: unknown): AgentMailCatchUpCursor | null {
   ) {
     return null;
   }
+  const checkpoint = normalizeCheckpoint(cursor.checkpoint);
   return {
     version: CURSOR_VERSION,
     baselineAtMs: cursor.baselineAtMs,
     highWaterAtMs: Math.max(cursor.baselineAtMs, cursor.highWaterAtMs),
     established: cursor.established,
+    ...(typeof cursor.generation === "string" && cursor.generation
+      ? { generation: cursor.generation }
+      : {}),
+    ...(checkpoint ? { checkpoint } : {}),
   };
 }
 
@@ -191,6 +232,8 @@ function mergeCursor(
   currentValue: unknown,
   next: Pick<AgentMailCatchUpCursor, "baselineAtMs" | "highWaterAtMs" | "established">,
   upperBoundAtMs: number,
+  generation: string,
+  checkpoint: AgentMailCatchUpCheckpoint | null,
 ): AgentMailCatchUpCursor {
   const current = normalizeCursor(currentValue);
   const baselineAtMs = Math.min(
@@ -209,6 +252,8 @@ function mergeCursor(
       Math.min(upperBoundAtMs, next.highWaterAtMs),
     ),
     established: current?.established === true || next.established,
+    generation,
+    ...(checkpoint ? { checkpoint } : {}),
   };
 }
 
@@ -219,21 +264,52 @@ async function persistCursor(params: {
   highWaterAtMs: number;
   established: boolean;
   upperBoundAtMs: number;
-}): Promise<void> {
+  generation: string;
+  checkpoint: AgentMailCatchUpCheckpoint | null;
+}): Promise<boolean> {
   const update = params.store.update;
-  if (update) {
-    await update(
-      params.key,
-      (currentValue) => mergeCursor(currentValue, params, params.upperBoundAtMs),
-      { ttlMs: AGENTMAIL_REST_CATCH_UP_CURSOR_TTL_MS },
-    );
-    return;
+  if (!update) {
+    throw new Error("AgentMail catch-up requires atomic keyed-store updates");
   }
-  await params.store.register(
+  return await update(
     params.key,
-    mergeCursor(await params.store.lookup(params.key), params, params.upperBoundAtMs),
+    (currentValue) => {
+      const current = normalizeCursor(currentValue);
+      if (!current || current.generation !== params.generation) {
+        return undefined;
+      }
+      return mergeCursor(
+        current,
+        params,
+        params.upperBoundAtMs,
+        params.generation,
+        params.checkpoint,
+      );
+    },
     { ttlMs: AGENTMAIL_REST_CATCH_UP_CURSOR_TTL_MS },
   );
+}
+
+async function claimCursorGeneration(params: {
+  store: PluginStateKeyedStore<AgentMailCatchUpCursor>;
+  key: string;
+  generation: string;
+}): Promise<void> {
+  const update = params.store.update;
+  if (!update) {
+    throw new Error("AgentMail catch-up requires atomic keyed-store updates");
+  }
+  const claimed = await update(
+    params.key,
+    (currentValue) => {
+      const current = normalizeCursor(currentValue);
+      return current ? { ...current, generation: params.generation } : undefined;
+    },
+    { ttlMs: AGENTMAIL_REST_CATCH_UP_CURSOR_TTL_MS },
+  );
+  if (!claimed) {
+    throw new Error("AgentMail catch-up cursor disappeared while claiming its generation");
+  }
 }
 
 export async function createAgentMailCatchUpSession(params: {
@@ -249,17 +325,16 @@ export async function createAgentMailCatchUpSession(params: {
   if (!store) {
     const state = getAgentMailRuntime().state;
     const accountStore = state.openKeyedStore<AgentMailCatchUpCursor>({
-      // Isolate each account in its own one-entry namespace. Inbox rotation evicts the prior cursor,
-      // while inactive rows expire instead of accumulating forever.
+      // One entry per account bounds inbox-rotation state. Generation-fenced updates cannot upsert
+      // an evicted key, so overlapping old sessions cannot displace the replacement cursor.
       namespace: cursorNamespace(params.account),
       maxEntries: AGENTMAIL_REST_CATCH_UP_MAX_ENTRIES_PER_ACCOUNT,
       overflowPolicy: "evict-oldest",
       defaultTtlMs: AGENTMAIL_REST_CATCH_UP_CURSOR_TTL_MS,
     });
     store = accountStore;
-    // Upgrade migration: the released implementation stored every account in one shared namespace.
-    // Probe it even when the replacement cursor already exists so a transient delete failure is
-    // retried on the next startup instead of leaving a TTL-less legacy row permanently behind.
+    // Upgrade migration probes the older shared namespace. Probe it even when the replacement
+    // cursor exists so transient cleanup failures remain retryable on later startups.
     const legacyStore = state.openKeyedStore<AgentMailCatchUpCursor>({
       namespace: AGENTMAIL_REST_CATCH_UP_NAMESPACE,
       maxEntries: AGENTMAIL_REST_CATCH_UP_LEGACY_MAX_ACCOUNTS,
@@ -293,6 +368,8 @@ export async function createAgentMailCatchUpSession(params: {
   await store.registerIfAbsent(key, initialCursor, {
     ttlMs: AGENTMAIL_REST_CATCH_UP_CURSOR_TTL_MS,
   });
+  const generation = randomUUID();
+  await claimCursorGeneration({ store, key, generation });
   const client = params.client ?? createAgentMailClient(params.account);
 
   return {
@@ -300,6 +377,11 @@ export async function createAgentMailCatchUpSession(params: {
       const storedCursor = normalizeCursor(await store.lookup(key));
       if (!storedCursor) {
         throw new Error("AgentMail WebSocket catch-up cursor is unavailable");
+      }
+      if (storedCursor.generation !== generation) {
+        // A replacement session now owns this inbox generation. The old worker must stop before it
+        // can overwrite the replacement's cursor or continuation checkpoint.
+        return;
       }
       // Never scan below the durable recovery horizon on any sweep. Pending work and completed
       // tombstones share this retention period, so catch-up can recover mail throughout the entire
@@ -310,7 +392,19 @@ export async function createAgentMailCatchUpSession(params: {
       // The deep sweep lists from max(baseline, recoveryFloor): it recovers back-dated mail within
       // the durable retention window and since monitoring began, but deliberately does not scan
       // before the baseline, which would re-inject pre-monitoring history.
-      const sweepAtMs = now();
+      const runAtMs = now();
+      const recoveryFloorMs = runAtMs - AGENTMAIL_DURABLE_PENDING_TTL_MS;
+      const requestedSinceBaseline = sinceBaseline === true;
+      const resumableCheckpoint =
+        storedCursor.checkpoint &&
+        storedCursor.checkpoint.sinceBaseline === requestedSinceBaseline &&
+        storedCursor.checkpoint.beforeAtMs <= runAtMs + 1 &&
+        storedCursor.checkpoint.afterAtMs >= recoveryFloorMs
+          ? storedCursor.checkpoint
+          : undefined;
+      const sweepAtMs = resumableCheckpoint
+        ? resumableCheckpoint.beforeAtMs - 1
+        : runAtMs;
       // If the host clock moved backwards, both stored bounds can be in the future. Clamp the
       // effective cursor for this run and persist the repaired value after a successful sweep.
       const effectiveBaselineAtMs = Math.min(storedCursor.baselineAtMs, sweepAtMs);
@@ -318,15 +412,19 @@ export async function createAgentMailCatchUpSession(params: {
         effectiveBaselineAtMs,
         Math.min(storedCursor.highWaterAtMs, sweepAtMs),
       );
-      const recoveryFloorMs = sweepAtMs - AGENTMAIL_DURABLE_PENDING_TTL_MS;
       const beforeMs = sweepAtMs + 1;
       const baseAfterMs =
-        sinceBaseline || !storedCursor.established
+        requestedSinceBaseline || !storedCursor.established
           ? effectiveBaselineAtMs
           : effectiveHighWaterAtMs - AGENTMAIL_REST_CATCH_UP_OVERLAP_MS;
-      const afterMs = Math.max(0, baseAfterMs, recoveryFloorMs);
-      let highWaterAtMs = effectiveHighWaterAtMs;
-      let pageCursor: string | undefined;
+      const afterMs = resumableCheckpoint
+        ? resumableCheckpoint.afterAtMs
+        : Math.max(0, baseAfterMs, recoveryFloorMs);
+      let highWaterAtMs = Math.max(
+        effectiveHighWaterAtMs,
+        Math.min(sweepAtMs, resumableCheckpoint?.highWaterAtMs ?? 0),
+      );
+      let pageCursor = resumableCheckpoint?.pageToken;
       let admitted = 0;
       do {
         const page = await client.inboxes.messages.list(
@@ -401,19 +499,48 @@ export async function createAgentMailCatchUpSession(params: {
           highWaterAtMs = Math.max(highWaterAtMs, receivedAt);
         }
         pageCursor = page.nextPageToken;
+        if (pageCursor) {
+          // Save a continuation only after every message on this page was durably admitted. The
+          // committed high-water mark remains unchanged until the entire sweep completes, so an
+          // out-of-order later page can never be skipped after capacity or a process restart.
+          const persisted = await persistCursor({
+            store,
+            key,
+            baselineAtMs: effectiveBaselineAtMs,
+            highWaterAtMs: effectiveHighWaterAtMs,
+            established: storedCursor.established,
+            upperBoundAtMs: sweepAtMs,
+            generation,
+            checkpoint: {
+              afterAtMs: afterMs,
+              beforeAtMs: beforeMs,
+              pageToken: pageCursor,
+              highWaterAtMs,
+              sinceBaseline: requestedSinceBaseline,
+            },
+          });
+          if (!persisted) {
+            return;
+          }
+        }
       } while (pageCursor && !abortSignal.aborted);
 
       if (abortSignal.aborted) {
         return;
       }
-      await persistCursor({
+      const persisted = await persistCursor({
         store,
         key,
         baselineAtMs: effectiveBaselineAtMs,
         highWaterAtMs,
         established: true,
         upperBoundAtMs: sweepAtMs,
+        generation,
+        checkpoint: null,
       });
+      if (!persisted) {
+        return;
+      }
       if (admitted > 0) {
         params.log?.info?.(
           `AgentMail WebSocket catch-up admitted ${admitted} message${admitted === 1 ? "" : "s"} for account ${params.account.accountId}`,

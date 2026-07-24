@@ -3,7 +3,8 @@
 // manifest/schema/command shapes and missing executables that a pure staleness check cannot.
 // Kept separate from `plugin:check` (manifest staleness).
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -11,6 +12,9 @@ import { fileURLToPath } from "node:url";
 const root = fileURLToPath(new URL("..", import.meta.url));
 const openclaw = fileURLToPath(new URL("../node_modules/.bin/openclaw", import.meta.url));
 const cliRunner = await import(new URL("../dist/cli/runner.js", import.meta.url));
+const cliRelease = JSON.parse(
+  readFileSync(new URL("../dist/cli/agentmail-cli-release.json", import.meta.url), "utf8"),
+);
 
 // Run against an isolated, disposable state dir so validation (invoked from prepack during
 // `npm pack`/`npm publish`) never touches the maintainer's real OpenClaw installation or its
@@ -82,6 +86,31 @@ const expectedCliVersion = readFileSync(
   cliRunner.resolveAgentMailCliVendorPath("VERSION"),
   "utf8",
 ).trim();
+const currentCliTarget = cliRunner.resolveAgentMailCliTarget().directory;
+for (const [target, metadata] of Object.entries(cliRelease.assets)) {
+  const executable = cliRunner.resolveAgentMailCliVendorPath(
+    target,
+    metadata.executableName,
+  );
+  if (!existsSync(executable)) {
+    if (target === currentCliTarget) {
+      fail(`bundled AgentMail CLI executable is missing for ${target}`);
+    }
+    continue;
+  }
+  const executableSha256 = createHash("sha256")
+    .update(readFileSync(executable))
+    .digest("hex");
+  if (executableSha256 !== metadata.executableSha256) {
+    fail(
+      `bundled AgentMail CLI executable checksum did not match for ${target}`,
+      `expected ${metadata.executableSha256}, got ${executableSha256}`,
+    );
+  }
+  if (!target.startsWith("win32-") && (statSync(executable).mode & 0o111) === 0) {
+    fail(`bundled AgentMail CLI executable is not executable for ${target}`);
+  }
+}
 let cliHelp = "";
 try {
   cliHelp = execFileSync(cliRunner.resolveAgentMailCliExecutable(), ["--help"], {
@@ -96,23 +125,24 @@ try {
     error.stdout || error.stderr || String(error),
   );
 }
-const endpointOptions = cliHelp
+const restrictedOptions = cliHelp
   .split("\n")
-  .filter((line) => /(base URL|environment for API requests)/i.test(line))
+  .filter((line) => /(--api-key\b|base URL|environment for API requests)/i.test(line))
   .flatMap((line) =>
     [...line.matchAll(/(?:^|[\s,])-+([a-z][a-z0-9-]*)\b/gi)].map((match) =>
       match[1].toLowerCase(),
     ),
   )
+  .filter((value, index, values) => values.indexOf(value) === index)
   .sort();
-const guardedEndpointOptions = [...cliRunner.AGENTMAIL_CLI_ENDPOINT_OPTIONS].sort();
-if (JSON.stringify(endpointOptions) !== JSON.stringify(guardedEndpointOptions)) {
+const guardedRestrictedOptions = [...cliRunner.AGENTMAIL_CLI_RESTRICTED_OPTIONS].sort();
+if (JSON.stringify(restrictedOptions) !== JSON.stringify(guardedRestrictedOptions)) {
   fail(
-    "bundled AgentMail CLI endpoint options no longer match the passthrough guard",
-    `CLI: ${endpointOptions.join(", ") || "(none)"}; guard: ${guardedEndpointOptions.join(", ")}`,
+    "bundled AgentMail CLI credential/endpoint options no longer match the passthrough guard",
+    `CLI: ${restrictedOptions.join(", ") || "(none)"}; guard: ${guardedRestrictedOptions.join(", ")}`,
   );
 }
-for (const option of endpointOptions) {
+for (const option of restrictedOptions) {
   for (const prefix of ["-", "--", "---"]) {
     for (const args of [
       [`${prefix}${option}`, "untrusted", "inboxes", "list"],

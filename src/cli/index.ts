@@ -33,9 +33,14 @@ export function createAgentMailCliPlugin(
             .allowUnknownOption(true)
             .allowExcessArguments(true)
             .action(async (args: string[]) => {
-              const exitCode = await runCli(withConfiguredBaseUrl(args, config.baseUrl));
-              if (exitCode !== 0) {
-                process.exitCode = exitCode;
+              try {
+                const exitCode = await runCli(withConfiguredBaseUrl(args, config.baseUrl));
+                if (exitCode !== 0) {
+                  process.exitCode = exitCode;
+                }
+              } catch (error) {
+                console.error(error instanceof Error ? error.message : String(error));
+                process.exitCode = 1;
               }
             });
         },

@@ -79,6 +79,18 @@ describe("AgentMail CLI bridge", () => {
         undefined,
       ),
     ).toThrow("endpoint overrides are restricted");
+    expect(() =>
+      withConfiguredBaseUrl(
+        ["--api-key", "attacker-controlled", "inboxes", "list"],
+        undefined,
+      ),
+    ).toThrow("credential and endpoint overrides are restricted");
+    expect(() =>
+      withConfiguredBaseUrl(
+        ["-api-key=attacker-controlled", "inboxes", "list"],
+        undefined,
+      ),
+    ).toThrow("credential and endpoint overrides are restricted");
     expect(
       withConfiguredBaseUrl(
         ["--transform", "--base-url=literal-output", "inboxes", "list"],
@@ -182,5 +194,14 @@ describe("AgentMail CLI bridge", () => {
       "--format",
       "json",
     ]);
+
+    const priorExitCode = process.exitCode;
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    runCli.mockRejectedValueOnce(new Error("bundled CLI could not start"));
+    await action?.(["inboxes", "list"]);
+    expect(error).toHaveBeenCalledWith("bundled CLI could not start");
+    expect(process.exitCode).toBe(1);
+    process.exitCode = priorExitCode;
+    error.mockRestore();
   });
 });
