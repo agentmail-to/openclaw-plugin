@@ -156,6 +156,46 @@ describe("AgentMail reply-only outbound", () => {
     expect(reply).not.toHaveBeenCalled();
   });
 
+  it("rejects a non-string hydrated From during unknown-send reconciliation", async () => {
+    reply.mockClear();
+    const malformedClient = {
+      inboxes: {
+        messages: {
+          get: vi.fn(async (_inboxId: string, messageId: string) => ({
+            ...(await get("inbox_1", messageId)),
+            from: ["sender@example.com"],
+          })),
+          reply,
+        },
+      },
+    } as never;
+    await expect(
+      reconcileAgentMailUnknownSend(
+        {
+          cfg: {
+            channels: {
+              agentmail: {
+                apiKey: "key",
+                inboxId: "inbox_1",
+                allowFrom: ["sender@example.com"],
+              },
+            },
+          },
+          queueId: "queue_1",
+          channel: "agentmail",
+          to: "message:msg_1",
+          accountId: "default",
+          enqueuedAt: 9_000,
+          retryCount: 1,
+          effectiveReplyToId: "msg_1",
+          payloads: [{ text: "Hello" }],
+        },
+        { client: malformedClient, now: () => 10_000 },
+      ),
+    ).rejects.toThrow("recipient is not an authorized triggering sender");
+    expect(reply).not.toHaveBeenCalled();
+  });
+
   it("rejects explicit and proactive message targets", async () => {
     const base = {
       cfg: {

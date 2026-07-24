@@ -18,6 +18,7 @@ import {
 import type { AgentMailIngressRecord, ResolvedAgentMailAccount } from "./types.js";
 
 const AGENTMAIL_WEBSOCKET_LIVE_QUEUE_MAX = 32;
+const AGENTMAIL_WEBSOCKET_STABLE_CONNECTION_MS = 30_000;
 // A single record must not pin the one bounded live worker forever. After this many failed durable
 // admissions, hand the record to REST catch-up (which retains the provider-side source) so later
 // live events keep advancing.
@@ -99,6 +100,7 @@ export async function startAgentMailWebSocket(params: {
   catchUpIntervalMs?: number;
   deepSweepIntervalMs?: number;
   client?: AgentMailClient;
+  now?: () => number;
 }): Promise<void> {
   const client = params.client ?? createAgentMailClient(params.account);
   const catchUpSession =
@@ -111,6 +113,7 @@ export async function startAgentMailWebSocket(params: {
   const retryDelay = params.retryDelayMs ?? websocketRetryDelayMs;
   const reconnectDelay = params.reconnectDelayMs ?? retryDelay;
   const liveQueueMax = params.liveQueueMax ?? AGENTMAIL_WEBSOCKET_LIVE_QUEUE_MAX;
+  const now = params.now ?? Date.now;
   const liveQueue: AgentMailIngressRecord[] = [];
   const queuedMessageIds = new Set<string>();
   let liveWorker: Promise<void> | undefined;
@@ -162,13 +165,13 @@ export async function startAgentMailWebSocket(params: {
     });
   };
 
-  const handleMessage = (event: unknown) => {
+  const handleMessage = (event: unknown): boolean => {
     if (!isReceivedEvent(event)) {
-      return;
+      return false;
     }
     if (!agentMailInboxIdsEqual(event.message.inboxId, params.account.inboxId)) {
       params.log?.warn?.("AgentMail WebSocket ignored an event for the wrong inbox");
-      return;
+      return false;
     }
     // The event type itself is authoritative for live receipt. Provider label projection can lag
     // the WebSocket frame; durable hydration already retries that condition safely.
@@ -176,25 +179,25 @@ export async function startAgentMailWebSocket(params: {
     if (messageTimestampMs === null) {
       params.log?.warn?.("AgentMail WebSocket received an event with an invalid timestamp");
       catchUpSupervisor.request();
-      return;
+      return false;
     }
     if (queuedMessageIds.has(event.message.messageId)) {
-      return;
+      return true;
     }
     if (queuedMessageIds.size >= liveQueueMax) {
       // Keep the process-local backlog bounded. REST catch-up remains the authoritative recovery
       // source for events dropped while durable admission is backpressured.
       params.log?.warn?.("AgentMail WebSocket live admission is full; scheduling REST catch-up");
       catchUpSupervisor.request();
-      return;
+      return true;
     }
-    const arrivedAt = Date.now();
+    const arrivedAt = now();
     if (!isAgentMailProviderTimestampWithinFutureSkew(messageTimestampMs, arrivedAt)) {
       params.log?.warn?.(
         "AgentMail WebSocket ignored an event timestamped too far in the future",
       );
       catchUpSupervisor.request();
-      return;
+      return false;
     }
     queuedMessageIds.add(event.message.messageId);
     liveQueue.push({
@@ -206,6 +209,7 @@ export async function startAgentMailWebSocket(params: {
       arrivedAt,
     });
     runLiveWorker();
+    return true;
   };
 
   // Own reconnection. The pinned agentmail@0.5.16 can synthesize a normal close, disable its
@@ -241,6 +245,7 @@ export async function startAgentMailWebSocket(params: {
         continue;
       }
       let subscribedForCurrentConnection = false;
+      let subscribedAtMs: number | undefined;
       const subscribe = () => {
         if (subscribedForCurrentConnection) {
           return;
@@ -251,6 +256,7 @@ export async function startAgentMailWebSocket(params: {
           eventTypes: ["message.received"],
         });
         subscribedForCurrentConnection = true;
+        subscribedAtMs = now();
         params.log?.info?.(
           `AgentMail WebSocket subscribed for account ${params.account.accountId}`,
         );
@@ -269,7 +275,6 @@ export async function startAgentMailWebSocket(params: {
           resolve();
         };
         socket.on("open", () => {
-          reconnectAttempt = 0;
           subscribe();
         });
         socket.on("close", settleClosed);
@@ -284,18 +289,32 @@ export async function startAgentMailWebSocket(params: {
           // for this connection so the outer loop recreates it.
           settleClosed();
         });
-        socket.on("message", handleMessage);
+        socket.on("message", (event) => {
+          if (handleMessage(event)) {
+            // A valid event proves the subscription is productive even when an intermediary
+            // recycles it before the 30-second stability threshold.
+            reconnectAttempt = 0;
+          }
+        });
       });
       // waitForOpen() does not settle on an aborted initial connection; close the already-open race
       // from readyState instead.
       if (socket.readyState === 1) {
-        reconnectAttempt = 0;
         subscribe();
       }
       await Promise.race([closed, aborted]);
       socket.close();
       if (params.abortSignal.aborted) {
         return;
+      }
+      // An `open` event alone does not prove a healthy connection: resetting there turns repeated
+      // open/close flaps into a zero-attempt reconnect loop. Reset only after the socket remained
+      // subscribed for a meaningful interval.
+      if (
+        subscribedAtMs !== undefined &&
+        now() - subscribedAtMs >= AGENTMAIL_WEBSOCKET_STABLE_CONNECTION_MS
+      ) {
+        reconnectAttempt = 0;
       }
       // Unexpected close: reconnect after a bounded backoff. REST catch-up covers the gap.
       params.log?.warn?.(

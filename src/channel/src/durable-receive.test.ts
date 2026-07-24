@@ -3,6 +3,7 @@ import {
   AGENTMAIL_DURABLE_COMPLETED_TTL_MS,
   AGENTMAIL_DURABLE_PENDING_MAX_ENTRIES,
   AGENTMAIL_DURABLE_PENDING_TTL_MS,
+  AGENTMAIL_DURABLE_RETENTION,
   createAgentMailDurableInboundId,
   withAgentMailIngressCapacity,
 } from "./durable-receive.js";
@@ -382,6 +383,68 @@ describe("AgentMail durable ingress", () => {
     expect(release).toHaveBeenCalledWith(createAgentMailDurableInboundId(record), {
       lastError: "temporary hydration failure",
     });
+    expect(release).toHaveBeenCalledTimes(2);
+    expect(dispatch).toHaveBeenCalledTimes(2);
+  });
+
+  it("bounds persistent release failures instead of pinning the active dispatch forever", async () => {
+    const release = vi.fn(async () => {
+      throw new Error("database read-only");
+    });
+    const dispatch = vi.fn(async () => {
+      throw new Error("temporary hydration failure");
+    });
+    const error = vi.fn();
+    await processAgentMailIngress({
+      journal: {
+        accept: async () => ({ kind: "accepted", duplicate: false, record: {} }),
+        complete: vi.fn(),
+        release,
+      } as never,
+      record,
+      dispatch,
+      retryDelayMs: () => 0,
+      log: { error },
+    });
+
+    await vi.waitFor(() => expect(error).toHaveBeenCalledWith(expect.stringContaining("release")));
+    expect(release).toHaveBeenCalledTimes(50);
+    expect(dispatch).toHaveBeenCalledOnce();
+  });
+
+  it("retries storage failures while releasing an abandoned deferred turn", async () => {
+    const release = vi
+      .fn<() => Promise<boolean>>()
+      .mockRejectedValueOnce(new Error("database busy"))
+      .mockResolvedValueOnce(true);
+    const complete = vi.fn(async () => undefined);
+    const dispatch = vi.fn(
+      async (
+        _record: AgentMailIngressRecord,
+        lifecycle: {
+          onTurnAbandoned: () => Promise<void>;
+          onTurnAdopted: () => Promise<void>;
+        },
+      ) => {
+        if (dispatch.mock.calls.length === 1) {
+          await lifecycle.onTurnAbandoned();
+          return;
+        }
+        await lifecycle.onTurnAdopted();
+      },
+    );
+    await processAgentMailIngress({
+      journal: {
+        accept: async () => ({ kind: "accepted", duplicate: false, record: {} }),
+        complete,
+        release,
+      } as never,
+      record,
+      dispatch,
+      retryDelayMs: () => 0,
+    });
+
+    await vi.waitFor(() => expect(complete).toHaveBeenCalledOnce());
     expect(release).toHaveBeenCalledTimes(2);
     expect(dispatch).toHaveBeenCalledTimes(2);
   });
@@ -926,10 +989,11 @@ describe("AgentMail durable ingress", () => {
     );
   });
 
-  it("keeps WhatsApp-aligned retention values", () => {
+  it("keeps completed dedupe for the full recovery horizon without an entry cap", () => {
     expect(AGENTMAIL_DURABLE_PENDING_TTL_MS).toBe(30 * 24 * 60 * 60 * 1000);
-    expect(AGENTMAIL_DURABLE_COMPLETED_TTL_MS).toBe(7 * 24 * 60 * 60 * 1000);
+    expect(AGENTMAIL_DURABLE_COMPLETED_TTL_MS).toBe(AGENTMAIL_DURABLE_PENDING_TTL_MS);
     expect(AGENTMAIL_DURABLE_PENDING_MAX_ENTRIES).toBe(450);
+    expect(AGENTMAIL_DURABLE_RETENTION).not.toHaveProperty("completedMaxEntries");
   });
 
   it("replays pending records after restart and completes them", async () => {

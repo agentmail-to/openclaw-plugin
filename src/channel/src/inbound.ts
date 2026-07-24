@@ -189,10 +189,17 @@ export async function dispatchAgentMailInboundEvent(params: {
     }
     throw new AgentMailLabelPendingError(params.record.messageId);
   }
-  const sender = parseSingleFromMailbox(message.from);
+  const sender =
+    typeof message.from === "string" ? parseSingleFromMailbox(message.from) : null;
   if (!sender) {
     params.log?.warn?.(
       `AgentMail rejected message ${message.messageId} with an ambiguous From mailbox`,
+    );
+    return;
+  }
+  if (typeof message.threadId !== "string" || !message.threadId.trim()) {
+    params.log?.warn?.(
+      `AgentMail rejected message ${message.messageId} with an invalid thread id`,
     );
     return;
   }
@@ -288,20 +295,13 @@ export async function dispatchAgentMailInboundEvent(params: {
   const turnAdoptionLifecycle = {
     admission: "exclusive" as const,
     onAdopted: async () => {
+      // Core has already adopted the turn when this observer runs. Transfer media ownership before
+      // persisting the ingress marker so a marker failure cannot delete files referenced by the
+      // adopted turn's recovery state or tools.
       turnAdoptionObserved = true;
-      try {
-        await params.onTurnAdopted?.();
-        turnAdopted = true;
-        detachAbortCleanup();
-      } catch (error) {
-        // Core has not started a fresh turn when its adoption observer rejects. Restore local media
-        // ownership so the normal failure/abort path can remove the files before a durable retry.
-        turnAdoptionObserved = false;
-        if (params.abortSignal?.aborted) {
-          await cleanupInboundMedia();
-        }
-        throw error;
-      }
+      turnAdopted = true;
+      detachAbortCleanup();
+      await params.onTurnAdopted?.();
     },
     onDeferred: () => {
       turnDeferred = true;

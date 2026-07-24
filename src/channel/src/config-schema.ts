@@ -11,6 +11,9 @@ import { z } from "openclaw/plugin-sdk/zod";
 // documented upper bound the schema enforces.
 export const AGENTMAIL_MEDIA_DEFAULT_MB = 20;
 export const AGENTMAIL_MEDIA_MAX_MB = 100;
+// One byte expressed in MiB. Preserve useful fractional limits (for example 0.5 MiB) while
+// rejecting positive values that floor to a misleading one-byte runtime limit.
+export const AGENTMAIL_MEDIA_MIN_MB = 1 / (1024 * 1024);
 
 const SecretInputSchema = buildSecretInputSchema();
 
@@ -26,7 +29,11 @@ const AgentMailAccountConfigSchema = z
     allowFrom: AllowFromListSchema,
     // Bounded so a typo cannot request an impractically large per-message buffer. 100 MiB comfortably
     // exceeds typical provider attachment limits; accounts.ts still floors this to finite integer bytes.
-    mediaMaxMb: z.number().positive().max(AGENTMAIL_MEDIA_MAX_MB).optional(),
+    mediaMaxMb: z
+      .number()
+      .min(AGENTMAIL_MEDIA_MIN_MB)
+      .max(AGENTMAIL_MEDIA_MAX_MB)
+      .optional(),
   })
   .strict();
 

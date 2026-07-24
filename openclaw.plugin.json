@@ -1,25 +1,25 @@
 {
   "id": "agentmail",
   "name": "AgentMail",
-  "description": "AgentMail for OpenClaw: email tools plus a durable, allowlisted, reply-only email channel.",
+  "description": "AgentMail for OpenClaw: a CLI-backed skill plus a durable, allowlisted, reply-only email channel.",
   "version": "0.1.0",
   "configSchema": {
     "type": "object",
     "properties": {
       "baseUrl": {
         "type": "string",
-        "description": "Optional AgentMail API base URL override.",
+        "description": "Optional AgentMail API base URL override for the bundled CLI.",
         "format": "uri"
       },
       "timeoutSeconds": {
         "type": "integer",
-        "description": "Maximum time to wait for an AgentMail API request.",
+        "description": "Deprecated tool setting retained for upgrade compatibility; the bundled CLI ignores it.",
         "minimum": 1,
         "maximum": 300
       },
       "maxRetries": {
         "type": "integer",
-        "description": "Number of times the AgentMail SDK retries a request.",
+        "description": "Deprecated tool setting retained for upgrade compatibility; the bundled CLI ignores it.",
         "minimum": 0,
         "maximum": 10
       }
@@ -31,6 +31,9 @@
   },
   "channels": [
     "agentmail"
+  ],
+  "skills": [
+    "./skills"
   ],
   "channelEnvVars": {
     "agentmail": [
@@ -236,7 +239,7 @@
           },
           "mediaMaxMb": {
             "type": "number",
-            "exclusiveMinimum": 0,
+            "minimum": 9.5367431640625e-7,
             "maximum": 100
           },
           "accounts": {
@@ -439,7 +442,7 @@
                 },
                 "mediaMaxMb": {
                   "type": "number",
-                  "exclusiveMinimum": 0,
+                  "minimum": 9.5367431640625e-7,
                   "maximum": 100
                 }
               },
@@ -453,7 +456,7 @@
         "additionalProperties": false
       },
       "label": "AgentMail",
-      "description": "AgentMail for OpenClaw: email tools plus a durable, allowlisted, reply-only email channel.",
+      "description": "AgentMail for OpenClaw: a CLI-backed skill plus a durable, allowlisted, reply-only email channel.",
       "uiHints": {
         "": {
           "label": "AgentMail",
@@ -487,18 +490,5 @@
         }
       }
     }
-  },
-  "contracts": {
-    "tools": [
-      "agentmail_list_inboxes",
-      "agentmail_create_inbox",
-      "agentmail_list_messages",
-      "agentmail_search_messages",
-      "agentmail_get_message",
-      "agentmail_send_message",
-      "agentmail_reply_to_message",
-      "agentmail_forward_message",
-      "agentmail_update_message_labels"
-    ]
   }
 }

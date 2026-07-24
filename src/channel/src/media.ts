@@ -17,6 +17,8 @@ export type AgentMailInboundMedia = {
 
 export class AgentMailMediaPolicyError extends Error {}
 
+export const AGENTMAIL_INBOUND_MAX_ATTACHMENTS = 25;
+
 function isAcceptedAttachment(attachment: AgentMail.Attachment): boolean {
   const disposition = attachment.contentDisposition?.toLocaleLowerCase("en-US");
   // An explicit attachment disposition wins even when the part also has a Content-ID. A bare
@@ -53,6 +55,11 @@ export async function loadAgentMailInboundAttachments(params: {
   maxBytes: number;
 }): Promise<AgentMailInboundMedia> {
   const accepted = params.attachments.filter(isAcceptedAttachment);
+  if (accepted.length > AGENTMAIL_INBOUND_MAX_ATTACHMENTS) {
+    throw new AgentMailMediaPolicyError(
+      `AgentMail message exceeds the ${AGENTMAIL_INBOUND_MAX_ATTACHMENTS}-attachment limit`,
+    );
+  }
   let declaredBytes = 0;
   for (const attachment of accepted) {
     // Hydrated AgentMail.Attachment objects require `size` in the provider SDK contract. Keep the

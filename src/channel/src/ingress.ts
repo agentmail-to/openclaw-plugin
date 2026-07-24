@@ -40,6 +40,7 @@ export type AgentMailIngressDispatch = (
 // tests exercise.
 const AGENTMAIL_MAX_DISPATCH_ATTEMPTS = 50;
 const AGENTMAIL_MAX_COMPLETION_ATTEMPTS = 50;
+const AGENTMAIL_MAX_RELEASE_ATTEMPTS = 50;
 
 type DeferredOutcome = "adopted" | "abandoned" | "completion-failed" | "aborted";
 
@@ -132,6 +133,37 @@ function nextDispatchDelayMs(params: {
     return base;
   }
   return Math.min(base, remaining);
+}
+
+async function releaseAgentMailIngressWithRetry(params: {
+  journal: AgentMailJournal;
+  id: string;
+  record: AgentMailIngressRecord;
+  lastError: string;
+  abortSignal?: AbortSignal;
+  retryDelay: (attempt: number) => number;
+  log?: AgentMailLog;
+}): Promise<"released" | "gone" | "aborted" | "exhausted"> {
+  let attempts = 0;
+  while (!params.abortSignal?.aborted) {
+    try {
+      return (await params.journal.release(params.id, { lastError: params.lastError }))
+        ? "released"
+        : "gone";
+    } catch (error) {
+      attempts += 1;
+      if (attempts >= AGENTMAIL_MAX_RELEASE_ATTEMPTS) {
+        params.log?.error?.(
+          `AgentMail could not release message ${params.record.messageId} after ${attempts} attempts: ${errorText(error)}`,
+        );
+        return "exhausted";
+      }
+      if (!(await waitForRetry(params.abortSignal, params.retryDelay(attempts)))) {
+        return "aborted";
+      }
+    }
+  }
+  return "aborted";
 }
 
 export async function processAgentMailIngress(params: {
@@ -339,9 +371,20 @@ async function dispatchAgentMailIngressUntilSettled(params: DispatchParams): Pro
           }
           return true;
         }
-        const released = await params.journal.release(params.id, { lastError });
-        if (!released) {
+        const releaseOutcome = await releaseAgentMailIngressWithRetry({
+          journal: params.journal,
+          id: params.id,
+          record: params.record,
+          lastError,
+          abortSignal: params.abortSignal,
+          retryDelay: params.retryDelay ?? retryDelayMs,
+          log: params.log,
+        });
+        if (releaseOutcome === "gone") {
           return true;
+        }
+        if (releaseOutcome !== "released") {
+          return false;
         }
         if (
           !(await waitForRetry(
@@ -377,27 +420,21 @@ async function dispatchAgentMailIngressUntilSettled(params: DispatchParams): Pro
           return true;
         }
         const lastError = errorText(dispatchError);
-        while (!params.abortSignal?.aborted) {
-          try {
-            const released = await params.journal.release(params.id, { lastError });
-            if (!released) {
-              // A concurrent completion or retention prune means this worker no longer owns a
-              // pending row. Redispatching without ownership could duplicate an adopted turn.
-              return true;
-            }
-            break;
-          } catch {
-            if (
-              !(await waitForRetry(
-                params.abortSignal,
-                (params.retryDelay ?? retryDelayMs)(dispatchAttempts),
-              ))
-            ) {
-              return false;
-            }
-          }
+        const releaseOutcome = await releaseAgentMailIngressWithRetry({
+          journal: params.journal,
+          id: params.id,
+          record: params.record,
+          lastError,
+          abortSignal: params.abortSignal,
+          retryDelay: params.retryDelay ?? retryDelayMs,
+          log: params.log,
+        });
+        if (releaseOutcome === "gone") {
+          // A concurrent completion or retention prune means this worker no longer owns a pending
+          // row. Redispatching without ownership could duplicate an adopted turn.
+          return true;
         }
-        if (params.abortSignal?.aborted) {
+        if (releaseOutcome !== "released") {
           return false;
         }
         const shouldRetry = await waitForRetry(
