@@ -1,6 +1,7 @@
 import { MediaFetchError } from "openclaw/plugin-sdk/media-runtime";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  AGENTMAIL_INBOUND_MAX_ATTACHMENTS,
   AgentMailMediaPolicyError,
   loadAgentMailInboundAttachments,
   loadAgentMailOutboundAttachments,
@@ -97,6 +98,23 @@ describe("AgentMail inbound attachments", () => {
       }),
     ).resolves.toEqual({ paths: ["/tmp/cid.png"], types: ["image/png"] });
     expect(getAttachment).toHaveBeenCalledOnce();
+  });
+
+  it("rejects excessive attachment counts before downloading", async () => {
+    const getAttachment = vi.fn();
+    await expect(
+      loadAgentMailInboundAttachments({
+        client: { inboxes: { messages: { getAttachment } } } as never,
+        inboxId: "inbox_1",
+        messageId: "message_1",
+        attachments: Array.from(
+          { length: AGENTMAIL_INBOUND_MAX_ATTACHMENTS + 1 },
+          (_, index) => ({ attachmentId: `attachment-${index}`, size: 0 }),
+        ),
+        maxBytes: 100,
+      }),
+    ).rejects.toThrow("attachment limit");
+    expect(getAttachment).not.toHaveBeenCalled();
   });
 
   it.each([undefined, Number.NaN, -1, 1.5])(

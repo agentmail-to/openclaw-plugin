@@ -95,6 +95,76 @@ describe("AgentMail WebSocket ingress", () => {
     expect(close).toHaveBeenCalledTimes(2);
   });
 
+  it("does not reset reconnect backoff for open-close flaps", async () => {
+    handlers.clear();
+    connect.mockClear();
+    const reconnectDelay = vi.fn(() => 0);
+    let nowMs = 1_000;
+    const controller = new AbortController();
+    const running = startAgentMailWebSocket({
+      account,
+      abortSignal: controller.signal,
+      receive: vi.fn(async () => undefined),
+      catchUpSession: { run: catchUpRun },
+      reconnectDelayMs: reconnectDelay,
+      now: () => nowMs,
+    });
+
+    await vi.waitFor(() => expect(handlers.has("open")).toBe(true));
+    handlers.get("open")?.();
+    handlers.get("close")?.();
+    await vi.waitFor(() => expect(connect).toHaveBeenCalledTimes(2));
+    handlers.get("open")?.();
+    handlers.get("close")?.();
+    await vi.waitFor(() => expect(connect).toHaveBeenCalledTimes(3));
+    expect(reconnectDelay.mock.calls.map(([attempt]) => attempt)).toEqual([1, 2]);
+
+    handlers.get("open")?.();
+    nowMs += 30_000;
+    handlers.get("close")?.();
+    await vi.waitFor(() => expect(connect).toHaveBeenCalledTimes(4));
+    expect(reconnectDelay.mock.calls.map(([attempt]) => attempt)).toEqual([1, 2, 1]);
+
+    controller.abort();
+    await running;
+  });
+
+  it("resets reconnect backoff when a short-lived connection delivers an event", async () => {
+    handlers.clear();
+    connect.mockClear();
+    const reconnectDelay = vi.fn(() => 0);
+    const controller = new AbortController();
+    const running = startAgentMailWebSocket({
+      account,
+      abortSignal: controller.signal,
+      receive: vi.fn(async () => undefined),
+      catchUpSession: { run: catchUpRun },
+      reconnectDelayMs: reconnectDelay,
+    });
+
+    await vi.waitFor(() => expect(handlers.has("open")).toBe(true));
+    handlers.get("open")?.();
+    handlers.get("close")?.();
+    await vi.waitFor(() => expect(connect).toHaveBeenCalledTimes(2));
+    handlers.get("open")?.();
+    handlers.get("message")?.({
+      type: "event",
+      eventType: "message.received",
+      message: {
+        inboxId: "inbox_1",
+        messageId: "message_productive_socket",
+        labels: ["received"],
+        timestamp: new Date(1_234),
+      },
+    });
+    handlers.get("close")?.();
+    await vi.waitFor(() => expect(connect).toHaveBeenCalledTimes(3));
+
+    expect(reconnectDelay.mock.calls.map(([attempt]) => attempt)).toEqual([1, 1]);
+    controller.abort();
+    await running;
+  });
+
   it("stops cleanly when aborted before the initial socket opens", async () => {
     handlers.clear();
     close.mockClear();

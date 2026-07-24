@@ -5,6 +5,7 @@ import type { AgentMailLog } from "./log.js";
 import {
   collectAgentMailAccountIdWarnings,
   findConflictingAgentMailInboxOwner,
+  isAgentMailAccountConfigured,
 } from "./accounts.js";
 import {
   createAgentMailCatchUpSession,
@@ -71,7 +72,7 @@ export function collectAgentMailSecurityWarnings(account: ResolvedAgentMailAccou
 
 export function collectAgentMailStartupWarnings(account: ResolvedAgentMailAccount): string[] {
   const warnings: string[] = [];
-  if (!account.apiKey || !account.inboxId) {
+  if (!isAgentMailAccountConfigured(account)) {
     warnings.push("- AgentMail: apiKey and inboxId are required.");
   }
   warnings.push(...collectAgentMailSecurityWarnings(account));
@@ -95,7 +96,7 @@ export async function startAgentMailGatewayAccount(params: {
   for (const warning of warnings) {
     params.log?.warn?.(warning);
   }
-  if (!params.account.apiKey || !params.account.inboxId) {
+  if (!isAgentMailAccountConfigured(params.account)) {
     return await waitUntilAbort(params.abortSignal);
   }
   const inboxOwner = findConflictingAgentMailInboxOwner(params.cfg, params.account);

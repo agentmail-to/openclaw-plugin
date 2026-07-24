@@ -167,7 +167,10 @@ async function sendBoundAgentMailReply(
   ) {
     throw new Error("AgentMail reply target did not hydrate to the configured inbox and message.");
   }
-  const sender = parseSingleFromMailbox(triggeringMessage.from);
+  const sender =
+    typeof triggeringMessage.from === "string"
+      ? parseSingleFromMailbox(triggeringMessage.from)
+      : null;
   if (
     !sender ||
     !isAgentMailSenderAllowed({

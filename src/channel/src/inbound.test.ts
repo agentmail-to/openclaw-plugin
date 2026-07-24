@@ -398,7 +398,7 @@ describe("AgentMail REST-authoritative inbound", () => {
     expect(rm).toHaveBeenCalledWith("/tmp/ignored.bin", { force: true });
   });
 
-  it("cleans up attachments when the adoption hook itself fails", async () => {
+  it("preserves adopted attachments when journal completion fails", async () => {
     rm.mockClear();
     loadAgentMailInboundAttachments.mockResolvedValueOnce({
       paths: ["/tmp/b.bin"],
@@ -432,8 +432,9 @@ describe("AgentMail REST-authoritative inbound", () => {
         onTurnAdopted,
       }),
     ).rejects.toThrow("journal.complete failed");
-    // The flag is set only after the hook resolves, so a failed completion still cleans up media.
-    expect(rm).toHaveBeenCalledWith("/tmp/b.bin", { force: true });
+    // Core invoked the hook only after adoption, so its recovery state and tools may still reference
+    // this media even though persisting the ingress completion marker failed.
+    expect(rm).not.toHaveBeenCalled();
   });
 
   it("denies an unauthorized hydrated sender without dispatch", async () => {
@@ -450,6 +451,33 @@ describe("AgentMail REST-authoritative inbound", () => {
       } as never,
     });
     expect(run).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["non-string sender", { from: ["sender@example.com"] }],
+    ["missing thread id", { threadId: undefined }],
+    ["empty thread id", { threadId: "   " }],
+  ])("settles a hydrated message with %s", async (_name, overrides) => {
+    const run = vi.fn();
+    const warn = vi.fn();
+    await expect(
+      dispatchAgentMailInboundEvent({
+        cfg: {},
+        account,
+        record,
+        channelRuntime: { inbound: { run } } as never,
+        client: {
+          inboxes: {
+            messages: {
+              get: vi.fn(async () => message(overrides as Partial<AgentMail.Message>)),
+            },
+          },
+        } as never,
+        log: { warn },
+      }),
+    ).resolves.toBeUndefined();
+    expect(run).not.toHaveBeenCalled();
+    expect(warn).toHaveBeenCalled();
   });
 
   it("settles permanently unsafe hydrated messages without dispatch", async () => {
