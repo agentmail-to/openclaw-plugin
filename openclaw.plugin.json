@@ -2,7 +2,7 @@
   "id": "agentmail",
   "name": "AgentMail",
   "description": "AgentMail for OpenClaw: a CLI-backed skill plus a durable, allowlisted, reply-only email channel.",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "configSchema": {
     "type": "object",
     "properties": {
