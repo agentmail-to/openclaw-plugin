@@ -12,6 +12,7 @@ import {
   renameSync,
   rmSync,
   statSync,
+  utimesSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -28,6 +29,8 @@ const versionPath = join(vendorRoot, "VERSION");
 const preparationLock = `${vendorRoot}.prepare-lock`;
 const allTargets = Object.keys(release.assets).sort();
 const INCOMPLETE_LOCK_GRACE_MS = 30_000;
+const PREPARATION_LOCK_LEASE_MS = 5 * 60_000;
+const PREPARATION_LOCK_HEARTBEAT_MS = 30_000;
 
 function processIsRunning(pid) {
   if (!Number.isSafeInteger(pid) || pid <= 0) {
@@ -84,7 +87,25 @@ function acquirePreparationLock() {
         );
       }
     }
-    if (processIsRunning(existing?.pid)) {
+    const lockAgeMs = (() => {
+      try {
+        const mtimeMs = statSync(preparationLock).mtimeMs;
+        const createdAt =
+          Number.isFinite(existing?.createdAt) && existing.createdAt >= 0
+            ? existing.createdAt
+            : 0;
+        return Date.now() - Math.max(createdAt, mtimeMs);
+      } catch (error) {
+        if (error?.code === "ENOENT") {
+          return Number.POSITIVE_INFINITY;
+        }
+        throw error;
+      }
+    })();
+    if (
+      processIsRunning(existing?.pid) &&
+      lockAgeMs <= PREPARATION_LOCK_LEASE_MS
+    ) {
       throw new Error(
         `Another AgentMail CLI preparation (pid ${existing.pid}) is already using ${preparationLock}.`,
       );
@@ -103,6 +124,22 @@ function acquirePreparationLock() {
     }
   }
   throw new Error(`Could not acquire AgentMail CLI preparation lock ${preparationLock}.`);
+}
+
+function startPreparationLockHeartbeat(token) {
+  return setInterval(() => {
+    try {
+      const owner = JSON.parse(readFileSync(preparationLock, "utf8"));
+      if (owner?.pid !== process.pid || owner?.token !== token) {
+        return;
+      }
+      const now = new Date();
+      utimesSync(preparationLock, now, now);
+    } catch {
+      // A replacement lock belongs to another process. The owner-token check in release prevents
+      // this process from disturbing it during cleanup.
+    }
+  }, PREPARATION_LOCK_HEARTBEAT_MS);
 }
 
 function releasePreparationLock(token) {
@@ -219,6 +256,7 @@ async function prepareTarget(target, temporaryRoot, destinationRoot) {
 async function main() {
   mkdirSync(vendorParent, { recursive: true });
   const preparationLockToken = acquirePreparationLock();
+  const preparationLockHeartbeat = startPreparationLockHeartbeat(preparationLockToken);
 
   let temporaryRoot;
   let stagingParent;
@@ -288,6 +326,7 @@ async function main() {
       `Prepared AgentMail CLI ${release.version} for ${targets.length} target${targets.length === 1 ? "" : "s"}.`,
     );
   } finally {
+    clearInterval(preparationLockHeartbeat);
     if (temporaryRoot) {
       rmSync(temporaryRoot, { recursive: true, force: true });
     }

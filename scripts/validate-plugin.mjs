@@ -86,17 +86,13 @@ const expectedCliVersion = readFileSync(
   cliRunner.resolveAgentMailCliVendorPath("VERSION"),
   "utf8",
 ).trim();
-const currentCliTarget = cliRunner.resolveAgentMailCliTarget().directory;
 for (const [target, metadata] of Object.entries(cliRelease.assets)) {
   const executable = cliRunner.resolveAgentMailCliVendorPath(
     target,
     metadata.executableName,
   );
   if (!existsSync(executable)) {
-    if (target === currentCliTarget) {
-      fail(`bundled AgentMail CLI executable is missing for ${target}`);
-    }
-    continue;
+    fail(`bundled AgentMail CLI executable is missing for ${target}`);
   }
   const executableSha256 = createHash("sha256")
     .update(readFileSync(executable))

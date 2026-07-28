@@ -129,7 +129,7 @@ describe("AgentMail WebSocket ingress", () => {
     await running;
   });
 
-  it("resets reconnect backoff when a short-lived connection delivers an event", async () => {
+  it("does not reset reconnect backoff for traffic on a short-lived connection", async () => {
     handlers.clear();
     connect.mockClear();
     const reconnectDelay = vi.fn(() => 0);
@@ -160,7 +160,7 @@ describe("AgentMail WebSocket ingress", () => {
     handlers.get("close")?.();
     await vi.waitFor(() => expect(connect).toHaveBeenCalledTimes(3));
 
-    expect(reconnectDelay.mock.calls.map(([attempt]) => attempt)).toEqual([1, 1]);
+    expect(reconnectDelay.mock.calls.map(([attempt]) => attempt)).toEqual([1, 2]);
     controller.abort();
     await running;
   });
@@ -378,6 +378,34 @@ describe("AgentMail WebSocket ingress", () => {
     expect(error).toHaveBeenCalledWith(
       "AgentMail WebSocket error for account default: frame parse failed",
     );
+    controller.abort();
+    await running;
+  });
+
+  it("reconnects a half-open socket after its inactivity timeout", async () => {
+    handlers.clear();
+    catchUpRun.mockClear();
+    connect.mockClear();
+    close.mockClear();
+    const warn = vi.fn();
+    const controller = new AbortController();
+    const running = startAgentMailWebSocket({
+      account,
+      abortSignal: controller.signal,
+      receive: vi.fn(async () => undefined),
+      catchUpSession: { run: catchUpRun },
+      reconnectDelayMs: () => 0,
+      inactivityTimeoutMs: 1,
+      log: { warn },
+    });
+    await vi.waitFor(() => expect(handlers.has("open")).toBe(true));
+    handlers.get("open")?.();
+
+    await vi.waitFor(() => expect(connect.mock.calls.length).toBeGreaterThanOrEqual(2));
+    expect(warn).toHaveBeenCalledWith(
+      "AgentMail WebSocket inactive for account default; reconnecting",
+    );
+    expect(close).toHaveBeenCalled();
     controller.abort();
     await running;
   });

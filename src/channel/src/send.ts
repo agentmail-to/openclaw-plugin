@@ -142,9 +142,12 @@ function collectMediaUrls(ctx: AgentMailSendContext): string[] {
   }
   return [
     ...new Set(
-      [ctx.mediaUrl, ctx.payload.mediaUrl, ...(ctx.payload.mediaUrls ?? [])].filter(Boolean),
+      [ctx.mediaUrl, ctx.payload.mediaUrl, ...(ctx.payload.mediaUrls ?? [])]
+        .filter((value): value is string => typeof value === "string")
+        .map((value) => value.trim())
+        .filter(Boolean),
     ),
-  ] as string[];
+  ];
 }
 
 async function sendBoundAgentMailReply(

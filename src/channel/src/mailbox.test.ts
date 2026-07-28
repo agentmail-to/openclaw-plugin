@@ -21,6 +21,12 @@ describe("AgentMail mailbox authorization", () => {
     expect(parseSingleFromMailbox("<sender@example.com>")).toEqual({
       address: "sender@example.com",
     });
+    expect(parseSingleFromMailbox('"" <sender@example.com>')).toEqual({
+      address: "sender@example.com",
+    });
+    expect(parseSingleFromMailbox('"   " <sender@example.com>')).toEqual({
+      address: "sender@example.com",
+    });
     expect(parseSingleFromMailbox("Doe, John <john@example.com>")).toEqual({
       address: "john@example.com",
       name: "Doe, John",

@@ -126,6 +126,61 @@ describe("resolveAgentMailOutboundSessionRoute", () => {
     );
   });
 
+  it("does not fabricate a default-account route when multiple accounts are ambiguous", () => {
+    const multiCfg = {
+      channels: {
+        agentmail: {
+          defaultAccount: "sales",
+          accounts: {
+            sales: { apiKey: "key", inboxId: "sales@agentmail.to" },
+            support: { apiKey: "key", inboxId: "support@agentmail.to" },
+          },
+        },
+      },
+    } as never;
+
+    expect(
+      resolveAgentMailOutboundSessionRoute({
+        cfg: multiCfg,
+        agentId: "agent-1",
+        accountId: undefined,
+        target: "message:m",
+        threadId: "t1",
+      }),
+    ).toBeNull();
+  });
+
+  it("infers a named account from the active inbound session when accountId is omitted", () => {
+    const multiCfg = {
+      channels: {
+        agentmail: {
+          defaultAccount: "sales",
+          accounts: {
+            sales: { apiKey: "key", inboxId: "sales@agentmail.to" },
+            support: { apiKey: "key", inboxId: "support@agentmail.to" },
+          },
+        },
+      },
+    } as never;
+    const conversationId = buildAgentMailConversationId("support@agentmail.to", "t1");
+    const currentSessionKey = buildAgentMailSessionKey({
+      agentId: "agent-1",
+      accountId: "support",
+      conversationId,
+    });
+    const route = resolveAgentMailOutboundSessionRoute({
+      cfg: multiCfg,
+      agentId: "agent-1",
+      accountId: undefined,
+      currentSessionKey,
+      target: "message:m",
+      threadId: "t1",
+    });
+
+    expect(route?.sessionKey).toBe(currentSessionKey);
+    expect(route?.peer.id).toBe(conversationId);
+  });
+
   it("returns null for a non-AgentMail target", () => {
     expect(
       resolveAgentMailOutboundSessionRoute({

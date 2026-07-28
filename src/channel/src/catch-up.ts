@@ -395,12 +395,21 @@ export async function createAgentMailCatchUpSession(params: {
       const runAtMs = now();
       const recoveryFloorMs = runAtMs - AGENTMAIL_DURABLE_PENDING_TTL_MS;
       const requestedSinceBaseline = sinceBaseline === true;
-      const resumableCheckpoint =
+      const eligibleCheckpoint =
         storedCursor.checkpoint &&
-        storedCursor.checkpoint.sinceBaseline === requestedSinceBaseline &&
         storedCursor.checkpoint.beforeAtMs <= runAtMs + 1 &&
         storedCursor.checkpoint.afterAtMs >= recoveryFloorMs
           ? storedCursor.checkpoint
+          : undefined;
+      const resumableCheckpoint =
+        eligibleCheckpoint?.sinceBaseline === requestedSinceBaseline
+          ? eligibleCheckpoint
+          : undefined;
+      // A short normal overlap must not erase a paused deep sweep's continuation. The cursor format
+      // has one checkpoint slot, so deep recovery takes priority until it completes.
+      const pausedDeepCheckpoint =
+        !requestedSinceBaseline && eligibleCheckpoint?.sinceBaseline
+          ? eligibleCheckpoint
           : undefined;
       const sweepAtMs = resumableCheckpoint
         ? resumableCheckpoint.beforeAtMs - 1
@@ -445,6 +454,14 @@ export async function createAgentMailCatchUpSession(params: {
           },
           { abortSignal },
         );
+        if (!page || typeof page !== "object" || !Array.isArray(page.messages)) {
+          // Do not let one malformed provider response trap the serialized supervisor in its retry
+          // loop. Leave the cursor untouched and let the next periodic pass retry the same range.
+          params.log?.error?.(
+            `AgentMail catch-up received a malformed messages page for account ${params.account.accountId}`,
+          );
+          return;
+        }
         for (const message of page.messages) {
           if (abortSignal.aborted) {
             return;
@@ -511,13 +528,14 @@ export async function createAgentMailCatchUpSession(params: {
             established: storedCursor.established,
             upperBoundAtMs: sweepAtMs,
             generation,
-            checkpoint: {
-              afterAtMs: afterMs,
-              beforeAtMs: beforeMs,
-              pageToken: pageCursor,
-              highWaterAtMs,
-              sinceBaseline: requestedSinceBaseline,
-            },
+            checkpoint:
+              pausedDeepCheckpoint ?? {
+                afterAtMs: afterMs,
+                beforeAtMs: beforeMs,
+                pageToken: pageCursor,
+                highWaterAtMs,
+                sinceBaseline: requestedSinceBaseline,
+              },
           });
           if (!persisted) {
             return;
@@ -536,7 +554,7 @@ export async function createAgentMailCatchUpSession(params: {
         established: true,
         upperBoundAtMs: sweepAtMs,
         generation,
-        checkpoint: null,
+        checkpoint: pausedDeepCheckpoint ?? null,
       });
       if (!persisted) {
         return;

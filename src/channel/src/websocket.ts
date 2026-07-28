@@ -18,6 +18,7 @@ import type { AgentMailIngressRecord, ResolvedAgentMailAccount } from "./types.j
 
 const AGENTMAIL_WEBSOCKET_LIVE_QUEUE_MAX = 32;
 const AGENTMAIL_WEBSOCKET_STABLE_CONNECTION_MS = 30_000;
+const AGENTMAIL_WEBSOCKET_INACTIVITY_TIMEOUT_MS = 2 * 60_000;
 // A single record must not pin the one bounded live worker forever. After this many failed durable
 // admissions, hand the record to REST catch-up (which retains the provider-side source) so later
 // live events keep advancing.
@@ -98,6 +99,7 @@ export async function startAgentMailWebSocket(params: {
   liveQueueMax?: number;
   catchUpIntervalMs?: number;
   deepSweepIntervalMs?: number;
+  inactivityTimeoutMs?: number;
   client?: AgentMailClient;
   now?: () => number;
 }): Promise<void> {
@@ -112,6 +114,8 @@ export async function startAgentMailWebSocket(params: {
   const retryDelay = params.retryDelayMs ?? websocketRetryDelayMs;
   const reconnectDelay = params.reconnectDelayMs ?? retryDelay;
   const liveQueueMax = params.liveQueueMax ?? AGENTMAIL_WEBSOCKET_LIVE_QUEUE_MAX;
+  const inactivityTimeoutMs =
+    params.inactivityTimeoutMs ?? AGENTMAIL_WEBSOCKET_INACTIVITY_TIMEOUT_MS;
   const now = params.now ?? Date.now;
   const liveQueue: AgentMailIngressRecord[] = [];
   const queuedMessageIds = new Set<string>();
@@ -255,18 +259,44 @@ export async function startAgentMailWebSocket(params: {
         // the same durable id, closing restart/reconnect gaps without creating duplicate turns.
         catchUpSupervisor.request();
       };
+      let cancelInactivityTimeout = () => {};
       const closed = new Promise<void>((resolve) => {
         let settled = false;
+        let inactivityTimer: ReturnType<typeof setTimeout> | undefined;
         const settleClosed = () => {
           if (settled) {
             return;
           }
           settled = true;
+          if (inactivityTimer) {
+            clearTimeout(inactivityTimer);
+          }
           subscribedForCurrentConnection = false;
           resolve();
         };
+        const armInactivityTimeout = () => {
+          if (inactivityTimer) {
+            clearTimeout(inactivityTimer);
+          }
+          inactivityTimer = setTimeout(() => {
+            params.log?.warn?.(
+              `AgentMail WebSocket inactive for account ${params.account.accountId}; reconnecting`,
+            );
+            catchUpSupervisor.request();
+            settleClosed();
+          }, inactivityTimeoutMs);
+        };
+        cancelInactivityTimeout = () => {
+          if (inactivityTimer) {
+            clearTimeout(inactivityTimer);
+            inactivityTimer = undefined;
+          }
+        };
+        // Also cover a socket that never emits its initial open/error/close event.
+        armInactivityTimeout();
         socket.on("open", () => {
           subscribe();
+          armInactivityTimeout();
         });
         socket.on("close", settleClosed);
         socket.on("error", (error) => {
@@ -281,11 +311,10 @@ export async function startAgentMailWebSocket(params: {
           settleClosed();
         });
         socket.on("message", (event) => {
-          if (handleMessage(event)) {
-            // A valid event proves the subscription is productive even when an intermediary
-            // recycles it before the 30-second stability threshold.
-            reconnectAttempt = 0;
-          }
+          // Any frame proves transport activity, but traffic must not bypass the 30-second
+          // reconnect stability gate below (duplicates and capacity-dropped events included).
+          armInactivityTimeout();
+          handleMessage(event);
         });
       });
       // waitForOpen() does not settle on an aborted initial connection; close the already-open race
@@ -294,6 +323,7 @@ export async function startAgentMailWebSocket(params: {
         subscribe();
       }
       await Promise.race([closed, aborted]);
+      cancelInactivityTimeout();
       socket.close();
       if (params.abortSignal.aborted) {
         return;

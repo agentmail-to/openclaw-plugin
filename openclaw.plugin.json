@@ -6,20 +6,98 @@
   "configSchema": {
     "type": "object",
     "properties": {
+      "apiKey": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "oneOf": [
+              {
+                "type": "object",
+                "properties": {
+                  "source": {
+                    "type": "string",
+                    "const": "env"
+                  },
+                  "provider": {
+                    "type": "string",
+                    "pattern": "^[a-z][a-z0-9_-]{0,63}$"
+                  },
+                  "id": {
+                    "type": "string",
+                    "pattern": "^[A-Z][A-Z0-9_]{0,127}$"
+                  }
+                },
+                "required": [
+                  "source",
+                  "provider",
+                  "id"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "source": {
+                    "type": "string",
+                    "const": "file"
+                  },
+                  "provider": {
+                    "type": "string",
+                    "pattern": "^[a-z][a-z0-9_-]{0,63}$"
+                  },
+                  "id": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "source",
+                  "provider",
+                  "id"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "source": {
+                    "type": "string",
+                    "const": "exec"
+                  },
+                  "provider": {
+                    "type": "string",
+                    "pattern": "^[a-z][a-z0-9_-]{0,63}$"
+                  },
+                  "id": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "source",
+                  "provider",
+                  "id"
+                ],
+                "additionalProperties": false
+              }
+            ]
+          }
+        ]
+      },
       "baseUrl": {
-        "type": "string",
         "description": "Optional AgentMail API base URL override for the bundled CLI.",
+        "type": "string",
         "format": "uri"
       },
       "timeoutSeconds": {
-        "type": "integer",
         "description": "Deprecated tool setting retained for upgrade compatibility; the bundled CLI ignores it.",
+        "type": "integer",
         "minimum": 1,
         "maximum": 300
       },
       "maxRetries": {
-        "type": "integer",
         "description": "Deprecated tool setting retained for upgrade compatibility; the bundled CLI ignores it.",
+        "type": "integer",
         "minimum": 0,
         "maximum": 10
       }

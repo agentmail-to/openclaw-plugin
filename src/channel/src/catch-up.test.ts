@@ -690,6 +690,38 @@ describe("AgentMail durable REST catch-up", () => {
     expect(receive).toHaveBeenCalledTimes(1);
   });
 
+  it("leaves the cursor retryable when a provider page has no messages array", async () => {
+    const store = memoryStore<AgentMailCatchUpCursor>();
+    const key = sha256Hex("default\ninbox_1");
+    const list = vi
+      .fn()
+      .mockResolvedValueOnce({ count: 1 })
+      .mockResolvedValueOnce({ count: 0, messages: [] });
+    const error = vi.fn();
+    const session = await createAgentMailCatchUpSession({
+      account,
+      client: { inboxes: { messages: { list } } } as never,
+      store,
+      now: () => 2_000,
+      log: { error },
+    });
+
+    await session.run({
+      receive: vi.fn(),
+      abortSignal: new AbortController().signal,
+    });
+    expect(await store.lookup(key)).toMatchObject({ established: false });
+    expect(error).toHaveBeenCalledWith(
+      "AgentMail catch-up received a malformed messages page for account default",
+    );
+
+    await session.run({
+      receive: vi.fn(),
+      abortSignal: new AbortController().signal,
+    });
+    expect(await store.lookup(key)).toMatchObject({ established: true });
+  });
+
   it("does not establish the cursor past a failed durable admission", async () => {
     const store = memoryStore<never>();
     const page = {
@@ -786,6 +818,76 @@ describe("AgentMail durable REST catch-up", () => {
       "backdated",
       "backdated",
     ]);
+  });
+
+  it("preserves a paused deep-sweep continuation across a normal sweep", async () => {
+    const store = memoryStore<AgentMailCatchUpCursor>();
+    const key = sha256Hex("default\ninbox_1");
+    await store.register(key, {
+      version: 1,
+      baselineAtMs: 100_000,
+      highWaterAtMs: 800_000,
+      established: true,
+    });
+    let deepPageTwoPauses = true;
+    const list = vi.fn(
+      async (_inboxId: string, options: { after: Date; pageToken?: string }) => {
+        if (options.pageToken === "deep_page_2") {
+          return {
+            count: 1,
+            messages: [message({ id: "deep_old", timestamp: 200_000 })],
+          };
+        }
+        if (options.after.getTime() === 100_000) {
+          return {
+            count: 1,
+            messages: [message({ id: "deep_page_1", timestamp: 300_000 })],
+            nextPageToken: "deep_page_2",
+          };
+        }
+        return { count: 0, messages: [] };
+      },
+    );
+    const session = await createAgentMailCatchUpSession({
+      account,
+      client: { inboxes: { messages: { list } } } as never,
+      store,
+      now: () => 1_000_000,
+    });
+    const receive = vi.fn(async (record: AgentMailIngressRecord) => {
+      if (record.messageId === "deep_old" && deepPageTwoPauses) {
+        deepPageTwoPauses = false;
+        throw new AgentMailIngressCapacityError();
+      }
+    });
+
+    await session.run({
+      receive,
+      abortSignal: new AbortController().signal,
+      sinceBaseline: true,
+    });
+    expect((await store.lookup(key))?.checkpoint).toMatchObject({
+      pageToken: "deep_page_2",
+      sinceBaseline: true,
+    });
+
+    await session.run({ receive, abortSignal: new AbortController().signal });
+    expect((await store.lookup(key))?.checkpoint).toMatchObject({
+      pageToken: "deep_page_2",
+      sinceBaseline: true,
+    });
+
+    await session.run({
+      receive,
+      abortSignal: new AbortController().signal,
+      sinceBaseline: true,
+    });
+    expect(list).toHaveBeenLastCalledWith(
+      "inbox_1",
+      expect.objectContaining({ pageToken: "deep_page_2" }),
+      expect.any(Object),
+    );
+    expect((await store.lookup(key))?.checkpoint).toBeUndefined();
   });
 
   it("resumes the last completed page after a mid-page abort", async () => {

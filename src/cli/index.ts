@@ -2,6 +2,7 @@ import {
   definePluginEntry,
   type OpenClawPluginDefinition,
 } from "openclaw/plugin-sdk/plugin-entry";
+import { resolveConfiguredSecretInputString } from "openclaw/plugin-sdk/secret-input-runtime";
 import {
   agentMailCliConfigSchema,
   parseAgentMailCliConfig,
@@ -34,7 +35,26 @@ export function createAgentMailCliPlugin(
             .allowExcessArguments(true)
             .action(async (args: string[]) => {
               try {
-                const exitCode = await runCli(withConfiguredBaseUrl(args, config.baseUrl));
+                let apiKey: string | undefined;
+                if (config.apiKey) {
+                  const resolved = await resolveConfiguredSecretInputString({
+                    config: api.config,
+                    env: process.env,
+                    value: config.apiKey,
+                    path: "plugins.entries.agentmail.config.apiKey",
+                  });
+                  if (!resolved.value) {
+                    throw new Error(
+                      resolved.unresolvedRefReason ??
+                        "AgentMail CLI apiKey resolved to an empty value.",
+                    );
+                  }
+                  apiKey = resolved.value;
+                }
+                const exitCode = await runCli(
+                  withConfiguredBaseUrl(args, config.baseUrl),
+                  { apiKey },
+                );
                 if (exitCode !== 0) {
                   process.exitCode = exitCode;
                 }
@@ -45,7 +65,6 @@ export function createAgentMailCliPlugin(
             });
         },
         {
-          commands: ["agentmail"],
           descriptors: [
             {
               name: "agentmail",

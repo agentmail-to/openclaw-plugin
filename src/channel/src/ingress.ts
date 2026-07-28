@@ -148,6 +148,57 @@ async function releaseAgentMailIngressWithRetry(params: {
   return "aborted";
 }
 
+async function transitionFailedAgentMailIngress(params: {
+  journal: AgentMailJournal;
+  id: string;
+  record: AgentMailIngressRecord;
+  attempts: number;
+  lastError: string;
+  terminalLogMessage: string;
+  retryDelayMs: number;
+  abortSignal?: AbortSignal;
+  retryDelay: (attempt: number) => number;
+  log?: AgentMailLog;
+}): Promise<"retry" | "settled" | "stopped"> {
+  if (params.attempts >= AGENTMAIL_MAX_DISPATCH_ATTEMPTS) {
+    params.log?.error?.(params.terminalLogMessage);
+    try {
+      if (params.journal.fail) {
+        await params.journal.fail(params.id, {
+          reason: "dispatch-attempts-exhausted",
+          message: params.lastError,
+        });
+      } else {
+        await params.journal.complete(params.id);
+      }
+    } catch {
+      // Best effort: TTL pruning still reclaims the row if the terminal marker cannot persist.
+    }
+    return "settled";
+  }
+
+  const releaseOutcome = await releaseAgentMailIngressWithRetry({
+    journal: params.journal,
+    id: params.id,
+    record: params.record,
+    lastError: params.lastError,
+    abortSignal: params.abortSignal,
+    retryDelay: params.retryDelay,
+    log: params.log,
+  });
+  if (releaseOutcome === "gone") {
+    // A concurrent completion or retention prune means this worker no longer owns a pending row.
+    // Redispatching without ownership could duplicate an adopted turn.
+    return "settled";
+  }
+  if (releaseOutcome !== "released") {
+    return "stopped";
+  }
+  return (await waitForRetry(params.abortSignal, params.retryDelayMs))
+    ? "retry"
+    : "stopped";
+}
+
 export async function processAgentMailIngress(params: {
   journal: AgentMailJournal;
   record: AgentMailIngressRecord;
@@ -329,104 +380,52 @@ async function dispatchAgentMailIngressUntilSettled(params: DispatchParams): Pro
       if (turnAbandoned) {
         dispatchAttempts += 1;
         const lastError = "deferred turn abandoned before adoption";
-        if (dispatchAttempts >= AGENTMAIL_MAX_DISPATCH_ATTEMPTS) {
-          params.log?.error?.(
-            `AgentMail dropping message ${params.record.messageId} after ${dispatchAttempts} abandoned deferred turns`,
-          );
-          try {
-            if (params.journal.fail) {
-              await params.journal.fail(params.id, {
-                reason: "dispatch-attempts-exhausted",
-                message: lastError,
-              });
-            } else {
-              await params.journal.complete(params.id);
-            }
-          } catch {
-            // Best effort: TTL pruning still reclaims the row if the terminal marker cannot
-            // persist.
-          }
-          return true;
-        }
-        const releaseOutcome = await releaseAgentMailIngressWithRetry({
+        const transition = await transitionFailedAgentMailIngress({
           journal: params.journal,
           id: params.id,
           record: params.record,
+          attempts: dispatchAttempts,
           lastError,
+          terminalLogMessage:
+            `AgentMail dropping message ${params.record.messageId} after ` +
+            `${dispatchAttempts} abandoned deferred turns`,
           abortSignal: params.abortSignal,
           retryDelay: params.retryDelay ?? retryDelayMs,
+          retryDelayMs: (params.retryDelay ?? retryDelayMs)(dispatchAttempts),
           log: params.log,
         });
-        if (releaseOutcome === "gone") {
-          return true;
+        if (transition === "retry") {
+          continue;
         }
-        if (releaseOutcome !== "released") {
-          return false;
-        }
-        if (
-          !(await waitForRetry(
-            params.abortSignal,
-            (params.retryDelay ?? retryDelayMs)(dispatchAttempts),
-          ))
-        ) {
-          return false;
-        }
-        continue;
+        return transition === "settled";
       }
 
       if (dispatchFailed) {
         dispatchAttempts += 1;
-        if (dispatchAttempts >= AGENTMAIL_MAX_DISPATCH_ATTEMPTS) {
-          // Poison message: it has failed deterministically past the retry ceiling. Mark it
-          // terminal so it stops occupying an admission slot and blocking new mail.
-          params.log?.error?.(
-            `AgentMail dropping message ${params.record.messageId} after ${dispatchAttempts} failed dispatch attempts: ${errorText(dispatchError)}`,
-          );
-          try {
-            if (params.journal.fail) {
-              await params.journal.fail(params.id, {
-                reason: "dispatch-attempts-exhausted",
-                message: errorText(dispatchError),
-              });
-            } else {
-              await params.journal.complete(params.id);
-            }
-          } catch {
-            // Best effort: TTL pruning still reclaims the row if the terminal marker cannot persist.
-          }
-          return true;
-        }
         const lastError = errorText(dispatchError);
-        const releaseOutcome = await releaseAgentMailIngressWithRetry({
+        const transition = await transitionFailedAgentMailIngress({
           journal: params.journal,
           id: params.id,
           record: params.record,
+          attempts: dispatchAttempts,
           lastError,
+          terminalLogMessage:
+            `AgentMail dropping message ${params.record.messageId} after ` +
+            `${dispatchAttempts} failed dispatch attempts: ${lastError}`,
           abortSignal: params.abortSignal,
           retryDelay: params.retryDelay ?? retryDelayMs,
-          log: params.log,
-        });
-        if (releaseOutcome === "gone") {
-          // A concurrent completion or retention prune means this worker no longer owns a pending
-          // row. Redispatching without ownership could duplicate an adopted turn.
-          return true;
-        }
-        if (releaseOutcome !== "released") {
-          return false;
-        }
-        const shouldRetry = await waitForRetry(
-          params.abortSignal,
-          nextDispatchDelayMs({
+          retryDelayMs: nextDispatchDelayMs({
             error: dispatchError,
             record: params.record,
             attempts: dispatchAttempts,
             retryDelay: params.retryDelay ?? retryDelayMs,
           }),
-        );
-        if (!shouldRetry) {
-          return false;
+          log: params.log,
+        });
+        if (transition === "retry") {
+          continue;
         }
-        continue;
+        return transition === "settled";
       }
       params.dispatchCompleted = true;
     }
