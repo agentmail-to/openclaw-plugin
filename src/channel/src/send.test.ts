@@ -590,7 +590,7 @@ describe("AgentMail reply-only outbound", () => {
     expect(reply).not.toHaveBeenCalled();
   });
 
-  it("uses persisted inbound arrival time to classify a 404 after restart", async () => {
+  it("uses the outbound queue time for a transient 404 after a long-running turn", async () => {
     reply.mockClear();
     const unavailableClient = {
       inboxes: {
@@ -614,15 +614,15 @@ describe("AgentMail reply-only outbound", () => {
         channel: "agentmail",
         to: "message:msg_1",
         accountId: "default",
-        // The recovered queue timestamp can be stale after restart; the durable inbound metadata
-        // remains the authoritative projection-window reference.
-        enqueuedAt: 0,
+        // The triggering turn can be much older than the reply. Recovery starts when the outbound
+        // row is enqueued, so a recent send still gets the full provider-projection window.
+        enqueuedAt: now - 1_000,
         retryCount: 2,
         effectiveReplyToId: "msg_1",
         payloads: [
           {
             text: "Hello",
-            channelData: { agentmail: { triggerArrivedAt: now - 1_000 } },
+            channelData: { agentmail: { triggerArrivedAt: 0 } },
           },
         ],
       } as never,

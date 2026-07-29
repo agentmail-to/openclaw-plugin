@@ -63,6 +63,7 @@ describe("AgentMail webhook", () => {
         inbox_id: "INBOX_1",
         message_id: "message_1",
         timestamp: "2026-07-15T12:34:56.000Z",
+        created_at: "2026-07-15T12:35:00.000Z",
       },
     });
     const res = response();
@@ -81,7 +82,33 @@ describe("AgentMail webhook", () => {
     );
   });
 
-  it("rejects far-future signed timestamps before durable admission", async () => {
+  it("falls back to provider creation time when the sender timestamp is invalid", async () => {
+    const receive = vi.fn(async () => undefined);
+    const body = JSON.stringify({
+      type: "event",
+      event_type: "message.received",
+      message: {
+        inbox_id: "inbox_1",
+        message_id: "message_created",
+        timestamp: "not-a-date",
+        created_at: "2026-07-15T12:35:00.000Z",
+      },
+    });
+    const res = response();
+    await createAgentMailWebhookHandler({ account: account(), verifier, receive })(
+      request(body, signed(body)),
+      res,
+    );
+
+    expect(receive).toHaveBeenCalledWith(
+      expect.objectContaining({
+        messageId: "message_created",
+        receivedAt: Date.parse("2026-07-15T12:35:00.000Z"),
+      }),
+    );
+  });
+
+  it("admits far-future signed timestamps with bounded retention", async () => {
     const now = Date.now();
     const dateNow = vi.spyOn(Date, "now").mockReturnValue(now);
     const receive = vi.fn(async () => undefined);
@@ -101,7 +128,13 @@ describe("AgentMail webhook", () => {
         res,
       );
       expect(res.statusCode).toBe(200);
-      expect(receive).not.toHaveBeenCalled();
+      expect(receive).toHaveBeenCalledWith(
+        expect.objectContaining({
+          messageId: "message_future",
+          receivedAt: now + 24 * 60 * 60_000,
+          arrivedAt: now,
+        }),
+      );
     } finally {
       dateNow.mockRestore();
     }

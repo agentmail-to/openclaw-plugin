@@ -2,7 +2,10 @@ import { type AgentMailLog, errorText } from "./log.js";
 import type { createAgentMailDurableInboundReceiveJournal } from "./durable-receive.js";
 import { AgentMailIngressCapacityError, createAgentMailDurableInboundId } from "./durable-receive.js";
 import { HYDRATION_NOT_FOUND_RETRY_WINDOW_MS } from "./inbound.js";
-import { capAgentMailProviderTimestampForRetention } from "./received-message.js";
+import {
+  capAgentMailProviderTimestampForRetention,
+  isValidAgentMailTimestampMs,
+} from "./received-message.js";
 import { createBackoff, waitForRetry } from "./retry.js";
 import type { AgentMailIngressRecord } from "./types.js";
 
@@ -75,25 +78,27 @@ const activeDispatches = new Map<string, ActiveDispatch>();
 
 const retryDelayMs = createBackoff(30 * 60_000);
 
+function resolveAgentMailIngressTerminalAt(
+  record: AgentMailIngressRecord,
+  terminalAt = Date.now(),
+): number {
+  const providerReceivedAt = capAgentMailProviderTimestampForRetention(
+    isValidAgentMailTimestampMs(record.receivedAt) ? record.receivedAt : terminalAt,
+    terminalAt,
+  );
+  return Math.max(terminalAt, providerReceivedAt);
+}
+
 async function completeAgentMailIngress(params: {
   journal: AgentMailJournal;
   id: string;
   record: AgentMailIngressRecord;
 }): Promise<void> {
   // REST catch-up scans by provider timestamp. A live message stamped in the future must retain its
-  // tombstone until seven days after that provider time, or it can re-enter the scan window only
-  // after a locally-timestamped completion marker has already expired.
-  const completedAt = Date.now();
-  const rawProviderReceivedAt =
-    Number.isFinite(params.record.receivedAt) && params.record.receivedAt >= 0
-      ? params.record.receivedAt
-      : completedAt;
-  const providerReceivedAt = capAgentMailProviderTimestampForRetention(
-    rawProviderReceivedAt,
-    completedAt,
-  );
+  // tombstone through the durable recovery horizon after that bounded time, or it can re-enter a
+  // provider-time scan after a locally-timestamped marker has already expired.
   await params.journal.complete(params.id, {
-    completedAt: Math.max(completedAt, providerReceivedAt),
+    completedAt: resolveAgentMailIngressTerminalAt(params.record),
   });
 }
 
@@ -174,11 +179,25 @@ export async function processAgentMailIngress(params: {
   retryDelayMs?: (attempt: number) => number;
   log?: AgentMailLog;
 }): Promise<"accepted" | "duplicate"> {
-  const id = createAgentMailDurableInboundId(params.record);
+  // Enforce the retention invariant at the shared durable boundary as well as transport parsing.
+  // This protects future transports and direct callers from persisting an unbounded timestamp.
+  const arrivedAt = isValidAgentMailTimestampMs(params.record.arrivedAt)
+    ? params.record.arrivedAt
+    : Date.now();
+  const record = {
+    ...params.record,
+    receivedAt: capAgentMailProviderTimestampForRetention(
+      isValidAgentMailTimestampMs(params.record.receivedAt)
+        ? params.record.receivedAt
+        : arrivedAt,
+      arrivedAt,
+    ),
+  };
+  const id = createAgentMailDurableInboundId(record);
   // accept() throws AgentMailIngressCapacityError directly when durable ingress is full, so
   // transports can apply plugin-owned backpressure (reject new mail, keep accepted pending mail).
-  const accepted = await params.journal.accept(id, params.record, {
-    receivedAt: params.record.receivedAt,
+  const accepted = await params.journal.accept(id, record, {
+    receivedAt: record.receivedAt,
   });
   // "completed" is a durable dedupe hit. "failed" is a terminal tombstone in SDK releases that
   // expose one; compare as a string so the defensive branch also compiles where the accept-result
@@ -187,13 +206,13 @@ export async function processAgentMailIngress(params: {
   if (acceptedKind === "completed" || acceptedKind === "failed") {
     return "duplicate";
   }
-  const record = accepted.kind === "pending" ? accepted.record.payload : params.record;
+  const dispatchRecord = accepted.kind === "pending" ? accepted.record.payload : record;
   // Pending duplicates also register as successors. This closes the account-reload race where a
   // replacement replay ran just before the old account admitted its final live event.
   scheduleAgentMailIngressDispatch({
     journal: params.journal,
     id,
-    record,
+    record: dispatchRecord,
     dispatch: params.dispatch,
     abortSignal: params.abortSignal,
     retryDelay: params.retryDelayMs,
@@ -270,6 +289,7 @@ async function dispatchAgentMailIngressUntilSettled(params: DispatchParams): Pro
                     (await params.journal.fail(params.id, {
                       reason: "completion-marker-failed",
                       message: "AgentMail could not persist the adoption completion marker",
+                      failedAt: resolveAgentMailIngressTerminalAt(params.record),
                     }))
                   ) {
                     params.dispatchCompleted = true;
@@ -361,6 +381,7 @@ async function dispatchAgentMailIngressUntilSettled(params: DispatchParams): Pro
               await params.journal.fail(params.id, {
                 reason: "dispatch-attempts-exhausted",
                 message: lastError,
+                failedAt: resolveAgentMailIngressTerminalAt(params.record),
               });
             } else {
               await completeAgentMailIngress(params);
@@ -410,6 +431,7 @@ async function dispatchAgentMailIngressUntilSettled(params: DispatchParams): Pro
               await params.journal.fail(params.id, {
                 reason: "dispatch-attempts-exhausted",
                 message: errorText(dispatchError),
+                failedAt: resolveAgentMailIngressTerminalAt(params.record),
               });
             } else {
               await completeAgentMailIngress(params);
@@ -466,6 +488,7 @@ async function dispatchAgentMailIngressUntilSettled(params: DispatchParams): Pro
           return await params.journal.fail(params.id, {
             reason: "completion-marker-failed",
             message: "AgentMail could not persist the completion marker",
+            failedAt: resolveAgentMailIngressTerminalAt(params.record),
           });
         }
         return false;

@@ -182,7 +182,7 @@ describe("AgentMail WebSocket ingress", () => {
     expect(waitForOpen).not.toHaveBeenCalled();
   });
 
-  it("rejects far-future provider timestamps before durable admission", async () => {
+  it("admits far-future sender timestamps with bounded retention", async () => {
     handlers.clear();
     const now = 1_000_000;
     const dateNow = vi.spyOn(Date, "now").mockReturnValue(now);
@@ -208,13 +208,56 @@ describe("AgentMail WebSocket ingress", () => {
         },
       });
 
-      await vi.waitFor(() => expect(catchUpRun).toHaveBeenCalled());
-      expect(receive).not.toHaveBeenCalled();
+      await vi.waitFor(() => expect(receive).toHaveBeenCalledOnce());
+      expect(receive).toHaveBeenCalledWith(
+        expect.objectContaining({
+          messageId: "message_future",
+          receivedAt: now + 24 * 60 * 60_000,
+          arrivedAt: now,
+        }),
+      );
     } finally {
       controller.abort();
       await running;
       dateNow.mockRestore();
     }
+  });
+
+  it("admits invalid sender timestamps using provider creation time", async () => {
+    handlers.clear();
+    const now = 1_000_000;
+    const receive = vi.fn(async () => undefined);
+    const controller = new AbortController();
+    const running = startAgentMailWebSocket({
+      account,
+      abortSignal: controller.signal,
+      receive,
+      catchUpSession: { run: catchUpRun },
+      now: () => now,
+    });
+    await vi.waitFor(() => expect(handlers.has("message")).toBe(true));
+    handlers.get("message")?.({
+      type: "event",
+      eventType: "message.received",
+      message: {
+        inboxId: "inbox_1",
+        messageId: "message_created",
+        labels: ["received"],
+        timestamp: new Date(Number.NaN),
+        createdAt: new Date(900_000),
+      },
+    });
+
+    await vi.waitFor(() => expect(receive).toHaveBeenCalledOnce());
+    expect(receive).toHaveBeenCalledWith(
+      expect.objectContaining({
+        messageId: "message_created",
+        receivedAt: 900_000,
+        arrivedAt: now,
+      }),
+    );
+    controller.abort();
+    await running;
   });
 
   it("durably admits message.received frames before the received label projects", async () => {

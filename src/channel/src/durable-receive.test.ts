@@ -312,10 +312,15 @@ describe("AgentMail durable ingress", () => {
     const futureReceivedAt = now + 365 * 24 * 60 * 60 * 1000;
     const dateNow = vi.spyOn(Date, "now").mockReturnValue(now);
     const complete = vi.fn(async () => undefined);
+    const accept = vi.fn(async () => ({
+      kind: "accepted" as const,
+      duplicate: false,
+      record: {},
+    }));
     try {
       await processAgentMailIngress({
         journal: {
-          accept: async () => ({ kind: "accepted", duplicate: false, record: {} }),
+          accept,
           complete,
           release: vi.fn(),
         } as never,
@@ -327,6 +332,13 @@ describe("AgentMail durable ingress", () => {
         expect(complete).toHaveBeenCalledWith(createAgentMailDurableInboundId(record), {
           completedAt: now + AGENTMAIL_PROVIDER_FUTURE_SKEW_MAX_MS,
         }),
+      );
+      expect(accept).toHaveBeenCalledWith(
+        createAgentMailDurableInboundId(record),
+        expect.objectContaining({
+          receivedAt: now + AGENTMAIL_PROVIDER_FUTURE_SKEW_MAX_MS,
+        }),
+        { receivedAt: now + AGENTMAIL_PROVIDER_FUTURE_SKEW_MAX_MS },
       );
     } finally {
       dateNow.mockRestore();
@@ -762,33 +774,45 @@ describe("AgentMail durable ingress", () => {
     expect(fail).toHaveBeenCalledWith(createAgentMailDurableInboundId(record), {
       reason: "dispatch-attempts-exhausted",
       message: "deferred turn abandoned before adoption",
+      failedAt: expect.any(Number),
     });
   });
 
   it("fails a completion marker after its retry ceiling without redispatching", async () => {
+    const now = 1_000_000;
+    const futureRecord = {
+      ...record,
+      receivedAt: now + 365 * 24 * 60 * 60_000,
+    };
+    const dateNow = vi.spyOn(Date, "now").mockReturnValue(now);
     const dispatch = vi.fn(async () => undefined);
     const complete = vi.fn(async () => {
       throw new Error("database read-only");
     });
     const fail = vi.fn(async () => true);
-    await processAgentMailIngress({
-      journal: {
-        accept: async () => ({ kind: "accepted", duplicate: false, record: {} }),
-        complete,
-        release: vi.fn(),
-        fail,
-      } as never,
-      record,
-      dispatch,
-      retryDelayMs: () => 0,
-    });
-    await vi.waitFor(() => expect(fail).toHaveBeenCalledOnce());
-    expect(dispatch).toHaveBeenCalledOnce();
-    expect(complete).toHaveBeenCalledTimes(50);
-    expect(fail).toHaveBeenCalledWith(createAgentMailDurableInboundId(record), {
-      reason: "completion-marker-failed",
-      message: "AgentMail could not persist the completion marker",
-    });
+    try {
+      await processAgentMailIngress({
+        journal: {
+          accept: async () => ({ kind: "accepted", duplicate: false, record: {} }),
+          complete,
+          release: vi.fn(),
+          fail,
+        } as never,
+        record: futureRecord,
+        dispatch,
+        retryDelayMs: () => 0,
+      });
+      await vi.waitFor(() => expect(fail).toHaveBeenCalledOnce());
+      expect(dispatch).toHaveBeenCalledOnce();
+      expect(complete).toHaveBeenCalledTimes(50);
+      expect(fail).toHaveBeenCalledWith(createAgentMailDurableInboundId(futureRecord), {
+        reason: "completion-marker-failed",
+        message: "AgentMail could not persist the completion marker",
+        failedAt: now + AGENTMAIL_PROVIDER_FUTURE_SKEW_MAX_MS,
+      });
+    } finally {
+      dateNow.mockRestore();
+    }
   });
 
   it("does not replay a turn after adoption if later dispatch settlement fails", async () => {

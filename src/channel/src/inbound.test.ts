@@ -4,6 +4,7 @@ import {
   AgentMailLabelPendingError,
   buildAgentMailSessionKey,
   dispatchAgentMailInboundEvent,
+  reclaimAbortedAgentMailDeferredMedia,
   resolveAgentMailMessageText,
 } from "./inbound.js";
 import { AgentMailMediaPolicyError } from "./media.js";
@@ -262,7 +263,7 @@ describe("AgentMail REST-authoritative inbound", () => {
       text: "reply",
       channelData: {
         existing: true,
-        agentmail: { existingAgentMail: true, triggerArrivedAt: 1 },
+        agentmail: { existingAgentMail: true },
       },
     });
     expect(delivery.durable()).toMatchObject({
@@ -344,7 +345,7 @@ describe("AgentMail REST-authoritative inbound", () => {
     expect(onTurnAbandoned).toHaveBeenCalledOnce();
   });
 
-  it("does not delete core-owned deferred attachments when account shutdown aborts", async () => {
+  it("reclaims deferred attachments only after account shutdown settles", async () => {
     rm.mockClear();
     loadAgentMailInboundAttachments.mockResolvedValueOnce({
       paths: ["/tmp/deferred-abort.bin"],
@@ -383,8 +384,11 @@ describe("AgentMail REST-authoritative inbound", () => {
     await new Promise((resolve) => setTimeout(resolve, 0));
     expect(rm).not.toHaveBeenCalled();
 
-    await lifecycle?.onAbandoned();
+    await reclaimAbortedAgentMailDeferredMedia(controller.signal);
     expect(rm).toHaveBeenCalledWith("/tmp/deferred-abort.bin", { force: true });
+
+    await lifecycle?.onAbandoned();
+    expect(rm).toHaveBeenCalledTimes(1);
   });
 
   it("cleans up attachments when inbound handling resolves without adoption", async () => {

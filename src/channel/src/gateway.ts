@@ -15,7 +15,11 @@ import {
 import { createAgentMailClient } from "./client.js";
 import { waitForRetry } from "./retry.js";
 import { createAgentMailDurableInboundReceiveJournal } from "./durable-receive.js";
-import { dispatchAgentMailInboundEvent, type AgentMailChannelRuntime } from "./inbound.js";
+import {
+  dispatchAgentMailInboundEvent,
+  reclaimAbortedAgentMailDeferredMedia,
+  type AgentMailChannelRuntime,
+} from "./inbound.js";
 import { processAgentMailIngress, replayPendingAgentMailIngress } from "./ingress.js";
 import type { AgentMailIngressRecord, ResolvedAgentMailAccount } from "./types.js";
 import { createAgentMailWebhookHandler, createAgentMailWebhookVerifier } from "./webhook.js";
@@ -151,14 +155,19 @@ export async function startAgentMailGatewayAccount(params: {
     log: params.log,
   });
 
-  const startWebSocket = () =>
-    startAgentMailWebSocket({
-      account: params.account,
-      abortSignal: params.abortSignal,
-      receive,
-      log: params.log,
-      client,
-    });
+  const startWebSocket = async () => {
+    try {
+      await startAgentMailWebSocket({
+        account: params.account,
+        abortSignal: params.abortSignal,
+        receive,
+        log: params.log,
+        client,
+      });
+    } finally {
+      await reclaimAbortedAgentMailDeferredMedia(params.abortSignal);
+    }
+  };
 
   if (!params.account.webhookSecret) {
     params.log?.info?.(
@@ -281,4 +290,5 @@ export async function startAgentMailGatewayAccount(params: {
     }
   });
   await Promise.allSettled([...periodicWorkers, catchUpSupervisor.settle()]);
+  await reclaimAbortedAgentMailDeferredMedia(params.abortSignal);
 }

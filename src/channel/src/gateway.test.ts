@@ -18,6 +18,7 @@ const mocks = vi.hoisted(() => ({
   catchUpSettle: vi.fn(async () => undefined),
   createCatchUpSession: vi.fn(async () => ({ run: vi.fn(async () => undefined) })),
   registerError: false,
+  reclaimDeferredMedia: vi.fn(async () => undefined),
   webhookReceives: [] as Array<(record: unknown) => Promise<void>>,
 }));
 const apiVal = "key";
@@ -71,6 +72,11 @@ vi.mock("./catch-up.js", () => ({
 vi.mock("./ingress.js", () => ({
   processAgentMailIngress: mocks.processIngress,
   replayPendingAgentMailIngress: vi.fn(async () => undefined),
+}));
+
+vi.mock("./inbound.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./inbound.js")>()),
+  reclaimAbortedAgentMailDeferredMedia: mocks.reclaimDeferredMedia,
 }));
 
 vi.mock("./webhook.js", () => ({
@@ -166,6 +172,7 @@ describe("AgentMail gateway route ownership", () => {
     mocks.webhookReceives.length = 0;
     mocks.catchUpRequest.mockClear();
     mocks.processIngress.mockReset();
+    mocks.reclaimDeferredMedia.mockClear();
     mocks.processIngress.mockRejectedValueOnce(new Error("queue full"));
     const controller = new AbortController();
     const running = startAgentMailGatewayAccount({
@@ -189,6 +196,7 @@ describe("AgentMail gateway route ownership", () => {
     expect(mocks.catchUpRequest).toHaveBeenCalledTimes(2);
     controller.abort();
     await running;
+    expect(mocks.reclaimDeferredMedia).toHaveBeenCalledWith(controller.signal);
   });
 
   it("releases an account's old path without letting stale cleanup remove its replacement", async () => {

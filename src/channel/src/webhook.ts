@@ -7,7 +7,7 @@ import { Webhook } from "svix";
 import { type AgentMailLog, errorText } from "./log.js";
 import {
   agentMailInboxIdsEqual,
-  isAgentMailProviderTimestampWithinFutureSkew,
+  capAgentMailProviderTimestampForRetention,
   resolveAgentMailTimestampMs,
 } from "./received-message.js";
 import type { AgentMailIngressRecord, ResolvedAgentMailAccount } from "./types.js";
@@ -46,7 +46,10 @@ function parseVerifiedEvent(payload: unknown): {
   if (!inboxId || !messageId) {
     return null;
   }
-  const receivedAt = resolveAgentMailTimestampMs(mail.timestamp);
+  // message.timestamp drives REST scan ordering, so retain its bounded value for dedupe. Fall back
+  // to provider ingestion time when the sender-authored timestamp is absent or malformed.
+  const receivedAt =
+    resolveAgentMailTimestampMs(mail.timestamp) ?? resolveAgentMailTimestampMs(mail.created_at);
   return { inboxId, messageId, ...(receivedAt === null ? {} : { receivedAt }) };
 }
 
@@ -121,21 +124,16 @@ export function createAgentMailWebhookHandler(params: {
     }
     try {
       const nowMs = Date.now();
-      if (
-        event.receivedAt !== undefined &&
-        !isAgentMailProviderTimestampWithinFutureSkew(event.receivedAt, nowMs)
-      ) {
-        // Acknowledging a signed but policy-invalid event prevents provider retry amplification.
-        // REST catch-up will admit it only if its provider time later enters the bounded window.
-        params.log?.warn?.("AgentMail webhook ignored an event timestamped too far in the future");
-        return respond(res, 200);
-      }
+      const receivedAt = capAgentMailProviderTimestampForRetention(
+        event.receivedAt ?? nowMs,
+        nowMs,
+      );
       await params.receive({
         accountId: params.account.accountId,
         inboxId: params.account.inboxId,
         messageId: event.messageId,
         transport: "webhook",
-        receivedAt: event.receivedAt ?? nowMs,
+        receivedAt,
         arrivedAt: nowMs,
       });
       return respond(res, 200);

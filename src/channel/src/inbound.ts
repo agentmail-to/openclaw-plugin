@@ -13,11 +13,32 @@ import {
   agentMailInboxIdsEqual,
   resolveAgentMailTimestampMs,
 } from "./received-message.js";
-import { withAgentMailTriggerArrival } from "./reply-metadata.js";
 import type { AgentMailIngressRecord, ResolvedAgentMailAccount } from "./types.js";
 
 const CHANNEL_ID = "agentmail";
 export const HYDRATION_NOT_FOUND_RETRY_WINDOW_MS = 5 * 60_000;
+
+type DeferredMediaCleanup = () => Promise<void>;
+const deferredMediaCleanups = new WeakMap<AbortSignal, Set<DeferredMediaCleanup>>();
+
+/**
+ * Reclaims media retained by deferred turns only after the account's ingress workers have stopped.
+ * Core does not drain its follow-up queue during shutdown, so no queued turn can adopt these files
+ * once the owning account lifecycle has settled.
+ */
+export async function reclaimAbortedAgentMailDeferredMedia(
+  abortSignal: AbortSignal,
+): Promise<void> {
+  if (!abortSignal.aborted) {
+    return;
+  }
+  const cleanups = deferredMediaCleanups.get(abortSignal);
+  if (!cleanups) {
+    return;
+  }
+  deferredMediaCleanups.delete(abortSignal);
+  await Promise.allSettled([...cleanups].map((cleanup) => cleanup()));
+}
 
 // AgentMail message labels the channel gates on. "received" marks authentic inbound mail; the
 // rejected set marks provider-flagged mail that must never reach the agent.
@@ -275,6 +296,23 @@ export async function dispatchAgentMailInboundEvent(params: {
     ).then(() => undefined);
     await mediaCleanup;
   };
+  let detachDeferredMediaCleanup = () => {};
+  const retainDeferredMediaUntilShutdown = () => {
+    const abortSignal = params.abortSignal;
+    if (!abortSignal || inboundMedia.paths.length === 0) {
+      return;
+    }
+    const cleanup = cleanupInboundMedia;
+    const cleanups = deferredMediaCleanups.get(abortSignal) ?? new Set();
+    cleanups.add(cleanup);
+    deferredMediaCleanups.set(abortSignal, cleanups);
+    detachDeferredMediaCleanup = () => {
+      cleanups.delete(cleanup);
+      if (cleanups.size === 0) {
+        deferredMediaCleanups.delete(abortSignal);
+      }
+    };
+  };
   let detachAbortCleanup = () => {};
   if (params.abortSignal) {
     const onAbort = () => {
@@ -301,14 +339,17 @@ export async function dispatchAgentMailInboundEvent(params: {
       turnAdoptionObserved = true;
       turnAdopted = true;
       detachAbortCleanup();
+      detachDeferredMediaCleanup();
       await params.onTurnAdopted?.();
     },
     onDeferred: () => {
       turnDeferred = true;
+      retainDeferredMediaUntilShutdown();
       params.onTurnDeferred?.();
     },
     onAbandoned: async () => {
       detachAbortCleanup();
+      detachDeferredMediaCleanup();
       if (!turnAdoptionObserved) {
         await cleanupInboundMedia();
       }
@@ -395,10 +436,7 @@ export async function dispatchAgentMailInboundEvent(params: {
             // implicit id owned by the durable delivery contract below, so remove those derived
             // payload directives immediately before delivery.
             preparePayload: (payload) => {
-              const prepared = withAgentMailTriggerArrival(
-                payload,
-                params.record.arrivedAt ?? params.record.receivedAt,
-              );
+              const prepared = { ...payload };
               delete prepared.replyToId;
               delete prepared.replyToTag;
               delete prepared.replyToCurrent;

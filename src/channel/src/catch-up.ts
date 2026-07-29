@@ -10,8 +10,10 @@ import {
 } from "./durable-receive.js";
 import {
   AGENTMAIL_RECEIVED_LABEL,
-  isAgentMailProviderTimestampWithinFutureSkew,
+  capAgentMailProviderTimestampForRetention,
+  isValidAgentMailTimestampMs,
   isReceivedAgentMailMessage,
+  resolveAgentMailTimestampMs,
   resolveReceivedAgentMailMessageTimestampMs,
 } from "./received-message.js";
 import { createBackoff, waitForRetry } from "./retry.js";
@@ -174,22 +176,18 @@ function cursorNamespace(account: ResolvedAgentMailAccount): string {
   return `${AGENTMAIL_REST_CATCH_UP_NAMESPACE}.${sha256Hex(account.accountId)}`;
 }
 
-function validTimestamp(value: unknown): value is number {
-  return typeof value === "number" && Number.isFinite(value) && value >= 0;
-}
-
 function normalizeCheckpoint(value: unknown): AgentMailCatchUpCheckpoint | undefined {
   if (!value || typeof value !== "object") {
     return undefined;
   }
   const checkpoint = value as Partial<AgentMailCatchUpCheckpoint>;
   if (
-    !validTimestamp(checkpoint.afterAtMs) ||
-    !validTimestamp(checkpoint.beforeAtMs) ||
+    !isValidAgentMailTimestampMs(checkpoint.afterAtMs) ||
+    !isValidAgentMailTimestampMs(checkpoint.beforeAtMs) ||
     checkpoint.beforeAtMs < checkpoint.afterAtMs ||
     typeof checkpoint.pageToken !== "string" ||
     checkpoint.pageToken.length === 0 ||
-    !validTimestamp(checkpoint.highWaterAtMs) ||
+    !isValidAgentMailTimestampMs(checkpoint.highWaterAtMs) ||
     typeof checkpoint.sinceBaseline !== "boolean"
   ) {
     return undefined;
@@ -210,8 +208,8 @@ function normalizeCursor(value: unknown): AgentMailCatchUpCursor | null {
   const cursor = value as Partial<AgentMailCatchUpCursor>;
   if (
     cursor.version !== CURSOR_VERSION ||
-    !validTimestamp(cursor.baselineAtMs) ||
-    !validTimestamp(cursor.highWaterAtMs) ||
+    !isValidAgentMailTimestampMs(cursor.baselineAtMs) ||
+    !isValidAgentMailTimestampMs(cursor.highWaterAtMs) ||
     typeof cursor.established !== "boolean"
   ) {
     return null;
@@ -237,7 +235,11 @@ function mergeCursor(
   checkpoint: AgentMailCatchUpCheckpoint | null,
 ): AgentMailCatchUpCursor {
   const current = normalizeCursor(currentValue);
-  const baselineAtMs = current?.baselineAtMs ?? next.baselineAtMs;
+  const baselineAtMs = Math.min(
+    upperBoundAtMs,
+    current?.baselineAtMs ?? next.baselineAtMs,
+    next.baselineAtMs,
+  );
   return {
     version: CURSOR_VERSION,
     baselineAtMs,
@@ -453,32 +455,24 @@ export async function createAgentMailCatchUpSession(params: {
             message,
             params.account.inboxId,
           );
-          if (
-            providerReceivedAt !== null &&
-            !isAgentMailProviderTimestampWithinFutureSkew(
-              providerReceivedAt,
-              sweepAtMs,
-            )
-          ) {
-            params.log?.warn?.(
-              `AgentMail catch-up ignored message ${message.messageId} timestamped too far in the future`,
-            );
-            continue;
-          }
           const arrivedAt = now();
-          const receivedAt = providerReceivedAt ?? sweepAtMs;
+          const providerCreatedAt = resolveAgentMailTimestampMs(message.createdAt);
+          const receivedAt = capAgentMailProviderTimestampForRetention(
+            providerReceivedAt ?? providerCreatedAt ?? arrivedAt,
+            arrivedAt,
+          );
           if (providerReceivedAt === null) {
-            // Invalid provider time must not turn a missed event into a permanent drop. Admit with
-            // local observation time, but do not use that synthetic value as cursor evidence.
+            // Invalid sender time must not turn a missed event into a permanent drop. Admit using
+            // provider/local arrival and advance to the fixed sweep bound so it is not re-listed
+            // and warned about on every periodic scan.
             params.log?.warn?.(
-              `AgentMail catch-up used arrival time for message ${message.messageId} with an invalid timestamp`,
+              `AgentMail catch-up used provider/local arrival time for message ${message.messageId} with an invalid timestamp`,
             );
           } else if (providerReceivedAt > sweepAtMs) {
-            // A bounded amount of provider skew is retained on the durable row so its completion
-            // tombstone survives until the message enters provider-time scans. Cursor advancement
-            // remains clamped to this sweep below.
+            // Sender-authored time can be arbitrarily skewed. The row was admitted above using a
+            // bounded retention timestamp, and cursor advancement remains clamped to this sweep.
             params.log?.warn?.(
-              `AgentMail catch-up retained bounded future timestamp for message ${message.messageId}`,
+              `AgentMail catch-up clamped future timestamp for message ${message.messageId}`,
             );
           }
           try {
@@ -503,12 +497,10 @@ export async function createAgentMailCatchUpSession(params: {
             throw error;
           }
           admitted += 1;
-          if (providerReceivedAt !== null) {
-            highWaterAtMs = Math.max(
-              highWaterAtMs,
-              Math.min(providerReceivedAt, sweepAtMs),
-            );
-          }
+          highWaterAtMs = Math.max(
+            highWaterAtMs,
+            providerReceivedAt === null ? sweepAtMs : Math.min(providerReceivedAt, sweepAtMs),
+          );
         }
         pageCursor = page.nextPageToken;
         if (pageCursor) {

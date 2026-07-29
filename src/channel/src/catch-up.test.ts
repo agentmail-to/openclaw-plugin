@@ -404,7 +404,7 @@ describe("AgentMail durable REST catch-up", () => {
     );
   });
 
-  it("admits malformed timestamps using local time without poisoning the cursor", async () => {
+  it("admits malformed timestamps using provider creation time", async () => {
     const store = memoryStore<never>();
     const malformed = message({ id: "bad_timestamp", timestamp: 1_100 }) as AgentMail.MessageItem;
     (malformed as { timestamp: unknown }).timestamp = new Date(Number.NaN);
@@ -421,13 +421,13 @@ describe("AgentMail durable REST catch-up", () => {
     expect(receive).toHaveBeenCalledWith(
       expect.objectContaining({
         messageId: "bad_timestamp",
-        receivedAt: 1_000,
+        receivedAt: 1_100,
         arrivedAt: 1_000,
       }),
     );
   });
 
-  it("does not advance the cursor from an invalid timestamp's local fallback", async () => {
+  it("advances the cursor from an invalid timestamp's fixed sweep fallback", async () => {
     const store = memoryStore<never>();
     const malformed = message({ id: "bad_timestamp", timestamp: 1_100 }) as AgentMail.MessageItem;
     (malformed as { timestamp: unknown }).timestamp = new Date(Number.NaN);
@@ -454,7 +454,7 @@ describe("AgentMail durable REST catch-up", () => {
     expect(list).toHaveBeenLastCalledWith(
       "inbox_1",
       expect.objectContaining({
-        after: new Date(1_000_000 - AGENTMAIL_REST_CATCH_UP_OVERLAP_MS),
+        after: new Date(2_000_000 - AGENTMAIL_REST_CATCH_UP_OVERLAP_MS),
       }),
       expect.any(Object),
     );
@@ -495,7 +495,7 @@ describe("AgentMail durable REST catch-up", () => {
     );
   });
 
-  it("keeps committed cursor state when the host clock moves backwards", async () => {
+  it("repairs a future baseline without regressing the committed high-water mark", async () => {
     const store = memoryStore<AgentMailCatchUpCursor>();
     const key = sha256Hex("default\ninbox_1");
     await store.register(key, {
@@ -524,7 +524,7 @@ describe("AgentMail durable REST catch-up", () => {
       expect.any(Object),
     );
     expect(await store.lookup(key)).toMatchObject({
-      baselineAtMs: 2_000_000,
+      baselineAtMs: 1_000_000,
       highWaterAtMs: 3_000_000,
       established: true,
     });
@@ -634,7 +634,7 @@ describe("AgentMail durable REST catch-up", () => {
     );
   });
 
-  it("does not advance from malformed timestamps or admit implausibly future timestamps", async () => {
+  it("advances malformed timestamps and admits far-future rows with bounded retention", async () => {
     const store = memoryStore<AgentMailCatchUpCursor>();
     const key = sha256Hex("default\ninbox_1");
     await store.register(key, {
@@ -666,7 +666,8 @@ describe("AgentMail durable REST catch-up", () => {
     await session.run({ receive, abortSignal: new AbortController().signal });
 
     expect(receive.mock.calls.map(([record]) => [record.messageId, record.receivedAt])).toEqual([
-      ["malformed", 1_000_000],
+      ["malformed", 900_000],
+      ["future", 1_000_000 + 24 * 60 * 60_000],
     ]);
     expect(list).toHaveBeenNthCalledWith(
       1,
@@ -680,12 +681,12 @@ describe("AgentMail durable REST catch-up", () => {
       2,
       "inbox_1",
       expect.objectContaining({
-        after: new Date(0),
+        after: new Date(1_000_000 - AGENTMAIL_REST_CATCH_UP_OVERLAP_MS),
       }),
       expect.any(Object),
     );
     expect(warn).toHaveBeenCalledWith(expect.stringContaining("invalid timestamp"));
-    expect(warn).toHaveBeenCalledWith(expect.stringContaining("too far in the future"));
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("clamped future timestamp"));
   });
 
   it("pauses the pass when durable ingress reports capacity", async () => {

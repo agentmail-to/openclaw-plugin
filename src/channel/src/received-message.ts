@@ -1,9 +1,8 @@
 import type { AgentMail } from "agentmail";
 
 export const AGENTMAIL_RECEIVED_LABEL = "received";
-// Email timestamps are provider-authored and may have ordinary clock skew, but allowing arbitrary
-// future values into durable retention can pin tombstones for years. One day is deliberately more
-// permissive than normal clock drift while keeping storage retention bounded.
+// Email timestamps are sender-authored and may have arbitrary clock skew. Keep their contribution
+// to durable retention bounded so malformed dates cannot pin tombstones for years.
 export const AGENTMAIL_PROVIDER_FUTURE_SKEW_MAX_MS = 24 * 60 * 60 * 1000;
 
 export function normalizeAgentMailInboxId(value: string): string {
@@ -14,6 +13,10 @@ export function agentMailInboxIdsEqual(left: string, right: string): boolean {
   return normalizeAgentMailInboxId(left) === normalizeAgentMailInboxId(right);
 }
 
+export function isValidAgentMailTimestampMs(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0;
+}
+
 export function resolveAgentMailTimestampMs(value: unknown): number | null {
   const timestampMs =
     value instanceof Date
@@ -21,14 +24,7 @@ export function resolveAgentMailTimestampMs(value: unknown): number | null {
       : typeof value === "string" || typeof value === "number"
         ? new Date(value).getTime()
         : Number.NaN;
-  return Number.isFinite(timestampMs) && timestampMs >= 0 ? timestampMs : null;
-}
-
-export function isAgentMailProviderTimestampWithinFutureSkew(
-  timestampMs: number,
-  observedAtMs: number,
-): boolean {
-  return timestampMs <= observedAtMs + AGENTMAIL_PROVIDER_FUTURE_SKEW_MAX_MS;
+  return isValidAgentMailTimestampMs(timestampMs) ? timestampMs : null;
 }
 
 export function capAgentMailProviderTimestampForRetention(
