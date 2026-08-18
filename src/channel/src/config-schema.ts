@@ -3,9 +3,12 @@ import {
   buildChannelConfigSchema,
 } from "openclaw/plugin-sdk/channel-config-schema";
 import { buildSecretInputSchema } from "openclaw/plugin-sdk/secret-input";
-// Use the SDK's own zod instance so schemas built here are assignable to SDK helpers
-// (buildChannelConfigSchema); mixing a second zod copy triggers structural type mismatches.
-import { z } from "openclaw/plugin-sdk/zod";
+// OpenClaw dropped the `openclaw/plugin-sdk/zod` re-export in 2026.8.1-beta.2 and now depends on
+// the `zod` package directly, so plugins import it the same way. Schemas built here still have to
+// come from the SAME zod copy the SDK helpers (buildChannelConfigSchema, buildSecretInputSchema)
+// use, or structural type mismatches and per-copy registries break sensitive-path registration —
+// that is why package.json pins zod to the exact version OpenClaw depends on, so npm hoists one copy.
+import { z } from "zod";
 
 // Per-message media buffer limits (MiB), co-located: the default applied when unset, and the
 // documented upper bound the schema enforces.

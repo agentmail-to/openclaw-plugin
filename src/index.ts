@@ -13,7 +13,7 @@ const entry: OpenClawPluginDefinition = definePluginEntry({
   id: "agentmail",
   name: "AgentMail",
   description:
-    "AgentMail for OpenClaw: a CLI-backed skill plus a durable, allowlisted, reply-only email channel.",
+    "AgentMail for OpenClaw: Official email plugin and email channel for OpenClaw. Your agent gets its own inbox.",
   configSchema: cliEntry.configSchema,
   register(api) {
     if (api.registrationMode === "tool-discovery") {
