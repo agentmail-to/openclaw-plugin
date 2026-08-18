@@ -26,18 +26,10 @@ const manifest = {
   activation: { onStartup: true },
   channels: ["agentmail"],
   skills: ["./skills"],
-  // The Plugin Inspector emits a `channel-env-vars` deprecation warning whenever this field is
-  // present (it is unconditional — a setup entry does NOT suppress it). We keep it anyway: on our
-  // supported OpenClaw range (peerDependency floor >=2026.7.2-beta.3, currently the newest published
-  // release) `channelEnvVars` is still the only source OpenClaw reads to detect the channel as
-  // configured from AGENTMAIL_API_KEY in the environment (isStaticallyChannelConfigured) and to
-  // advertise expected env-shell keys. No setup-metadata replacement path has shipped in any release
-  // yet, so dropping this would regress env-driven setup with no upside.
-  // Remove this field (which clears the warning) only once our minimum supported OpenClaw version
-  // reads channel env names from the newer setup model instead — then also raise the floor to match.
-  channelEnvVars: {
-    agentmail: ["AGENTMAIL_API_KEY", "AGENTMAIL_WEBHOOK_SECRET"],
-  },
+  // No `channelEnvVars` here on purpose. It was removed from OpenClaw's PluginManifest in
+  // 2026.8.1-beta.2 (our peerDependency floor); the channel env names now live in package.json under
+  // `openclaw.channel.configuredState.env`, which is what resolveChannelEnvVars reads to detect the
+  // channel as env-configured (isStaticallyChannelConfigured) and to advertise env-shell keys.
   channelConfigs: {
     agentmail: {
       schema: AgentMailChannelConfigSchema.schema,

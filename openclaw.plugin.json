@@ -1,8 +1,8 @@
 {
   "id": "agentmail",
   "name": "AgentMail",
-  "description": "AgentMail for OpenClaw: a CLI-backed skill plus a durable, allowlisted, reply-only email channel.",
-  "version": "0.1.1",
+  "description": "AgentMail for OpenClaw: Official email plugin and email channel for OpenClaw. Your agent gets its own inbox.",
+  "version": "0.2.0",
   "configSchema": {
     "type": "object",
     "properties": {
@@ -35,12 +35,6 @@
   "skills": [
     "./skills"
   ],
-  "channelEnvVars": {
-    "agentmail": [
-      "AGENTMAIL_API_KEY",
-      "AGENTMAIL_WEBHOOK_SECRET"
-    ]
-  },
   "channelConfigs": {
     "agentmail": {
       "schema": {
@@ -66,6 +60,29 @@
                       "source": {
                         "type": "string",
                         "const": "env"
+                      },
+                      "provider": {
+                        "type": "string",
+                        "pattern": "^[a-z][a-z0-9_-]{0,63}$"
+                      },
+                      "id": {
+                        "type": "string",
+                        "pattern": "^[A-Z][A-Z0-9_]{0,127}$"
+                      }
+                    },
+                    "required": [
+                      "source",
+                      "provider",
+                      "id"
+                    ],
+                    "additionalProperties": false
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "source": {
+                        "type": "string",
+                        "const": "store"
                       },
                       "provider": {
                         "type": "string",
@@ -148,6 +165,29 @@
                       "source": {
                         "type": "string",
                         "const": "env"
+                      },
+                      "provider": {
+                        "type": "string",
+                        "pattern": "^[a-z][a-z0-9_-]{0,63}$"
+                      },
+                      "id": {
+                        "type": "string",
+                        "pattern": "^[A-Z][A-Z0-9_]{0,127}$"
+                      }
+                    },
+                    "required": [
+                      "source",
+                      "provider",
+                      "id"
+                    ],
+                    "additionalProperties": false
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "source": {
+                        "type": "string",
+                        "const": "store"
                       },
                       "provider": {
                         "type": "string",
@@ -291,6 +331,29 @@
                           "properties": {
                             "source": {
                               "type": "string",
+                              "const": "store"
+                            },
+                            "provider": {
+                              "type": "string",
+                              "pattern": "^[a-z][a-z0-9_-]{0,63}$"
+                            },
+                            "id": {
+                              "type": "string",
+                              "pattern": "^[A-Z][A-Z0-9_]{0,127}$"
+                            }
+                          },
+                          "required": [
+                            "source",
+                            "provider",
+                            "id"
+                          ],
+                          "additionalProperties": false
+                        },
+                        {
+                          "type": "object",
+                          "properties": {
+                            "source": {
+                              "type": "string",
                               "const": "file"
                             },
                             "provider": {
@@ -351,6 +414,29 @@
                             "source": {
                               "type": "string",
                               "const": "env"
+                            },
+                            "provider": {
+                              "type": "string",
+                              "pattern": "^[a-z][a-z0-9_-]{0,63}$"
+                            },
+                            "id": {
+                              "type": "string",
+                              "pattern": "^[A-Z][A-Z0-9_]{0,127}$"
+                            }
+                          },
+                          "required": [
+                            "source",
+                            "provider",
+                            "id"
+                          ],
+                          "additionalProperties": false
+                        },
+                        {
+                          "type": "object",
+                          "properties": {
+                            "source": {
+                              "type": "string",
+                              "const": "store"
                             },
                             "provider": {
                               "type": "string",
@@ -456,7 +542,7 @@
         "additionalProperties": false
       },
       "label": "AgentMail",
-      "description": "AgentMail for OpenClaw: a CLI-backed skill plus a durable, allowlisted, reply-only email channel.",
+      "description": "AgentMail for OpenClaw: Official email plugin and email channel for OpenClaw. Your agent gets its own inbox.",
       "uiHints": {
         "": {
           "label": "AgentMail",
