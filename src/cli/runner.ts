@@ -16,15 +16,10 @@ export const AGENTMAIL_CLI_RESTRICTED_OPTIONS = [
 ] as const;
 
 const restrictedOptions = new Set<string>(AGENTMAIL_CLI_RESTRICTED_OPTIONS);
-const optionsWithSeparateValues = new Set([
-  "format",
-  "format-error",
-  "transform",
-  "transform-error",
-  "subject",
-]);
 const restrictedEnvironmentKeys = new Set([
+  "AGENTMAIL_API_KEY",
   "AGENTMAIL_BASE_URL",
+  "AGENTMAIL_CUSTOM_HEADERS",
   "AGENTMAIL_ENVIRONMENT",
   "ALL_PROXY",
   "HTTP_PROXY",
@@ -32,10 +27,7 @@ const restrictedEnvironmentKeys = new Set([
   "NO_PROXY",
 ]);
 
-function parseOptionToken(token: string): {
-  name: string;
-  hasInlineValue: boolean;
-} | null {
+function parseOptionToken(token: string): { name: string } | null {
   const option = /^-+(.+)$/.exec(token)?.[1];
   if (!option) {
     return null;
@@ -43,7 +35,6 @@ function parseOptionToken(token: string): {
   const equalsAt = option.indexOf("=");
   return {
     name: (equalsAt < 0 ? option : option.slice(0, equalsAt)).toLowerCase(),
-    hasInlineValue: equalsAt >= 0,
   };
 }
 
@@ -84,22 +75,13 @@ export function withConfiguredBaseUrl(
   args: readonly string[],
   baseUrl: string | undefined,
 ): string[] {
-  let consumesNextValue = false;
   for (const arg of args) {
-    if (consumesNextValue) {
-      consumesNextValue = false;
-      continue;
-    }
     const option = parseOptionToken(arg);
-    if (!option) {
-      continue;
-    }
-    if (restrictedOptions.has(option.name)) {
+    if (option && restrictedOptions.has(option.name)) {
       throw new Error(
         "AgentMail API credential and endpoint overrides are restricted to operator-controlled configuration.",
       );
     }
-    consumesNextValue = !option.hasInlineValue && optionsWithSeparateValues.has(option.name);
   }
   return baseUrl ? ["--base-url", baseUrl, ...args] : [...args];
 }
@@ -116,6 +98,17 @@ export function sanitizeAgentMailCliEnvironment(
   return sanitized;
 }
 
+export function buildAgentMailCliEnvironment(
+  source: NodeJS.ProcessEnv,
+  apiKey?: string,
+): NodeJS.ProcessEnv {
+  const env = sanitizeAgentMailCliEnvironment(source);
+  if (apiKey) {
+    env.AGENTMAIL_API_KEY = apiKey;
+  }
+  return env;
+}
+
 export function agentMailCliSignalExitCode(signal: NodeJS.Signals): number {
   const signalNumber = osConstants.signals[signal];
   return typeof signalNumber === "number" ? 128 + signalNumber : 1;
@@ -126,6 +119,7 @@ export async function runAgentMailCli(
   options: {
     executable?: string;
     env?: NodeJS.ProcessEnv;
+    apiKey?: string;
   } = {},
 ): Promise<number> {
   const executable = options.executable ?? resolveAgentMailCliExecutable();
@@ -141,7 +135,7 @@ export async function runAgentMailCli(
 
   return await new Promise<number>((resolve, reject) => {
     const child = spawn(executable, [...args], {
-      env: sanitizeAgentMailCliEnvironment(options.env ?? process.env),
+      env: buildAgentMailCliEnvironment(options.env ?? process.env, options.apiKey),
       stdio: "inherit",
       windowsHide: false,
     });

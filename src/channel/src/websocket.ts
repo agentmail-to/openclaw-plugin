@@ -12,6 +12,7 @@ import { AgentMailIngressCapacityError } from "./ingress.js";
 import { createBackoff, waitForRetry } from "./retry.js";
 import {
   agentMailInboxIdsEqual,
+  capAgentMailProviderTimestampForRetention,
   resolveAgentMailTimestampMs,
 } from "./received-message.js";
 import type { AgentMailIngressRecord, ResolvedAgentMailAccount } from "./types.js";
@@ -174,11 +175,12 @@ export async function startAgentMailWebSocket(params: {
     }
     // The event type itself is authoritative for live receipt. Provider label projection can lag
     // the WebSocket frame; durable hydration already retries that condition safely.
+    const arrivedAt = now();
     const messageTimestampMs = resolveAgentMailTimestampMs(event.message.timestamp);
     if (messageTimestampMs === null) {
-      params.log?.warn?.("AgentMail WebSocket received an event with an invalid timestamp");
-      catchUpSupervisor.request();
-      return false;
+      params.log?.warn?.(
+        "AgentMail WebSocket used provider arrival time for an event with an invalid timestamp",
+      );
     }
     if (queuedMessageIds.has(event.message.messageId)) {
       return true;
@@ -190,14 +192,19 @@ export async function startAgentMailWebSocket(params: {
       catchUpSupervisor.request();
       return true;
     }
+    const providerCreatedAtMs = resolveAgentMailTimestampMs(event.message.createdAt);
+    const receivedAt = capAgentMailProviderTimestampForRetention(
+      messageTimestampMs ?? providerCreatedAtMs ?? arrivedAt,
+      arrivedAt,
+    );
     queuedMessageIds.add(event.message.messageId);
     liveQueue.push({
       accountId: params.account.accountId,
       inboxId: params.account.inboxId,
       messageId: event.message.messageId,
       transport: "websocket",
-      receivedAt: messageTimestampMs,
-      arrivedAt: Date.now(),
+      receivedAt,
+      arrivedAt,
     });
     runLiveWorker();
     return true;
@@ -281,11 +288,7 @@ export async function startAgentMailWebSocket(params: {
           settleClosed();
         });
         socket.on("message", (event) => {
-          if (handleMessage(event)) {
-            // A valid event proves the subscription is productive even when an intermediary
-            // recycles it before the 30-second stability threshold.
-            reconnectAttempt = 0;
-          }
+          handleMessage(event);
         });
       });
       // waitForOpen() does not settle on an aborted initial connection; close the already-open race

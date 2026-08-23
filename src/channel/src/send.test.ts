@@ -101,6 +101,39 @@ describe("AgentMail reply-only outbound", () => {
     expect(get).toHaveBeenCalledWith("inbox_1", "msg_1");
   });
 
+  it("trims media URLs and ignores whitespace-only entries", async () => {
+    reply.mockClear();
+    loadAgentMailOutboundAttachments.mockClear();
+    await sendAgentMailReply(
+      {
+        cfg: {
+          channels: {
+            agentmail: {
+              apiKey: "key",
+              inboxId: "inbox_1",
+              allowFrom: ["sender@example.com"],
+              mediaMaxMb: 20,
+            },
+          },
+        },
+        to: "message:msg_1",
+        text: "Hello",
+        payload: {
+          text: "Hello",
+          mediaUrls: ["  ", " file:///proof.txt ", "\t"],
+        },
+        replyToId: "msg_1",
+        replyToIdSource: "implicit",
+        deliveryQueueId: "queue_1",
+      },
+      { client: client() },
+    );
+
+    expect(loadAgentMailOutboundAttachments).toHaveBeenCalledWith(
+      expect.objectContaining({ mediaUrls: ["file:///proof.txt"] }),
+    );
+  });
+
   it("rejects a different target than the active turn's triggering message", async () => {
     await expect(
       sendAgentMailReply(

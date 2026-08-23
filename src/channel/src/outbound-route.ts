@@ -1,6 +1,10 @@
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import { listAgentMailAccountIds, resolveAgentMailAccount } from "./accounts.js";
-import { buildAgentMailConversationId, buildAgentMailSessionKey } from "./inbound.js";
+import {
+  buildAgentMailConversationId,
+  buildAgentMailSessionKey,
+  parseAgentMailSessionKey,
+} from "./inbound.js";
 import { normalizeAgentMailTarget } from "./send.js";
 
 type AgentMailOutboundSessionRoute = {
@@ -32,6 +36,7 @@ export function resolveAgentMailOutboundSessionRoute(params: {
   cfg: OpenClawConfig;
   agentId: string;
   accountId?: string | null;
+  currentSessionKey?: string;
   target?: string;
   resolvedTarget?: { to: string };
   threadId?: string | number | null;
@@ -40,15 +45,37 @@ export function resolveAgentMailOutboundSessionRoute(params: {
   if (!target) {
     return null;
   }
+  const hasExplicitAccount = params.accountId != null && String(params.accountId).trim() !== "";
+  const configuredAccountIds = listAgentMailAccountIds(params.cfg);
+  const isAmbiguousAccount = configuredAccountIds.length > 1;
+  const currentRoute = parseAgentMailSessionKey(params.currentSessionKey);
+  const currentRouteBelongsToAgent =
+    currentRoute !== null &&
+    buildAgentMailSessionKey({
+      agentId: params.agentId,
+      accountId: currentRoute.accountId,
+      conversationId: currentRoute.conversationId,
+    }) === currentRoute.sessionKey;
+  // Infer only from a session whose account is STILL configured. A stale key naming a removed
+  // account would otherwise satisfy the ambiguity check below and resolve an unconfigured account,
+  // yielding a recipient-exact route on a synthesized account with an empty inboxId and no apiKey.
+  const inferredAccountId =
+    !hasExplicitAccount && currentRouteBelongsToAgent
+      ? configuredAccountIds.find((id) => id.toLowerCase() === currentRoute.accountId)
+      : undefined;
+  const effectiveAccountId = hasExplicitAccount ? params.accountId : inferredAccountId;
+  if (!effectiveAccountId && isAmbiguousAccount) {
+    // Without an account id, a multi-account route cannot be tied safely to the named account that
+    // owns the active inbound session. Decline rather than fabricating a recipient-exact route
+    // under the configured default account.
+    return null;
+  }
   // Resolve the account so the session key uses the same canonical accountId the inbound turn uses
   // (a raw or undefined params.accountId would otherwise diverge, breaking continuity for a single
-  // named account). Only inbox-scope the conversation when the account is unambiguous: an explicit
-  // accountId or a single configured account. With multiple accounts and no accountId, resolving
-  // would silently pick the default account's inbox — fall back to the message target instead.
-  const hasExplicitAccount = params.accountId != null && String(params.accountId).trim() !== "";
-  const resolved = resolveAgentMailAccount(params.cfg, params.accountId);
-  const inboxId =
-    hasExplicitAccount || listAgentMailAccountIds(params.cfg).length <= 1 ? resolved.inboxId : "";
+  // named account). The account is explicit, uniquely configured, or inferred from the active
+  // inbound session; ambiguous multi-account sends are declined above.
+  const resolved = resolveAgentMailAccount(params.cfg, effectiveAccountId);
+  const inboxId = resolved.inboxId;
   const threadId =
     params.threadId === undefined || params.threadId === null || params.threadId === ""
       ? undefined
@@ -56,12 +83,30 @@ export function resolveAgentMailOutboundSessionRoute(params: {
   // Thread is encoded in the conversation id (matching inbound), so the session key stays flat — no
   // separate route threadId that could add a divergent thread suffix.
   const conversationId =
-    inboxId && threadId ? buildAgentMailConversationId(inboxId, threadId) : target;
+    inboxId && threadId
+      ? buildAgentMailConversationId(inboxId, threadId)
+      : inferredAccountId && currentRoute?.accountId === resolved.accountId.toLowerCase()
+        ? currentRoute.conversationId
+        : target;
   const sessionKey = buildAgentMailSessionKey({
     agentId: params.agentId,
     accountId: resolved.accountId,
     conversationId,
   });
+  if (
+    !hasExplicitAccount &&
+    inferredAccountId &&
+    isAmbiguousAccount &&
+    threadId !== undefined &&
+    currentRoute &&
+    currentRoute.sessionKey !== sessionKey
+  ) {
+    // A current session from another AgentMail thread is not evidence for this target's account.
+    // Only ambiguity is worth declining over: with a single configured account the inference cannot
+    // pick a wrong inbox, and declining would drop the route back to core's `dmScope ?? "main"`,
+    // collapsing every thread into one session — the exact failure this module exists to prevent.
+    return null;
+  }
   return {
     sessionKey,
     baseSessionKey: sessionKey,

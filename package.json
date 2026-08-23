@@ -25,8 +25,8 @@
     "cli:prepare": "node scripts/prepare-agentmail-cli.mjs",
     "plugin:build": "npm run build && npm run cli:prepare && node scripts/build-manifest.mjs",
     "plugin:check": "npm run build && node scripts/build-manifest.mjs --check",
-    "plugin:validate": "npm run build && npm run cli:prepare && node scripts/build-manifest.mjs --check && node scripts/validate-plugin.mjs",
-    "prepack": "npm run cli:prepare -- --all && npm run plugin:validate",
+    "plugin:validate": "npm run build && npm run cli:prepare -- --all && node scripts/build-manifest.mjs --check && node scripts/validate-plugin.mjs",
+    "prepack": "npm run plugin:validate",
     "test": "vitest run --config ./vitest.config.ts"
   },
   "files": [

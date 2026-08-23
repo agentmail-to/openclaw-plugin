@@ -22,7 +22,6 @@ const cliRelease = JSON.parse(
 const stateDir = mkdtempSync(join(tmpdir(), "agentmail-plugin-validate-"));
 const childEnv = {
   ...process.env,
-  AGENTMAIL_API_KEY: process.env.AGENTMAIL_API_KEY || "am_plugin_validation",
   OPENCLAW_STATE_DIR: stateDir,
   OPENCLAW_CONFIG_DIR: stateDir,
   OPENCLAW_HOME: stateDir,
@@ -30,6 +29,11 @@ const childEnv = {
   NO_COLOR: "1",
   FORCE_COLOR: "0",
 };
+for (const key of Object.keys(childEnv)) {
+  if (key.toUpperCase() === "AGENTMAIL_API_KEY") {
+    delete childEnv[key];
+  }
+}
 
 function run(args) {
   return execFileSync(openclaw, args, {
@@ -62,6 +66,20 @@ try {
   fail("openclaw could not install the linked plugin", error.stdout || error.stderr || String(error));
 }
 
+try {
+  run([
+    "config",
+    "set",
+    "plugins.entries.agentmail.config.apiKey",
+    "am_plugin_validation",
+  ]);
+} catch (error) {
+  fail(
+    "openclaw could not configure the operator-controlled AgentMail CLI credential",
+    error.stdout || error.stderr || String(error),
+  );
+}
+
 let inspect = "";
 try {
   inspect = run(["plugins", "inspect", "agentmail", "--runtime"]);
@@ -86,17 +104,13 @@ const expectedCliVersion = readFileSync(
   cliRunner.resolveAgentMailCliVendorPath("VERSION"),
   "utf8",
 ).trim();
-const currentCliTarget = cliRunner.resolveAgentMailCliTarget().directory;
 for (const [target, metadata] of Object.entries(cliRelease.assets)) {
   const executable = cliRunner.resolveAgentMailCliVendorPath(
     target,
     metadata.executableName,
   );
   if (!existsSync(executable)) {
-    if (target === currentCliTarget) {
-      fail(`bundled AgentMail CLI executable is missing for ${target}`);
-    }
-    continue;
+    fail(`bundled AgentMail CLI executable is missing for ${target}`);
   }
   const executableSha256 = createHash("sha256")
     .update(readFileSync(executable))

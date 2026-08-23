@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { createAgentMailCliPlugin } from "./index.js";
 import {
   agentMailCliSignalExitCode,
+  buildAgentMailCliEnvironment,
   resolveAgentMailCliTarget,
   sanitizeAgentMailCliEnvironment,
   withConfiguredBaseUrl,
@@ -26,7 +27,7 @@ describe("AgentMail CLI bridge", () => {
     );
   });
 
-  it("allows only the operator-configured API base URL", () => {
+  it("allows only operator-configured credentials and API base URL", () => {
     expect(withConfiguredBaseUrl(["inboxes", "list"], "https://example.test/v0")).toEqual([
       "--base-url",
       "https://example.test/v0",
@@ -91,29 +92,31 @@ describe("AgentMail CLI bridge", () => {
         undefined,
       ),
     ).toThrow("credential and endpoint overrides are restricted");
-    expect(
+    expect(() =>
       withConfiguredBaseUrl(
         ["--transform", "--base-url=literal-output", "inboxes", "list"],
         undefined,
       ),
-    ).toEqual(["--transform", "--base-url=literal-output", "inboxes", "list"]);
-    expect(
+    ).toThrow("endpoint overrides are restricted");
+    expect(() =>
       withConfiguredBaseUrl(
         ["inboxes:messages", "send", "--subject", "--base-url=is restricted"],
         undefined,
       ),
-    ).toEqual([
-      "inboxes:messages",
-      "send",
-      "--subject",
-      "--base-url=is restricted",
-    ]);
+    ).toThrow("endpoint overrides are restricted");
+    expect(
+      withConfiguredBaseUrl(
+        ["inboxes:messages", "send", "--subject=--base-url-is-safe"],
+        undefined,
+      ),
+    ).toEqual(["inboxes:messages", "send", "--subject=--base-url-is-safe"]);
   });
 
-  it("removes inherited endpoint selectors while preserving credentials", () => {
+  it("removes inherited credentials, custom headers, and endpoint selectors", () => {
     expect(
       sanitizeAgentMailCliEnvironment({
         AGENTMAIL_API_KEY: "am_test",
+        agentmail_custom_headers: '{"X-Secret":"leak"}',
         AGENTMAIL_BASE_URL: "https://attacker.example",
         agentmail_environment: "development",
         HTTPS_PROXY: "https://attacker.example",
@@ -121,9 +124,23 @@ describe("AgentMail CLI bridge", () => {
         OTHER_VALUE: "kept",
       }),
     ).toEqual({
-      AGENTMAIL_API_KEY: "am_test",
       OTHER_VALUE: "kept",
     });
+    expect(
+      buildAgentMailCliEnvironment(
+        {
+          AGENTMAIL_API_KEY: "am_attacker",
+          AGENTMAIL_CUSTOM_HEADERS: '{"X-Secret":"leak"}',
+        },
+        "am_operator",
+      ),
+    ).toEqual({ AGENTMAIL_API_KEY: "am_operator" });
+    expect(
+      buildAgentMailCliEnvironment({
+        AGENTMAIL_API_KEY: "am_attacker",
+        AGENTMAIL_CUSTOM_HEADERS: '{"X-Secret":"leak"}',
+      }),
+    ).toEqual({});
   });
 
   it("maps terminating signals to conventional shell exit codes", () => {
@@ -164,7 +181,8 @@ describe("AgentMail CLI bridge", () => {
         options: unknown,
       ) => void;
     }) => void)({
-      pluginConfig: { baseUrl: "https://example.test/v0" },
+      config: {},
+      pluginConfig: { apiKey: "am_operator", baseUrl: "https://example.test/v0" },
       registerCli(callback, options) {
         registrar = callback;
         registrationOptions = options;
@@ -172,7 +190,6 @@ describe("AgentMail CLI bridge", () => {
     });
 
     expect(registrationOptions).toEqual({
-      commands: ["agentmail"],
       descriptors: [
         {
           name: "agentmail",
@@ -186,20 +203,58 @@ describe("AgentMail CLI bridge", () => {
     expect(program.command).toHaveBeenCalledWith("agentmail [arguments...]");
 
     await action?.(["inboxes", "list", "--format", "json"]);
-    expect(runCli).toHaveBeenCalledWith([
-      "--base-url",
-      "https://example.test/v0",
-      "inboxes",
-      "list",
-      "--format",
-      "json",
-    ]);
+    expect(runCli).toHaveBeenCalledWith(
+      [
+        "--base-url",
+        "https://example.test/v0",
+        "inboxes",
+        "list",
+        "--format",
+        "json",
+      ],
+      { apiKey: "am_operator" },
+    );
 
     const priorExitCode = process.exitCode;
     const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
     runCli.mockRejectedValueOnce(new Error("bundled CLI could not start"));
     await action?.(["inboxes", "list"]);
     expect(error).toHaveBeenCalledWith("bundled CLI could not start");
+    expect(process.exitCode).toBe(1);
+    process.exitCode = priorExitCode;
+    error.mockRestore();
+  });
+
+  it("reports the required plugin config instead of running without a credential", async () => {
+    const runCli = vi.fn().mockResolvedValue(0);
+    const plugin = createAgentMailCliPlugin(runCli);
+    let action: ((args: string[]) => Promise<void>) | undefined;
+    const command = {
+      description: vi.fn().mockReturnThis(),
+      helpOption: vi.fn().mockReturnThis(),
+      allowUnknownOption: vi.fn().mockReturnThis(),
+      allowExcessArguments: vi.fn().mockReturnThis(),
+      action: vi.fn((handler: (args: string[]) => Promise<void>) => {
+        action = handler;
+        return command;
+      }),
+    };
+    (plugin.register as never)({
+      config: {},
+      pluginConfig: {},
+      registerCli(callback: (context: { program: { command: () => typeof command } }) => void) {
+        callback({ program: { command: () => command } });
+      },
+    });
+    const priorExitCode = process.exitCode;
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    await action?.(["inboxes", "list"]);
+
+    expect(runCli).not.toHaveBeenCalled();
+    expect(error).toHaveBeenCalledWith(
+      "AgentMail CLI requires plugins.entries.agentmail.config.apiKey.",
+    );
     expect(process.exitCode).toBe(1);
     process.exitCode = priorExitCode;
     error.mockRestore();

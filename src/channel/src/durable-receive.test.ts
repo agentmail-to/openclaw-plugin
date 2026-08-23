@@ -7,6 +7,7 @@ import {
   createAgentMailDurableInboundId,
   withAgentMailIngressCapacity,
 } from "./durable-receive.js";
+import { AGENTMAIL_PROVIDER_FUTURE_SKEW_MAX_MS } from "./received-message.js";
 import {
   AgentMailIngressCapacityError,
   processAgentMailIngress,
@@ -62,6 +63,102 @@ describe("AgentMail durable ingress", () => {
     expect(deletePending).toHaveBeenCalledWith(id);
   });
 
+  it("coordinates capacity across journal facades for the same queue", async () => {
+    const pendingRows = new Map<string, { id: string; payload: AgentMailIngressRecord }>();
+    const baseJournal = () =>
+      ({
+        accept: vi.fn(async (id: string, payload: AgentMailIngressRecord) => {
+          const existing = pendingRows.get(id);
+          if (existing) {
+            return {
+              kind: "pending",
+              duplicate: true,
+              record: { ...existing, attempts: 0 },
+            };
+          }
+          const accepted = { id, payload };
+          pendingRows.set(id, accepted);
+          return { kind: "accepted", duplicate: false, record: accepted };
+        }),
+        pending: vi.fn(async () =>
+          [...pendingRows.values()].map((item) => ({ ...item, attempts: 0 })),
+        ),
+        complete: vi.fn(),
+        release: vi.fn(),
+        deletePending: vi.fn(async (id: string) => pendingRows.delete(id)),
+      }) as never;
+    const coordinationKey = `capacity-test-${crypto.randomUUID()}`;
+    const first = withAgentMailIngressCapacity(baseJournal(), 3, coordinationKey);
+    const second = withAgentMailIngressCapacity(baseJournal(), 3, coordinationKey);
+
+    await first.accept("message_1", record);
+    await second.accept("message_2", record);
+    const admissions = await Promise.allSettled([
+      first.accept("message_3", record),
+      second.accept("message_4", record),
+    ]);
+
+    expect(admissions.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+    expect(
+      admissions.filter(
+        (result) =>
+          result.status === "rejected" &&
+          result.reason instanceof AgentMailIngressCapacityError,
+      ),
+    ).toHaveLength(1);
+    expect(pendingRows).toHaveLength(3);
+  });
+
+  it("resynchronizes capacity after accept persists a row and then throws", async () => {
+    const pendingRows = new Map<string, { id: string; payload: AgentMailIngressRecord }>();
+    let failAfterPersist = true;
+    const journal = withAgentMailIngressCapacity(
+      {
+        accept: vi.fn(async (id: string, payload: AgentMailIngressRecord) => {
+          const existing = pendingRows.get(id);
+          if (existing) {
+            return {
+              kind: "pending",
+              duplicate: true,
+              record: { ...existing, attempts: 0 },
+            };
+          }
+          const accepted = { id, payload };
+          pendingRows.set(id, accepted);
+          if (id === "message_3" && failAfterPersist) {
+            failAfterPersist = false;
+            throw new Error("post-enqueue prune failed");
+          }
+          return { kind: "accepted", duplicate: false, record: accepted };
+        }),
+        pending: vi.fn(async () =>
+          [...pendingRows.values()].map((item) => ({ ...item, attempts: 0 })),
+        ),
+        complete: vi.fn(),
+        release: vi.fn(),
+        deletePending: vi.fn(async (id: string) => pendingRows.delete(id)),
+      } as never,
+      3,
+      `partial-admission-test-${crypto.randomUUID()}`,
+    );
+
+    await journal.accept("message_1", record);
+    await journal.accept("message_2", record);
+    await expect(journal.accept("message_3", record)).rejects.toThrow(
+      "post-enqueue prune failed",
+    );
+    // Duplicate redelivery does not consume capacity and must remain dispatchable.
+    await expect(journal.accept("message_3", record)).resolves.toMatchObject({
+      kind: "pending",
+    });
+    // The next new row forces a durable recount, rolls itself back, and preserves the cap.
+    await expect(journal.accept("message_4", record)).rejects.toBeInstanceOf(
+      AgentMailIngressCapacityError,
+    );
+    expect(pendingRows).toHaveLength(3);
+    expect(pendingRows.has("message_4")).toBe(false);
+  });
+
   it("keeps an overflow row retryable when rollback deletion fails", async () => {
     const id = createAgentMailDurableInboundId(record);
     const fail = vi.fn(async () => true);
@@ -99,7 +196,12 @@ describe("AgentMail durable ingress", () => {
     await expect(
       processAgentMailIngress({ journal: journal as never, record, dispatch }),
     ).resolves.toBe("accepted");
-    await vi.waitFor(() => expect(complete).toHaveBeenCalledWith(id));
+    await vi.waitFor(() =>
+      expect(complete).toHaveBeenCalledWith(
+        id,
+        expect.objectContaining({ completedAt: expect.any(Number) }),
+      ),
+    );
     expect(dispatch).toHaveBeenCalledOnce();
     expect(fail).not.toHaveBeenCalled();
   });
@@ -203,6 +305,72 @@ describe("AgentMail durable ingress", () => {
     });
     await vi.waitFor(() => expect(order).toHaveLength(3));
     expect(order).toEqual(["accept", "dispatch", "complete"]);
+  });
+
+  it("retains future-dated completion tombstones through the provider scan horizon", async () => {
+    const now = 1_000_000;
+    const futureReceivedAt = now + 365 * 24 * 60 * 60 * 1000;
+    const dateNow = vi.spyOn(Date, "now").mockReturnValue(now);
+    const complete = vi.fn(async () => undefined);
+    const accept = vi.fn(async () => ({
+      kind: "accepted" as const,
+      duplicate: false,
+      record: {},
+    }));
+    try {
+      await processAgentMailIngress({
+        journal: {
+          accept,
+          complete,
+          release: vi.fn(),
+        } as never,
+        record: { ...record, receivedAt: futureReceivedAt },
+        dispatch: vi.fn(async () => undefined),
+      });
+
+      await vi.waitFor(() =>
+        expect(complete).toHaveBeenCalledWith(createAgentMailDurableInboundId(record), {
+          completedAt: now,
+        }),
+      );
+      expect(accept).toHaveBeenCalledWith(
+        createAgentMailDurableInboundId(record),
+        expect.objectContaining({
+          receivedAt: now + AGENTMAIL_PROVIDER_FUTURE_SKEW_MAX_MS,
+        }),
+        { receivedAt: now + AGENTMAIL_PROVIDER_FUTURE_SKEW_MAX_MS },
+      );
+    } finally {
+      dateNow.mockRestore();
+    }
+  });
+
+  it("persists a sanitized local arrival timestamp for direct callers", async () => {
+    const now = 1_000_000;
+    const dateNow = vi.spyOn(Date, "now").mockReturnValue(now);
+    const accept = vi.fn(async () => ({
+      kind: "accepted" as const,
+      duplicate: false,
+      record: {},
+    }));
+    try {
+      await processAgentMailIngress({
+        journal: {
+          accept,
+          complete: vi.fn(async () => undefined),
+          release: vi.fn(),
+        } as never,
+        record: { ...record, messageId: "invalid-arrival", arrivedAt: Number.NaN },
+        dispatch: vi.fn(async () => undefined),
+      });
+      expect(accept).toHaveBeenCalledWith(
+        createAgentMailDurableInboundId({ ...record, messageId: "invalid-arrival" }),
+        expect.objectContaining({ arrivedAt: now }),
+        expect.any(Object),
+      );
+    } finally {
+      dateNow.mockRestore();
+    }
   });
 
   it("returns after durable admission without waiting for agent dispatch", async () => {
@@ -634,33 +802,45 @@ describe("AgentMail durable ingress", () => {
     expect(fail).toHaveBeenCalledWith(createAgentMailDurableInboundId(record), {
       reason: "dispatch-attempts-exhausted",
       message: "deferred turn abandoned before adoption",
+      failedAt: expect.any(Number),
     });
   });
 
   it("fails a completion marker after its retry ceiling without redispatching", async () => {
+    const now = 1_000_000;
+    const futureRecord = {
+      ...record,
+      receivedAt: now + 365 * 24 * 60 * 60_000,
+    };
+    const dateNow = vi.spyOn(Date, "now").mockReturnValue(now);
     const dispatch = vi.fn(async () => undefined);
     const complete = vi.fn(async () => {
       throw new Error("database read-only");
     });
     const fail = vi.fn(async () => true);
-    await processAgentMailIngress({
-      journal: {
-        accept: async () => ({ kind: "accepted", duplicate: false, record: {} }),
-        complete,
-        release: vi.fn(),
-        fail,
-      } as never,
-      record,
-      dispatch,
-      retryDelayMs: () => 0,
-    });
-    await vi.waitFor(() => expect(fail).toHaveBeenCalledOnce());
-    expect(dispatch).toHaveBeenCalledOnce();
-    expect(complete).toHaveBeenCalledTimes(50);
-    expect(fail).toHaveBeenCalledWith(createAgentMailDurableInboundId(record), {
-      reason: "completion-marker-failed",
-      message: "AgentMail could not persist the completion marker",
-    });
+    try {
+      await processAgentMailIngress({
+        journal: {
+          accept: async () => ({ kind: "accepted", duplicate: false, record: {} }),
+          complete,
+          release: vi.fn(),
+          fail,
+        } as never,
+        record: futureRecord,
+        dispatch,
+        retryDelayMs: () => 0,
+      });
+      await vi.waitFor(() => expect(fail).toHaveBeenCalledOnce());
+      expect(dispatch).toHaveBeenCalledOnce();
+      expect(complete).toHaveBeenCalledTimes(50);
+      expect(fail).toHaveBeenCalledWith(createAgentMailDurableInboundId(futureRecord), {
+        reason: "completion-marker-failed",
+        message: "AgentMail could not persist the completion marker",
+        failedAt: now,
+      });
+    } finally {
+      dateNow.mockRestore();
+    }
   });
 
   it("does not replay a turn after adoption if later dispatch settlement fails", async () => {
@@ -831,7 +1011,13 @@ describe("AgentMail durable ingress", () => {
       record,
       expect.objectContaining({ onTurnAdopted: expect.any(Function) }),
     );
-    expect(complete).toHaveBeenCalledWith(createAgentMailDurableInboundId(record));
+    expect(complete).toHaveBeenCalledWith(
+      createAgentMailDurableInboundId(record),
+      expect.objectContaining({ completedAt: expect.any(Number) }),
+    );
+    // Let the completed dispatch remove itself from the process-wide active-dispatch registry
+    // before exercising a fresh pending row with the same durable id.
+    await new Promise((resolve) => setTimeout(resolve, 0));
 
     dispatch.mockClear();
     complete.mockClear();
@@ -849,12 +1035,20 @@ describe("AgentMail durable ingress", () => {
       dispatch,
     });
     await vi.waitFor(() => expect(dispatch).toHaveBeenCalledOnce());
-    expect(complete).toHaveBeenCalledWith(createAgentMailDurableInboundId(record));
+    expect(complete).toHaveBeenCalledWith(
+      createAgentMailDurableInboundId(record),
+      expect.objectContaining({ completedAt: expect.any(Number) }),
+    );
   });
 
   it("keeps completed dedupe for the full recovery horizon without an entry cap", () => {
     expect(AGENTMAIL_DURABLE_PENDING_TTL_MS).toBe(30 * 24 * 60 * 60 * 1000);
-    expect(AGENTMAIL_DURABLE_COMPLETED_TTL_MS).toBe(AGENTMAIL_DURABLE_PENDING_TTL_MS);
+    expect(AGENTMAIL_DURABLE_COMPLETED_TTL_MS).toBe(
+      AGENTMAIL_DURABLE_PENDING_TTL_MS + AGENTMAIL_PROVIDER_FUTURE_SKEW_MAX_MS,
+    );
+    expect(AGENTMAIL_DURABLE_RETENTION.failedTtlMs).toBe(
+      AGENTMAIL_DURABLE_COMPLETED_TTL_MS,
+    );
     expect(AGENTMAIL_DURABLE_PENDING_MAX_ENTRIES).toBe(450);
     expect(AGENTMAIL_DURABLE_RETENTION).not.toHaveProperty("completedMaxEntries");
   });
@@ -876,7 +1070,12 @@ describe("AgentMail durable ingress", () => {
       } as never,
       dispatch,
     });
-    await vi.waitFor(() => expect(complete).toHaveBeenCalledWith("durable_1"));
+    await vi.waitFor(() =>
+      expect(complete).toHaveBeenCalledWith(
+        "durable_1",
+        expect.objectContaining({ completedAt: expect.any(Number) }),
+      ),
+    );
     expect(dispatch).toHaveBeenCalledWith(
       record,
       expect.objectContaining({ onTurnAdopted: expect.any(Function) }),
@@ -1001,7 +1200,10 @@ describe("AgentMail durable ingress", () => {
     firstAbort.abort();
     rejectFirst(new Error("old account stopped"));
     await vi.waitFor(() => expect(replacementDispatch).toHaveBeenCalledOnce());
-    expect(replacementComplete).toHaveBeenCalledWith(createAgentMailDurableInboundId(record));
+    expect(replacementComplete).toHaveBeenCalledWith(
+      createAgentMailDurableInboundId(record),
+      expect.objectContaining({ completedAt: expect.any(Number) }),
+    );
     replacementAbort.abort();
   });
 });

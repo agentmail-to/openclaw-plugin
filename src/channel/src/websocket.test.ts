@@ -129,7 +129,7 @@ describe("AgentMail WebSocket ingress", () => {
     await running;
   });
 
-  it("resets reconnect backoff when a short-lived connection delivers an event", async () => {
+  it("does not reset reconnect backoff for traffic on a short-lived connection", async () => {
     handlers.clear();
     connect.mockClear();
     const reconnectDelay = vi.fn(() => 0);
@@ -160,7 +160,7 @@ describe("AgentMail WebSocket ingress", () => {
     handlers.get("close")?.();
     await vi.waitFor(() => expect(connect).toHaveBeenCalledTimes(3));
 
-    expect(reconnectDelay.mock.calls.map(([attempt]) => attempt)).toEqual([1, 1]);
+    expect(reconnectDelay.mock.calls.map(([attempt]) => attempt)).toEqual([1, 2]);
     controller.abort();
     await running;
   });
@@ -180,6 +180,84 @@ describe("AgentMail WebSocket ingress", () => {
     await expect(running).resolves.toBeUndefined();
     expect(close).toHaveBeenCalledOnce();
     expect(waitForOpen).not.toHaveBeenCalled();
+  });
+
+  it("admits far-future sender timestamps with bounded retention", async () => {
+    handlers.clear();
+    const now = 1_000_000;
+    const dateNow = vi.spyOn(Date, "now").mockReturnValue(now);
+    const receive = vi.fn(async () => undefined);
+    const controller = new AbortController();
+    const running = startAgentMailWebSocket({
+      account,
+      abortSignal: controller.signal,
+      receive,
+      catchUpSession: { run: catchUpRun },
+    });
+    try {
+      await vi.waitFor(() => expect(handlers.has("message")).toBe(true));
+      catchUpRun.mockClear();
+      handlers.get("message")?.({
+        type: "event",
+        eventType: "message.received",
+        message: {
+          inboxId: "inbox_1",
+          messageId: "message_future",
+          labels: ["received"],
+          timestamp: new Date(now + 365 * 24 * 60 * 60_000),
+        },
+      });
+
+      await vi.waitFor(() => expect(receive).toHaveBeenCalledOnce());
+      expect(receive).toHaveBeenCalledWith(
+        expect.objectContaining({
+          messageId: "message_future",
+          receivedAt: now + 24 * 60 * 60_000,
+          arrivedAt: now,
+        }),
+      );
+    } finally {
+      controller.abort();
+      await running;
+      dateNow.mockRestore();
+    }
+  });
+
+  it("admits invalid sender timestamps using provider creation time", async () => {
+    handlers.clear();
+    const now = 1_000_000;
+    const receive = vi.fn(async () => undefined);
+    const controller = new AbortController();
+    const running = startAgentMailWebSocket({
+      account,
+      abortSignal: controller.signal,
+      receive,
+      catchUpSession: { run: catchUpRun },
+      now: () => now,
+    });
+    await vi.waitFor(() => expect(handlers.has("message")).toBe(true));
+    handlers.get("message")?.({
+      type: "event",
+      eventType: "message.received",
+      message: {
+        inboxId: "inbox_1",
+        messageId: "message_created",
+        labels: ["received"],
+        timestamp: new Date(Number.NaN),
+        createdAt: new Date(900_000),
+      },
+    });
+
+    await vi.waitFor(() => expect(receive).toHaveBeenCalledOnce());
+    expect(receive).toHaveBeenCalledWith(
+      expect.objectContaining({
+        messageId: "message_created",
+        receivedAt: 900_000,
+        arrivedAt: now,
+      }),
+    );
+    controller.abort();
+    await running;
   });
 
   it("durably admits message.received frames before the received label projects", async () => {
@@ -380,5 +458,38 @@ describe("AgentMail WebSocket ingress", () => {
     );
     controller.abort();
     await running;
+  });
+
+  it("keeps a healthy quiet socket open without application messages", async () => {
+    handlers.clear();
+    catchUpRun.mockClear();
+    connect.mockClear();
+    close.mockClear();
+    vi.useFakeTimers();
+    const controller = new AbortController();
+    try {
+      const running = startAgentMailWebSocket({
+        account,
+        abortSignal: controller.signal,
+        receive: vi.fn(async () => undefined),
+        catchUpSession: { run: catchUpRun },
+      });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(handlers.has("open")).toBe(true);
+      handlers.get("open")?.();
+
+      // The SDK exposes no heartbeat/liveness probe through this facade. Silence is healthy; the
+      // periodic REST sweep covers missed delivery without forcing a reconnect storm.
+      await vi.advanceTimersByTimeAsync(10 * 60_000);
+      expect(connect).toHaveBeenCalledOnce();
+      expect(close).not.toHaveBeenCalled();
+
+      controller.abort();
+      await running;
+      expect(close).toHaveBeenCalledOnce();
+    } finally {
+      controller.abort();
+      vi.useRealTimers();
+    }
   });
 });

@@ -1,19 +1,21 @@
 import { createDurableInboundReceiveJournalFromQueue } from "openclaw/plugin-sdk/channel-outbound";
 import { sha256Hex } from "./digest.js";
+import { AGENTMAIL_PROVIDER_FUTURE_SKEW_MAX_MS } from "./received-message.js";
 import { getAgentMailRuntime } from "./runtime.js";
 import type { AgentMailIngressRecord } from "./types.js";
 
 export const AGENTMAIL_DURABLE_PENDING_MAX_ENTRIES = 450;
 const AGENTMAIL_DURABLE_PRUNE_EVERY_ACCEPTS = 100;
 export const AGENTMAIL_DURABLE_PENDING_TTL_MS = 30 * 24 * 60 * 60 * 1000;
-// Keep completed tombstones for the full pending recovery horizon. REST catch-up may remain behind
-// while durable admission is full; expiring dedupe markers sooner either replays completed mail or
-// forces catch-up to skip never-admitted messages.
-export const AGENTMAIL_DURABLE_COMPLETED_TTL_MS = AGENTMAIL_DURABLE_PENDING_TTL_MS;
+// Terminal markers use truthful local transition times. Retain them for the pending recovery
+// horizon plus the future-skew window REST scans, so every supported provider timestamp remains
+// deduplicated until it has moved behind the local high-water cursor.
+export const AGENTMAIL_DURABLE_COMPLETED_TTL_MS =
+  AGENTMAIL_DURABLE_PENDING_TTL_MS + AGENTMAIL_PROVIDER_FUTURE_SKEW_MAX_MS;
 export const AGENTMAIL_DURABLE_RETENTION = {
   pendingTtlMs: AGENTMAIL_DURABLE_PENDING_TTL_MS,
   completedTtlMs: AGENTMAIL_DURABLE_COMPLETED_TTL_MS,
-  failedTtlMs: AGENTMAIL_DURABLE_PENDING_TTL_MS,
+  failedTtlMs: AGENTMAIL_DURABLE_COMPLETED_TTL_MS,
   failedMaxEntries: AGENTMAIL_DURABLE_PENDING_MAX_ENTRIES,
 } as const;
 
@@ -48,6 +50,31 @@ type AgentMailJournal = ReturnType<
   ) => Promise<boolean>;
 };
 
+type AgentMailCapacityAdmissionState = {
+  admissionChain: Promise<unknown>;
+  pendingEstimate: number | null;
+};
+
+// Account reloads can briefly leave old and replacement journal facades open over the same
+// persisted queue. Keep their count-and-accept sequence on one chain, keyed by that queue's stable
+// storage identity, rather than coordinating only calls made through one facade.
+const capacityAdmissionStates = new Map<string, AgentMailCapacityAdmissionState>();
+
+function resolveCapacityAdmissionState(
+  coordinationKey: string | undefined,
+): AgentMailCapacityAdmissionState {
+  if (!coordinationKey) {
+    return { admissionChain: Promise.resolve(), pendingEstimate: null };
+  }
+  const existing = capacityAdmissionStates.get(coordinationKey);
+  if (existing) {
+    return existing;
+  }
+  const created = { admissionChain: Promise.resolve(), pendingEstimate: null };
+  capacityAdmissionStates.set(coordinationKey, created);
+  return created;
+}
+
 /**
  * Wraps the store-backed journal with an admission cap. The published SDK's queue journal only
  * evicts on capacity; durable email must instead reject NEW mail while keeping already-accepted
@@ -56,47 +83,62 @@ type AgentMailJournal = ReturnType<
 export function withAgentMailIngressCapacity(
   journal: AgentMailJournal,
   maxPendingEntries: number,
+  coordinationKey?: string,
 ): AgentMailJournal {
   // Serialize check-and-enqueue. The published queue journal has no atomic admission cap, so two
   // concurrent transports (live WebSocket + REST catch-up) could otherwise both observe free space
-  // and push past the bound. Chaining admissions makes the count-then-accept step atomic per
-  // journal; the chain never rejects so one failed admission cannot poison later ones.
-  let admissionChain: Promise<unknown> = Promise.resolve();
+  // and push past the bound. Chaining admissions makes the count-then-accept step atomic across
+  // every facade for the queue; the chain never rejects so one failed admission cannot poison
+  // later ones. This intentionally introduces brief head-of-line coupling for facades sharing one
+  // queue; each critical section contains only the queue admission and occasional capacity scan.
+  const state = resolveCapacityAdmissionState(coordinationKey);
   // Upper-bound estimate of the pending count. It only increases on new admissions (never on
   // completion/retention pruning), so the O(pending) scan is skipped on the common below-cap path
   // and only runs to re-sync from the source of truth when the estimate first reaches the cap.
-  let pendingEstimate: number | null = null;
   return {
     ...journal,
     accept: (id, payload, options) => {
-      const admission = admissionChain.then(async () => {
-        const accepted = await journal.accept(id, payload, options);
-        // Let the queue perform its atomic id lookup first. Completed tombstones and pending
-        // duplicates consume no new capacity and must remain harmless even while the queue is full.
-        if (accepted.kind !== "accepted") {
-          return accepted;
-        }
-        if (pendingEstimate === null || pendingEstimate >= maxPendingEntries) {
-          const pending = await journal.pending();
-          pendingEstimate = pending.length;
-          if (pendingEstimate > maxPendingEntries) {
-            try {
-              if (await journal.deletePending(id)) {
-                pendingEstimate -= 1;
-              }
-            } catch {
-              // Never turn a capacity rejection into a terminal tombstone. If rollback deletion is
-              // temporarily unavailable, preserve the accepted pending row: provider redelivery or
-              // REST catch-up re-admits that duplicate and dispatches it once capacity recovers.
-            }
-            throw new AgentMailIngressCapacityError();
+      const admission = state.admissionChain.then(async () => {
+        try {
+          const accepted = await journal.accept(id, payload, options);
+          // Let the queue perform its atomic id lookup first. Completed tombstones and pending
+          // duplicates consume no new capacity and must remain harmless even while the queue is
+          // full.
+          if (accepted.kind !== "accepted") {
+            return accepted;
           }
-        } else {
-          pendingEstimate += 1;
+          if (
+            state.pendingEstimate === null ||
+            state.pendingEstimate >= maxPendingEntries
+          ) {
+            const pending = await journal.pending();
+            state.pendingEstimate = pending.length;
+            if (state.pendingEstimate > maxPendingEntries) {
+              try {
+                if (await journal.deletePending(id)) {
+                  state.pendingEstimate -= 1;
+                }
+              } catch {
+                // Never turn a capacity rejection into a terminal tombstone. If rollback deletion
+                // is temporarily unavailable, preserve the accepted pending row: provider
+                // redelivery or REST catch-up re-admits that duplicate and dispatches it once
+                // capacity recovers.
+              }
+              throw new AgentMailIngressCapacityError();
+            }
+          } else {
+            state.pendingEstimate += 1;
+          }
+          return accepted;
+        } catch (error) {
+          // accept() may persist the row and then fail during its post-enqueue retention prune.
+          // Any failure after entering the critical section makes the cached count uncertain; force
+          // the next new admission to resynchronize from durable storage.
+          state.pendingEstimate = null;
+          throw error;
         }
-        return accepted;
       });
-      admissionChain = admission.then(
+      state.admissionChain = admission.then(
         () => undefined,
         () => undefined,
       );
@@ -110,10 +152,12 @@ export function createAgentMailDurableInboundReceiveJournal(params: {
   inboxId: string;
 }): AgentMailJournal {
   const runtime = getAgentMailRuntime();
+  const stateDir = runtime.state.resolveStateDir();
+  const queueAccountId = sha256Hex(`${params.accountId}\n${params.inboxId}`).slice(0, 24);
   const queue = runtime.state.openChannelIngressQueue<AgentMailIngressRecord, undefined, undefined>(
     {
-      accountId: sha256Hex(`${params.accountId}\n${params.inboxId}`).slice(0, 24),
-      stateDir: runtime.state.resolveStateDir(),
+      accountId: queueAccountId,
+      stateDir,
     },
   );
   const prune = async () => {
@@ -132,7 +176,7 @@ export function createAgentMailDurableInboundReceiveJournal(params: {
         await prune();
         acceptsSincePrune = 0;
       }
-      const result = await queue.enqueue(id.trim(), payload, options);
+      const result = await queue.enqueue(id, payload, options);
       acceptsSincePrune += 1;
       if (result.kind === "accepted") {
         return { kind: "accepted", duplicate: false, record: result.record };
@@ -173,5 +217,6 @@ export function createAgentMailDurableInboundReceiveJournal(params: {
   return withAgentMailIngressCapacity(
     extendedJournal,
     AGENTMAIL_DURABLE_PENDING_MAX_ENTRIES,
+    `${stateDir}\nagentmail\n${queueAccountId}`,
   );
 }

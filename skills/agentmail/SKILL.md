@@ -5,8 +5,11 @@ metadata:
   {
     "openclaw":
       {
-        "requires": { "bins": ["openclaw"], "env": ["AGENTMAIL_API_KEY"] },
-        "primaryEnv": "AGENTMAIL_API_KEY",
+        "requires":
+          {
+            "bins": ["openclaw"],
+            "config": ["plugins.entries.agentmail.config.apiKey"],
+          },
       },
   }
 ---
@@ -20,9 +23,8 @@ openclaw agentmail -- <agentmail arguments>
 ```
 
 Always put `--` after `agentmail`; it prevents OpenClaw from interpreting AgentMail flags.
-Never pass `--api-key`, `--base-url`, `--environment`, or print the API key. Authentication is
-inherited from `AGENTMAIL_API_KEY`, and only operator-controlled plugin configuration may select
-the API endpoint.
+Never pass `--api-key`, `--base-url`, `--environment`, or print the API key. Authentication and
+the API endpoint come only from operator-controlled `plugins.entries.agentmail.config` values.
 If a literal command value begins with `--base-url` or `--environment`, pass it with the containing
 option's `--option=value` form so the endpoint guard can distinguish it from a global override.
 

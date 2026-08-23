@@ -130,6 +130,9 @@ export function parseSingleFromMailbox(value: string): { address: string; name?:
   if (!rawName.trim()) {
     return { address };
   }
+  if (/^"\s*"$/u.test(rawName.trim())) {
+    return { address };
+  }
   const name = parseDisplayName(rawName);
   return name ? { address, name } : null;
 }

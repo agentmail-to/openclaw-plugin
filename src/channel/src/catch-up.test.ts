@@ -5,9 +5,11 @@ import type {
 } from "openclaw/plugin-sdk/plugin-state-runtime";
 import { describe, expect, it, vi } from "vitest";
 import {
+  AGENTMAIL_CATCH_UP_INTERVAL_MS,
   AGENTMAIL_REST_CATCH_UP_CURSOR_TTL_MS,
   AGENTMAIL_REST_CATCH_UP_LEGACY_MAX_ACCOUNTS,
   AGENTMAIL_REST_CATCH_UP_MAX_ENTRIES_PER_ACCOUNT,
+  AGENTMAIL_REST_CATCH_UP_MAX_FUTURE_ADMISSIONS,
   AGENTMAIL_REST_CATCH_UP_NAMESPACE,
   AGENTMAIL_REST_CATCH_UP_OVERLAP_MS,
   type AgentMailCatchUpCursor,
@@ -19,6 +21,7 @@ import {
   AGENTMAIL_DURABLE_PENDING_TTL_MS,
   AgentMailIngressCapacityError,
 } from "./durable-receive.js";
+import { AGENTMAIL_PROVIDER_FUTURE_SKEW_MAX_MS } from "./received-message.js";
 import type { AgentMailIngressRecord, ResolvedAgentMailAccount } from "./types.js";
 
 const openKeyedStore = vi.hoisted(() => vi.fn());
@@ -93,6 +96,7 @@ function message(params: {
   timestamp: number;
   labels?: string[];
   inboxId?: string;
+  createdAtMs?: number;
 }): AgentMail.MessageItem {
   return {
     inboxId: params.inboxId ?? "inbox_1",
@@ -104,7 +108,18 @@ function message(params: {
     to: ["agent@example.com"],
     size: 1,
     updatedAt: new Date(params.timestamp),
-    createdAt: new Date(params.timestamp),
+    createdAt: new Date(params.createdAtMs ?? params.timestamp),
+  };
+}
+
+/** A provider row whose sender date does not parse, so retention must fall back to createdAt. */
+function malformedTimestampMessage(params: {
+  id: string;
+  createdAtMs: number;
+}): AgentMail.MessageItem {
+  return {
+    ...message({ id: params.id, timestamp: params.createdAtMs, createdAtMs: params.createdAtMs }),
+    timestamp: "not-a-date" as never,
   };
 }
 
@@ -404,7 +419,7 @@ describe("AgentMail durable REST catch-up", () => {
     );
   });
 
-  it("admits malformed timestamps using local time without poisoning the cursor", async () => {
+  it("admits malformed timestamps using provider creation time", async () => {
     const store = memoryStore<never>();
     const malformed = message({ id: "bad_timestamp", timestamp: 1_100 }) as AgentMail.MessageItem;
     (malformed as { timestamp: unknown }).timestamp = new Date(Number.NaN);
@@ -421,13 +436,13 @@ describe("AgentMail durable REST catch-up", () => {
     expect(receive).toHaveBeenCalledWith(
       expect.objectContaining({
         messageId: "bad_timestamp",
-        receivedAt: 1_000,
+        receivedAt: 1_100,
         arrivedAt: 1_000,
       }),
     );
   });
 
-  it("does not advance the cursor beyond the sweep's fixed upper bound", async () => {
+  it("advances the cursor from an invalid timestamp's fixed sweep fallback", async () => {
     const store = memoryStore<never>();
     const malformed = message({ id: "bad_timestamp", timestamp: 1_100 }) as AgentMail.MessageItem;
     (malformed as { timestamp: unknown }).timestamp = new Date(Number.NaN);
@@ -482,7 +497,9 @@ describe("AgentMail durable REST catch-up", () => {
     expect(list).toHaveBeenNthCalledWith(
       1,
       "inbox_1",
-      expect.objectContaining({ before: new Date(nowMs + 1) }),
+      expect.objectContaining({
+        before: new Date(nowMs + AGENTMAIL_PROVIDER_FUTURE_SKEW_MAX_MS + 1),
+      }),
       expect.any(Object),
     );
     await session.run({ receive, abortSignal: new AbortController().signal });
@@ -495,7 +512,7 @@ describe("AgentMail durable REST catch-up", () => {
     );
   });
 
-  it("repairs a stored cursor after the host clock moves backwards", async () => {
+  it("repairs future cursor bounds when the clock moves backward", async () => {
     const store = memoryStore<AgentMailCatchUpCursor>();
     const key = sha256Hex("default\ninbox_1");
     await store.register(key, {
@@ -528,6 +545,35 @@ describe("AgentMail durable REST catch-up", () => {
       highWaterAtMs: 1_000_000,
       established: true,
     });
+  });
+
+  it("does not invert baseline catch-up bounds when the clock moves backward", async () => {
+    const store = memoryStore<never>();
+    const list = vi.fn(async () => ({ count: 0, messages: [] }));
+    let nowMs = 2_000_000;
+    const session = await createAgentMailCatchUpSession({
+      account,
+      client: { inboxes: { messages: { list } } } as never,
+      store: store as never,
+      now: () => nowMs,
+    });
+    nowMs = 1_000_000;
+
+    await session.run({ receive: vi.fn(), abortSignal: new AbortController().signal });
+    await session.run({
+      receive: vi.fn(),
+      abortSignal: new AbortController().signal,
+      sinceBaseline: true,
+    });
+
+    for (const [, query] of list.mock.calls) {
+      expect(query).toEqual(
+        expect.objectContaining({
+          after: new Date(nowMs),
+          before: new Date(nowMs + AGENTMAIL_PROVIDER_FUTURE_SKEW_MAX_MS + 1),
+        }),
+      );
+    }
   });
 
   it("lists from the monitoring baseline on a deep sweep", async () => {
@@ -605,7 +651,7 @@ describe("AgentMail durable REST catch-up", () => {
     );
   });
 
-  it("advances past malformed timestamps and clamps implausibly future timestamps", async () => {
+  it("advances malformed timestamps using provider creation time", async () => {
     const store = memoryStore<AgentMailCatchUpCursor>();
     const key = sha256Hex("default\ninbox_1");
     await store.register(key, {
@@ -618,10 +664,9 @@ describe("AgentMail durable REST catch-up", () => {
       ...message({ id: "malformed", timestamp: 900_000 }),
       timestamp: new Date(Number.NaN),
     };
-    const farFuture = message({ id: "future", timestamp: 100_000_000 });
     const list = vi
       .fn()
-      .mockResolvedValueOnce({ count: 2, messages: [malformed, farFuture] })
+      .mockResolvedValueOnce({ count: 1, messages: [malformed] })
       .mockResolvedValueOnce({ count: 0, messages: [] });
     const warn = vi.fn();
     const session = await createAgentMailCatchUpSession({
@@ -637,14 +682,13 @@ describe("AgentMail durable REST catch-up", () => {
     await session.run({ receive, abortSignal: new AbortController().signal });
 
     expect(receive.mock.calls.map(([record]) => [record.messageId, record.receivedAt])).toEqual([
-      ["malformed", 1_000_000],
-      ["future", 1_000_000],
+      ["malformed", 900_000],
     ]);
     expect(list).toHaveBeenNthCalledWith(
       1,
       "inbox_1",
       expect.objectContaining({
-        before: new Date(1_000_001),
+        before: new Date(1_000_000 + AGENTMAIL_PROVIDER_FUTURE_SKEW_MAX_MS + 1),
       }),
       expect.any(Object),
     );
@@ -657,7 +701,6 @@ describe("AgentMail durable REST catch-up", () => {
       expect.any(Object),
     );
     expect(warn).toHaveBeenCalledWith(expect.stringContaining("invalid timestamp"));
-    expect(warn).toHaveBeenCalledWith(expect.stringContaining("clamped future timestamp"));
   });
 
   it("pauses the pass when durable ingress reports capacity", async () => {
@@ -688,6 +731,38 @@ describe("AgentMail durable REST catch-up", () => {
     ).resolves.toBeUndefined();
     expect(list).toHaveBeenCalledTimes(1);
     expect(receive).toHaveBeenCalledTimes(1);
+  });
+
+  it("leaves the cursor retryable when a provider page has no messages array", async () => {
+    const store = memoryStore<AgentMailCatchUpCursor>();
+    const key = sha256Hex("default\ninbox_1");
+    const list = vi
+      .fn()
+      .mockResolvedValueOnce({ count: 1 })
+      .mockResolvedValueOnce({ count: 0, messages: [] });
+    const error = vi.fn();
+    const session = await createAgentMailCatchUpSession({
+      account,
+      client: { inboxes: { messages: { list } } } as never,
+      store,
+      now: () => 2_000,
+      log: { error },
+    });
+
+    await session.run({
+      receive: vi.fn(),
+      abortSignal: new AbortController().signal,
+    });
+    expect(await store.lookup(key)).toMatchObject({ established: false });
+    expect(error).toHaveBeenCalledWith(
+      "AgentMail catch-up received a malformed messages page for account default",
+    );
+
+    await session.run({
+      receive: vi.fn(),
+      abortSignal: new AbortController().signal,
+    });
+    expect(await store.lookup(key)).toMatchObject({ established: true });
   });
 
   it("does not establish the cursor past a failed durable admission", async () => {
@@ -785,6 +860,445 @@ describe("AgentMail durable REST catch-up", () => {
       "newer",
       "backdated",
       "backdated",
+    ]);
+  });
+
+  it("preserves a paused deep-sweep continuation across a normal sweep", async () => {
+    const store = memoryStore<AgentMailCatchUpCursor>();
+    const key = sha256Hex("default\ninbox_1");
+    await store.register(key, {
+      version: 1,
+      baselineAtMs: 100_000,
+      highWaterAtMs: 800_000,
+      established: true,
+    });
+    let deepPageTwoPauses = true;
+    let nowMs = 1_000_000;
+    const list = vi.fn(
+      async (_inboxId: string, options: { after: Date; pageToken?: string }) => {
+        if (options.pageToken === "deep_page_2") {
+          return {
+            count: 1,
+            messages: [message({ id: "deep_old", timestamp: 200_000 })],
+          };
+        }
+        if (options.after.getTime() === 100_000) {
+          return {
+            count: 1,
+            messages: [message({ id: "deep_page_1", timestamp: 300_000 })],
+            nextPageToken: "deep_page_2",
+          };
+        }
+        return {
+          count: 1,
+          messages: [message({ id: "normal_new", timestamp: 1_400_000 })],
+        };
+      },
+    );
+    const session = await createAgentMailCatchUpSession({
+      account,
+      client: { inboxes: { messages: { list } } } as never,
+      store,
+      now: () => nowMs,
+    });
+    const receive = vi.fn(async (record: AgentMailIngressRecord) => {
+      if (record.messageId === "deep_old" && deepPageTwoPauses) {
+        deepPageTwoPauses = false;
+        throw new AgentMailIngressCapacityError();
+      }
+    });
+
+    await session.run({
+      receive,
+      abortSignal: new AbortController().signal,
+      sinceBaseline: true,
+    });
+    expect((await store.lookup(key))?.checkpoints?.deep).toMatchObject({
+      pageToken: "deep_page_2",
+      sinceBaseline: true,
+    });
+
+    nowMs = 2_000_000;
+    await session.run({ receive, abortSignal: new AbortController().signal });
+    expect((await store.lookup(key))?.checkpoints?.deep).toMatchObject({
+      pageToken: "deep_page_2",
+      sinceBaseline: true,
+    });
+    expect((await store.lookup(key))?.highWaterAtMs).toBe(1_400_000);
+
+    nowMs = 3_000_000;
+    await session.run({
+      receive,
+      abortSignal: new AbortController().signal,
+      sinceBaseline: true,
+    });
+    expect(list).toHaveBeenLastCalledWith(
+      "inbox_1",
+      expect.objectContaining({ pageToken: "deep_page_2" }),
+      expect.any(Object),
+    );
+    expect((await store.lookup(key))?.checkpoints?.deep).toBeUndefined();
+    expect((await store.lookup(key))?.highWaterAtMs).toBe(1_400_000);
+  });
+
+  it("resumes a normal continuation while a deep continuation is paused", async () => {
+    const store = memoryStore<AgentMailCatchUpCursor>();
+    const key = sha256Hex("default\ninbox_1");
+    await store.register(key, {
+      version: 1,
+      baselineAtMs: 100_000,
+      highWaterAtMs: 800_000,
+      established: true,
+      checkpoints: {
+        deep: {
+          afterAtMs: 100_000,
+          beforeAtMs: 900_001,
+          pageToken: "deep_page_2",
+          highWaterAtMs: 800_000,
+          sinceBaseline: true,
+        },
+      },
+    });
+    let pause = true;
+    const list = vi.fn(async (_inboxId: string, options: { pageToken?: string }) =>
+      options.pageToken === "normal_page_2"
+        ? { count: 1, messages: [message({ id: "normal_b", timestamp: 900_000 })] }
+        : {
+            count: 1,
+            messages: [message({ id: "normal_a", timestamp: 850_000 })],
+            nextPageToken: "normal_page_2",
+          },
+    );
+    const session = await createAgentMailCatchUpSession({
+      account,
+      client: { inboxes: { messages: { list } } } as never,
+      store,
+      now: () => 1_000_000,
+    });
+    const receive = vi.fn(async (record: AgentMailIngressRecord) => {
+      if (record.messageId === "normal_b" && pause) {
+        pause = false;
+        throw new AgentMailIngressCapacityError();
+      }
+    });
+
+    await session.run({ receive, abortSignal: new AbortController().signal });
+    expect((await store.lookup(key))?.checkpoints).toMatchObject({
+      normal: { pageToken: "normal_page_2" },
+      deep: { pageToken: "deep_page_2" },
+    });
+    await session.run({ receive, abortSignal: new AbortController().signal });
+
+    expect(list.mock.calls.map(([, options]) => options.pageToken)).toEqual([
+      undefined,
+      "normal_page_2",
+      "normal_page_2",
+    ]);
+    expect(receive.mock.calls.map(([record]) => record.messageId)).toEqual([
+      "normal_a",
+      "normal_b",
+      "normal_b",
+    ]);
+    expect((await store.lookup(key))?.checkpoints?.deep?.pageToken).toBe("deep_page_2");
+  });
+
+  it("resumes an old account checkpoint while filtering rows beyond retention", async () => {
+    const store = memoryStore<AgentMailCatchUpCursor>();
+    const key = sha256Hex("default\ninbox_1");
+    const nowMs = 40 * 24 * 60 * 60_000;
+    const previousSweepAtMs = nowMs - 60_000;
+    const recoveryFloorMs = nowMs - AGENTMAIL_DURABLE_PENDING_TTL_MS;
+    await store.register(key, {
+      version: 1,
+      baselineAtMs: 0,
+      highWaterAtMs: previousSweepAtMs,
+      established: true,
+      // Exercise migration from the shipped single-slot cursor at the same time.
+      checkpoint: {
+        // This boundary was the recovery floor one periodic interval ago. Requiring it to remain
+        // above today's floor made old-account continuations expire almost immediately.
+        afterAtMs: previousSweepAtMs - AGENTMAIL_DURABLE_PENDING_TTL_MS,
+        beforeAtMs: previousSweepAtMs + 1,
+        pageToken: "old_deep_page_2",
+        highWaterAtMs: previousSweepAtMs,
+        sinceBaseline: true,
+      },
+    });
+    const list = vi.fn(async () => ({
+      count: 4,
+      messages: [
+        message({ id: "expired", timestamp: recoveryFloorMs - 1 }),
+        // A malformed sender date must not skip the retention filter: the createdAt fallback the
+        // row is admitted with is itself expired, so its tombstone is already gone.
+        malformedTimestampMessage({ id: "expired_fallback", createdAtMs: recoveryFloorMs - 1 }),
+        // ...while a malformed date with a live createdAt stays recoverable.
+        malformedTimestampMessage({ id: "retained_fallback", createdAtMs: recoveryFloorMs + 1 }),
+        message({ id: "retained", timestamp: recoveryFloorMs + 1 }),
+      ],
+    }));
+    const session = await createAgentMailCatchUpSession({
+      account,
+      client: { inboxes: { messages: { list } } } as never,
+      store,
+      now: () => nowMs,
+    });
+    const receive = vi.fn(async () => undefined);
+
+    await session.run({
+      receive,
+      abortSignal: new AbortController().signal,
+      sinceBaseline: true,
+    });
+
+    expect(list).toHaveBeenCalledWith(
+      "inbox_1",
+      expect.objectContaining({ pageToken: "old_deep_page_2" }),
+      expect.any(Object),
+    );
+    expect(receive.mock.calls.map(([record]) => record.messageId)).toEqual([
+      "retained_fallback",
+      "retained",
+    ]);
+    expect((await store.lookup(key))?.checkpoints?.deep).toBeUndefined();
+  });
+
+  it("admits a future-dated message once instead of on every sweep", async () => {
+    const store = memoryStore<AgentMailCatchUpCursor>();
+    const key = sha256Hex("default\ninbox_1");
+    let nowMs = 10_000_000;
+    const futureAtMs = nowMs + 6 * 60 * 60_000;
+    // Model the provider filter: the row comes back on every sweep whose window still contains it,
+    // which the widened future-skew `before` bound guarantees for the next 24h.
+    const list = vi.fn(async (_inboxId: string, options: { after: Date; before: Date }) =>
+      futureAtMs >= options.after.getTime() && futureAtMs < options.before.getTime()
+        ? { count: 1, messages: [message({ id: "future", timestamp: futureAtMs })] }
+        : { count: 0, messages: [] },
+    );
+    const session = await createAgentMailCatchUpSession({
+      account,
+      client: { inboxes: { messages: { list } } } as never,
+      store,
+      now: () => nowMs,
+    });
+    const receive = vi.fn(async () => undefined);
+
+    for (let sweep = 0; sweep < 3; sweep += 1) {
+      await session.run({ receive, abortSignal: new AbortController().signal });
+      nowMs += AGENTMAIL_CATCH_UP_INTERVAL_MS;
+    }
+
+    // The cursor cannot advance past the sender date, so the id is what keeps the repeats out of
+    // the admission chain.
+    expect(list.mock.calls.length).toBe(3);
+    expect(receive.mock.calls.map(([record]) => record.messageId)).toEqual(["future"]);
+    expect((await store.lookup(key))?.futureAdmissions).toEqual([
+      { messageId: "future", atMs: futureAtMs },
+    ]);
+
+    // Once the sweep clock covers the sender date the entry is dropped and the high-water cursor
+    // takes over, so nothing is remembered forever.
+    nowMs = futureAtMs + 1_000;
+    await session.run({ receive, abortSignal: new AbortController().signal });
+    const settled = await store.lookup(key);
+    expect(receive.mock.calls.map(([record]) => record.messageId)).toEqual(["future", "future"]);
+    expect(settled?.futureAdmissions).toBeUndefined();
+    expect(settled?.highWaterAtMs).toBe(futureAtMs);
+  });
+
+  it("memoizes a future-dated row whose sender date is malformed", async () => {
+    const store = memoryStore<AgentMailCatchUpCursor>();
+    const key = sha256Hex("default\ninbox_1");
+    let nowMs = 10_000_000;
+    const futureAtMs = nowMs + 6 * 60 * 60_000;
+    // The provider orders by its own future value; only our parse of `timestamp` fails, so the row
+    // is admitted on the createdAt fallback and is just as unreachable by the high-water cursor.
+    const list = vi.fn(async (_inboxId: string, options: { after: Date; before: Date }) =>
+      futureAtMs >= options.after.getTime() && futureAtMs < options.before.getTime()
+        ? { count: 1, messages: [malformedTimestampMessage({ id: "m", createdAtMs: futureAtMs })] }
+        : { count: 0, messages: [] },
+    );
+    const log = { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+    const session = await createAgentMailCatchUpSession({
+      account,
+      client: { inboxes: { messages: { list } } } as never,
+      store,
+      now: () => nowMs,
+      log,
+    });
+    const receive = vi.fn(async () => undefined);
+
+    for (let sweep = 0; sweep < 4; sweep += 1) {
+      await session.run({ receive, abortSignal: new AbortController().signal });
+      nowMs += AGENTMAIL_CATCH_UP_INTERVAL_MS;
+    }
+
+    expect(receive.mock.calls.map(([record]) => record.messageId)).toEqual(["m"]);
+    // One warning, not one per sweep.
+    expect(log.warn.mock.calls.length).toBe(1);
+    expect((await store.lookup(key))?.futureAdmissions).toEqual([
+      { messageId: "m", atMs: futureAtMs },
+    ]);
+  });
+
+  it("does not treat ordinary mail as future-dated during a resumed continuation", async () => {
+    const store = memoryStore<AgentMailCatchUpCursor>();
+    const key = sha256Hex("default\ninbox_1");
+    const baseAtMs = 100 * 24 * 60 * 60_000;
+    await store.register(key, {
+      version: 1,
+      baselineAtMs: baseAtMs - 60 * 60_000,
+      highWaterAtMs: baseAtMs - 60 * 60_000,
+      established: true,
+      checkpoints: {
+        deep: {
+          afterAtMs: baseAtMs - 2 * 60 * 60_000,
+          beforeAtMs: baseAtMs + 1,
+          pageToken: "deep_page_2",
+          highWaterAtMs: baseAtMs,
+          sinceBaseline: true,
+        },
+      },
+    });
+    // Ordinary mail that arrived after the resumed window's bound but well before the run clock.
+    const list = vi.fn(async () => ({
+      count: 2,
+      messages: [
+        message({ id: "recent_a", timestamp: baseAtMs + 60 * 60_000 }),
+        message({ id: "recent_b", timestamp: baseAtMs + 2 * 60 * 60_000 }),
+      ],
+    }));
+    const log = { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+    const session = await createAgentMailCatchUpSession({
+      account,
+      client: { inboxes: { messages: { list } } } as never,
+      store,
+      now: () => baseAtMs + 3 * 60 * 60_000,
+      log,
+    });
+    const receive = vi.fn(async () => undefined);
+
+    await session.run({
+      receive,
+      abortSignal: new AbortController().signal,
+      sinceBaseline: true,
+    });
+
+    expect(receive.mock.calls.map(([record]) => record.messageId)).toEqual([
+      "recent_a",
+      "recent_b",
+    ]);
+    // Rewinding the sweep bound must not make past mail look like sender skew.
+    expect((await store.lookup(key))?.futureAdmissions).toBeUndefined();
+    expect(log.warn).not.toHaveBeenCalled();
+  });
+
+  it("keeps the furthest-future ids when the memo overflows its bounds", async () => {
+    const store = memoryStore<AgentMailCatchUpCursor>();
+    const key = sha256Hex("default\ninbox_1");
+    const nowMs = 100 * 24 * 60 * 60_000;
+    const firstAtMs = nowMs + 60 * 60_000;
+    const overflow = AGENTMAIL_REST_CATCH_UP_MAX_FUTURE_ADMISSIONS + 1;
+    const list = vi.fn(async () => ({
+      count: overflow,
+      messages: Array.from({ length: overflow }, (_, index) =>
+        message({ id: `future_${index}`, timestamp: firstAtMs + index * 1_000 }),
+      ),
+    }));
+    const session = await createAgentMailCatchUpSession({
+      account,
+      client: { inboxes: { messages: { list } } } as never,
+      store,
+      now: () => nowMs,
+    });
+
+    await session.run({
+      receive: vi.fn(async () => undefined),
+      abortSignal: new AbortController().signal,
+    });
+
+    const memo = (await store.lookup(key))?.futureAdmissions ?? [];
+    expect(memo.length).toBe(AGENTMAIL_REST_CATCH_UP_MAX_FUTURE_ADMISSIONS);
+    // The nearest-future id is the one dropped: the clock reaches it first, so it churns least.
+    expect(memo.map((entry) => entry.messageId)).not.toContain("future_0");
+    expect(memo.map((entry) => entry.messageId)).toContain(`future_${overflow - 1}`);
+  });
+
+  it("bounds the memo by serialized size when provider ids are long", async () => {
+    const store = memoryStore<AgentMailCatchUpCursor>();
+    const key = sha256Hex("default\ninbox_1");
+    const nowMs = 100 * 24 * 60 * 60_000;
+    const firstAtMs = nowMs + 60 * 60_000;
+    const count = 100;
+    const list = vi.fn(async () => ({
+      count,
+      messages: Array.from({ length: count }, (_, index) =>
+        message({
+          // Provider ids are unbounded strings; the entry cap alone would not keep the persisted
+          // cursor under the keyed store's 64KB ceiling.
+          id: `${String(index).padStart(4, "0")}${"x".repeat(1_000)}`,
+          timestamp: firstAtMs + index * 1_000,
+        }),
+      ),
+    }));
+    const session = await createAgentMailCatchUpSession({
+      account,
+      client: { inboxes: { messages: { list } } } as never,
+      store,
+      now: () => nowMs,
+    });
+
+    await session.run({
+      receive: vi.fn(async () => undefined),
+      abortSignal: new AbortController().signal,
+    });
+
+    const cursor = await store.lookup(key);
+    const memo = cursor?.futureAdmissions ?? [];
+    expect(memo.length).toBeGreaterThan(0);
+    expect(memo.length).toBeLessThan(count);
+    expect(new TextEncoder().encode(JSON.stringify(cursor)).byteLength).toBeLessThan(65_536);
+  });
+
+  it("keeps future-dated ids a resumed continuation cannot re-list", async () => {
+    const store = memoryStore<AgentMailCatchUpCursor>();
+    const key = sha256Hex("default\ninbox_1");
+    const baseAtMs = 100 * 24 * 60 * 60_000;
+    // Recorded by a later sweep, inside that sweep's skew horizon but beyond the resumed window's.
+    const memoAtMs = baseAtMs + 25 * 60 * 60_000;
+    await store.register(key, {
+      version: 1,
+      baselineAtMs: baseAtMs,
+      highWaterAtMs: baseAtMs,
+      established: true,
+      checkpoints: {
+        deep: {
+          afterAtMs: baseAtMs - 60 * 60_000,
+          beforeAtMs: baseAtMs + 1,
+          pageToken: "deep_page_2",
+          highWaterAtMs: baseAtMs,
+          sinceBaseline: true,
+        },
+      },
+      futureAdmissions: [{ messageId: "future", atMs: memoAtMs }],
+    });
+    const list = vi.fn(async () => ({ count: 0, messages: [] }));
+    const session = await createAgentMailCatchUpSession({
+      account,
+      client: { inboxes: { messages: { list } } } as never,
+      store,
+      // A resumed continuation rewinds the sweep bound to its original window; pruning the memo
+      // against that older horizon would drop the id and persist the loss.
+      now: () => baseAtMs + 3 * 60 * 60_000,
+    });
+
+    await session.run({
+      receive: vi.fn(async () => undefined),
+      abortSignal: new AbortController().signal,
+      sinceBaseline: true,
+    });
+
+    expect((await store.lookup(key))?.futureAdmissions).toEqual([
+      { messageId: "future", atMs: memoAtMs },
     ]);
   });
 

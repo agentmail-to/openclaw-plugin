@@ -33,8 +33,7 @@ For development, use `openclaw plugins install --link .` so OpenClaw loads this 
 
 Set `AGENTMAIL_API_KEY` in the environment that runs the OpenClaw Gateway. To enable **webhook** ingress for the channel, also set `AGENTMAIL_WEBHOOK_SECRET` (Svix-signed); without it the channel falls back to WebSocket ingress.
 
-For a managed Gateway, put them in `~/.openclaw/.env` so the channel and agent turns inherit the
-same credentials:
+For a managed Gateway, put the channel secrets in `~/.openclaw/.env`:
 
 ```dotenv
 AGENTMAIL_API_KEY=am_...
@@ -50,12 +49,11 @@ openclaw plugins inspect agentmail --runtime
 
 ### CLI config
 
-> **Credentials:** the bundled CLI authenticates only with the `AGENTMAIL_API_KEY` environment
-> variable, while the **channel** can also take an inline or resolved `apiKey` in
-> `channels.agentmail`. Always set `AGENTMAIL_API_KEY` in the Gateway environment so both surfaces
-> are configured; a channel-only inline key leaves the CLI-backed skill unavailable.
+> **Credentials:** the bundled CLI does not trust credentials inherited from the invoking process.
+> Configure its `apiKey` under `plugins.entries.agentmail.config` as an inline secret or SecretRef.
+> The **channel** is configured separately under `channels.agentmail`.
 
-An optional API base URL override for the bundled CLI belongs under
+The CLI credential and optional API base URL override belong under
 `plugins.entries.agentmail.config`:
 
 ```json5
@@ -64,6 +62,7 @@ An optional API base URL override for the bundled CLI belongs under
     entries: {
       agentmail: {
         config: {
+          apiKey: { source: "env", provider: "default", id: "AGENTMAIL_API_KEY" },
           baseUrl: "https://api.agentmail.to/v0",
         },
       },
@@ -75,13 +74,15 @@ An optional API base URL override for the bundled CLI belongs under
 The previous `timeoutSeconds` and `maxRetries` tool settings remain accepted so existing
 configurations continue to load, but the bundled CLI does not use them.
 For credential safety, command arguments cannot override `--api-key`, `--base-url`, or
-`--environment`; only inherited credentials and the operator-controlled plugin setting above can
-select the AgentMail identity and API endpoint. The passthrough also removes inherited
-endpoint-selector and standard proxy environment variables (`HTTP_PROXY`, `HTTPS_PROXY`,
-`ALL_PROXY`, and `NO_PROXY`, including lowercase forms).
+`--environment`; only the operator-controlled plugin setting above can select the AgentMail
+identity and API endpoint. The passthrough removes inherited AgentMail credentials, custom headers,
+endpoint selectors, and standard proxy environment variables (`HTTP_PROXY`, `HTTPS_PROXY`,
+`ALL_PROXY`, and `NO_PROXY`, including lowercase forms), then injects only the resolved configured
+CLI credential.
 If a command value must literally begin with `--base-url` or `--environment`, use the CLI's
-`--option=value` form (for example, `--subject=--base-url-is-restricted`). The endpoint guard fails
-closed for unrecognized separate-value options.
+`--option=value` form (for example, `--subject=--base-url-is-restricted`). Restricted-looking
+standalone tokens are rejected in every argument position, so CLI grammar changes cannot turn one
+into an unvalidated override.
 
 ### Channel config
 
@@ -91,9 +92,9 @@ The **channel** is configured under `channels.agentmail` (single inbox) or `chan
 {
   channels: {
     agentmail: {
-      apiKey: { source: "env", provider: "agentmail", id: "AGENTMAIL_API_KEY" },
+      apiKey: { source: "env", provider: "default", id: "AGENTMAIL_API_KEY" },
       inboxId: "agent@agentmail.to",
-      webhookSecret: { source: "env", provider: "agentmail", id: "AGENTMAIL_WEBHOOK_SECRET" },
+      webhookSecret: { source: "env", provider: "default", id: "AGENTMAIL_WEBHOOK_SECRET" },
       dmPolicy: "allowlist",       // default; an empty allowFrom denies every sender
       allowFrom: ["person@example.com"],
       mediaMaxMb: 20,
@@ -107,6 +108,14 @@ Security defaults worth knowing:
 - `dmPolicy` defaults to `allowlist`. With an empty `allowFrom`, **every sender is denied**.
 - `dmPolicy: "open"` requires `allowFrom` to include `"*"`.
 - Every reply re-hydrates the triggering message and re-authorizes its `From`, so an untrusted `Reply-To` cannot redirect delivery.
+
+The configured `inboxId` also identifies the durable receive queue. Keep its casing stable across
+upgrades: changing only letter case can create a new queue identity, so messages covered only by
+older completion tombstones may be dispatched once more during the migration.
+
+Durable REST recovery accommodates provider message timestamps up to 24 hours ahead of the local
+clock. Messages farther in the future are still handled by live webhook or WebSocket delivery, but
+missed-live recovery follows the provider timestamp and may be delayed until it enters that window.
 
 ## CLI-backed skill
 
