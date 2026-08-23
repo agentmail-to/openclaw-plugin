@@ -349,6 +349,12 @@ export async function dispatchAgentMailInboundEvent(params: {
   if (params.abortSignal) {
     const onAbort = () => {
       if (!turnAdoptionObserved && !turnDeferred) {
+        // Hand the (memoized) cleanup to the account reclaimer BEFORE starting it: abort listeners
+        // run synchronously inside lifecycleAbort.abort(), so the reclaimer that runs next awaits
+        // this unlink instead of the host exiting with it still in flight. Start it here anyway —
+        // a turn that begins after that reclaim has no reclaimer left to run it, and calling the
+        // memoized cleanup twice awaits one deletion.
+        retainDeferredMediaUntilShutdown();
         void cleanupInboundMedia();
       }
     };

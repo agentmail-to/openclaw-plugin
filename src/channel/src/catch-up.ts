@@ -27,6 +27,18 @@ const PAGE_LIMIT = 100;
 export const AGENTMAIL_REST_CATCH_UP_NAMESPACE = "agentmail.rest-catch-up";
 export const AGENTMAIL_REST_CATCH_UP_LEGACY_MAX_ACCOUNTS = 1_000;
 export const AGENTMAIL_REST_CATCH_UP_MAX_ENTRIES_PER_ACCOUNT = 1;
+// Two full pages of future-dated ids. This bounds cursor size rather than correctness: ids past the
+// cap are forgotten, so their rows re-admit (deduplicated, never re-dispatched) on each sweep until
+// the clock covers them — the same churn the memo removes, for the overflow only.
+export const AGENTMAIL_REST_CATCH_UP_MAX_FUTURE_ADMISSIONS = 2 * PAGE_LIMIT;
+// Provider message ids are unbounded strings, so an entry count alone does not bound the persisted
+// value. The keyed store rejects a value over 64KB and persistCursor does not catch that, which
+// would strand catch-up in its retry loop instead of degrading to re-admission. Budget the memo at
+// half the limit so the baseline/high-water fields and both checkpoints — whose page tokens are
+// also provider-sized — always fit alongside it.
+const FUTURE_ADMISSION_BUDGET_BYTES = 32 * 1024;
+// `{"messageId":"","atMs":1700000000000},` plus room for JSON escaping.
+const FUTURE_ADMISSION_OVERHEAD_BYTES = 48;
 export const AGENTMAIL_REST_CATCH_UP_CURSOR_TTL_MS = 90 * 24 * 60 * 60 * 1000;
 export const AGENTMAIL_REST_CATCH_UP_OVERLAP_MS = 5 * 60_000;
 // Periodic overlap covers half-open sockets and provider webhook gaps; the less frequent deep sweep
@@ -48,6 +60,12 @@ export type AgentMailCatchUpCheckpoints = {
   deep?: AgentMailCatchUpCheckpoint;
 };
 
+/** A row admitted ahead of the sweep clock, remembered by id because the cursor cannot pass it. */
+export type AgentMailCatchUpFutureAdmission = {
+  messageId: string;
+  atMs: number;
+};
+
 export type AgentMailCatchUpCursor = {
   version: typeof CURSOR_VERSION;
   baselineAtMs: number;
@@ -55,6 +73,7 @@ export type AgentMailCatchUpCursor = {
   established: boolean;
   generation?: string;
   checkpoints?: AgentMailCatchUpCheckpoints;
+  futureAdmissions?: AgentMailCatchUpFutureAdmission[];
   /** Legacy single-slot checkpoint, migrated by normalizeCursor. */
   checkpoint?: AgentMailCatchUpCheckpoint;
 };
@@ -209,6 +228,63 @@ function normalizeCheckpoint(value: unknown): AgentMailCatchUpCheckpoint | undef
   };
 }
 
+function capFutureAdmissions(
+  entries: AgentMailCatchUpFutureAdmission[],
+): AgentMailCatchUpFutureAdmission[] {
+  if (entries.length === 0) {
+    return entries;
+  }
+  // Keep the furthest-future ids: those are the ones the sweep clock takes longest to cover, so
+  // forgetting them would churn the longest. Both caps are re-applied on every persist, so a
+  // dropped id keeps re-admitting once per sweep — bounded by how soon the clock reaches its
+  // nearer date, and always deduplicated by durable ingress rather than re-dispatched.
+  const ordered = [...entries].sort((left, right) => right.atMs - left.atMs);
+  const kept: AgentMailCatchUpFutureAdmission[] = [];
+  let budgetBytes = 0;
+  for (const entry of ordered) {
+    if (kept.length >= AGENTMAIL_REST_CATCH_UP_MAX_FUTURE_ADMISSIONS) {
+      break;
+    }
+    budgetBytes += FUTURE_ADMISSION_OVERHEAD_BYTES + Buffer.byteLength(entry.messageId, "utf8");
+    if (budgetBytes > FUTURE_ADMISSION_BUDGET_BYTES) {
+      break;
+    }
+    kept.push(entry);
+  }
+  return kept;
+}
+
+function serializeFutureAdmissions(
+  entries: ReadonlyMap<string, number>,
+): AgentMailCatchUpFutureAdmission[] {
+  return [...entries].map(([messageId, atMs]) => ({ messageId, atMs }));
+}
+
+function normalizeFutureAdmissions(value: unknown): AgentMailCatchUpFutureAdmission[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  const seen = new Set<string>();
+  const entries: AgentMailCatchUpFutureAdmission[] = [];
+  for (const raw of value) {
+    if (!raw || typeof raw !== "object") {
+      continue;
+    }
+    const entry = raw as Partial<AgentMailCatchUpFutureAdmission>;
+    if (
+      typeof entry.messageId !== "string" ||
+      entry.messageId.length === 0 ||
+      !isValidAgentMailTimestampMs(entry.atMs) ||
+      seen.has(entry.messageId)
+    ) {
+      continue;
+    }
+    seen.add(entry.messageId);
+    entries.push({ messageId: entry.messageId, atMs: entry.atMs });
+  }
+  return capFutureAdmissions(entries);
+}
+
 function normalizeCursor(value: unknown): AgentMailCatchUpCursor | null {
   if (!value || typeof value !== "object") {
     return null;
@@ -234,6 +310,7 @@ function normalizeCursor(value: unknown): AgentMailCatchUpCursor | null {
     const mode = legacyCheckpoint.sinceBaseline ? "deep" : "normal";
     checkpoints[mode] ??= legacyCheckpoint;
   }
+  const futureAdmissions = normalizeFutureAdmissions(cursor.futureAdmissions);
   return {
     version: CURSOR_VERSION,
     baselineAtMs: cursor.baselineAtMs,
@@ -243,12 +320,16 @@ function normalizeCursor(value: unknown): AgentMailCatchUpCursor | null {
       ? { generation: cursor.generation }
       : {}),
     ...(checkpoints.normal || checkpoints.deep ? { checkpoints } : {}),
+    ...(futureAdmissions.length > 0 ? { futureAdmissions } : {}),
   };
 }
 
 function mergeCursor(
   currentValue: unknown,
-  next: Pick<AgentMailCatchUpCursor, "baselineAtMs" | "highWaterAtMs" | "established">,
+  next: Pick<
+    AgentMailCatchUpCursor,
+    "baselineAtMs" | "highWaterAtMs" | "established" | "futureAdmissions"
+  >,
   upperBoundAtMs: number,
   generation: string,
   checkpointMode: "normal" | "deep",
@@ -256,6 +337,7 @@ function mergeCursor(
 ): AgentMailCatchUpCursor {
   const current = normalizeCursor(currentValue);
   const checkpoints = { ...current?.checkpoints };
+  const futureAdmissions = capFutureAdmissions(next.futureAdmissions ?? []);
   if (checkpoint) {
     checkpoints[checkpointMode] = checkpoint;
   } else {
@@ -280,6 +362,9 @@ function mergeCursor(
     established: current?.established === true || next.established,
     generation,
     ...(checkpoints.normal || checkpoints.deep ? { checkpoints } : {}),
+    // Generation-fenced writes serialize every sweep for this cursor, so the running sweep's set —
+    // already pruned against its own clock — replaces the stored one rather than merging with it.
+    ...(futureAdmissions.length > 0 ? { futureAdmissions } : {}),
   };
 }
 
@@ -293,6 +378,7 @@ async function persistCursor(params: {
   generation: string;
   checkpointMode: "normal" | "deep";
   checkpoint: AgentMailCatchUpCheckpoint | null;
+  futureAdmissions: AgentMailCatchUpFutureAdmission[];
 }): Promise<boolean> {
   const update = params.store.update;
   if (!update) {
@@ -447,6 +533,24 @@ export async function createAgentMailCatchUpSession(params: {
       // beyond the local clock or retain its tombstone indefinitely.
       const beforeMs = sweepAtMs + 1;
       const providerBeforeMs = beforeMs + AGENTMAIL_PROVIDER_FUTURE_SKEW_MAX_MS;
+      // High-water advancement is clamped to this sweep, so a future-dated row stays inside the
+      // listed window on every later sweep — up to the full skew horizon. Remember the ids already
+      // admitted ahead of the clock so those repeats are skipped instead of re-entering the
+      // admission chain (and inflating the admitted count) once a minute for a day. Entries the
+      // clock has now covered are dropped: the normal high-water path takes over from there.
+      //
+      // The upper bound only discards implausible dates that the furthest-first cap would otherwise
+      // pin forever, and is measured from the CURRENT run, never from this sweep's bound: a resumed
+      // continuation rewinds sweepAtMs to its original window, and pruning against that older
+      // horizon would discard ids a later sweep legitimately recorded — persistCursor then writes
+      // the loss back. A row dated beyond even the run horizon is forgotten and re-admitted
+      // (deduplicated), which only happens when a provider violates the `before` filter it was sent.
+      const memoHorizonAtMs = runAtMs + AGENTMAIL_PROVIDER_FUTURE_SKEW_MAX_MS;
+      const futureAdmissions = new Map(
+        (storedCursor.futureAdmissions ?? [])
+          .filter((entry) => entry.atMs > runAtMs && entry.atMs <= memoHorizonAtMs)
+          .map((entry) => [entry.messageId, entry.atMs] as const),
+      );
       const baseAfterMs =
         requestedSinceBaseline || !storedCursor.established
           ? effectiveBaselineAtMs
@@ -498,15 +602,34 @@ export async function createAgentMailCatchUpSession(params: {
             message,
             params.account.inboxId,
           );
+          const providerCreatedAt = resolveAgentMailTimestampMs(message.createdAt);
+          // Retention is filtered on the SAME effective provider time the row is admitted with,
+          // below. Checking only message.timestamp would let a malformed sender date fall through
+          // to the createdAt fallback unfiltered, re-admitting mail whose tombstone already expired.
+          const providerAtMs = providerReceivedAt ?? providerCreatedAt;
           // A resumed page token retains the original query boundary. Skip rows that have since
           // aged beyond durable tombstone retention so an old continuation cannot re-admit them.
-          if (providerReceivedAt !== null && providerReceivedAt < recoveryFloorMs) {
+          if (providerAtMs !== null && providerAtMs < recoveryFloorMs) {
+            continue;
+          }
+          // Derived from the same effective provider time the row is admitted and filtered with: a
+          // malformed sender date with a future createdAt is just as unreachable by the high-water
+          // cursor as a future `timestamp`, so it must be memoized too or it re-lists, re-admits,
+          // and re-warns on every sweep until the clock catches up.
+          //
+          // Compared against the run clock, never the sweep bound: a resumed continuation rewinds
+          // sweepAtMs to its original window, and every ordinary row that arrived since would then
+          // be misread as sender skew — warned about, and memoized until the next full sweep prunes
+          // it. The memo exists for rows the clock has genuinely not reached.
+          const isFutureRow = providerAtMs !== null && providerAtMs > runAtMs;
+          if (isFutureRow && futureAdmissions.has(message.messageId)) {
+            // Already admitted ahead of the clock by an earlier sweep; durable ingress would only
+            // deduplicate it again.
             continue;
           }
           const arrivedAt = now();
-          const providerCreatedAt = resolveAgentMailTimestampMs(message.createdAt);
           const receivedAt = capAgentMailProviderTimestampForRetention(
-            providerReceivedAt ?? providerCreatedAt ?? arrivedAt,
+            providerAtMs ?? arrivedAt,
             arrivedAt,
           );
           if (providerReceivedAt === null) {
@@ -516,7 +639,7 @@ export async function createAgentMailCatchUpSession(params: {
             params.log?.warn?.(
               `AgentMail catch-up used provider/local arrival time for message ${message.messageId} with an invalid timestamp`,
             );
-          } else if (providerReceivedAt > sweepAtMs) {
+          } else if (isFutureRow) {
             // Sender-authored time can be arbitrarily skewed. The row was admitted above using a
             // bounded retention timestamp, and cursor advancement remains clamped to this sweep.
             params.log?.warn?.(
@@ -545,6 +668,9 @@ export async function createAgentMailCatchUpSession(params: {
             throw error;
           }
           admitted += 1;
+          if (isFutureRow) {
+            futureAdmissions.set(message.messageId, providerAtMs);
+          }
           highWaterAtMs = Math.max(
             highWaterAtMs,
             providerReceivedAt === null ? sweepAtMs : Math.min(providerReceivedAt, sweepAtMs),
@@ -573,6 +699,7 @@ export async function createAgentMailCatchUpSession(params: {
               highWaterAtMs,
               sinceBaseline: requestedSinceBaseline,
             },
+            futureAdmissions: serializeFutureAdmissions(futureAdmissions),
           });
           if (!persisted) {
             return;
@@ -593,6 +720,7 @@ export async function createAgentMailCatchUpSession(params: {
         generation,
         checkpointMode,
         checkpoint: null,
+        futureAdmissions: serializeFutureAdmissions(futureAdmissions),
       });
       if (!persisted) {
         return;

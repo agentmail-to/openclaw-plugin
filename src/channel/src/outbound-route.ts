@@ -46,6 +46,8 @@ export function resolveAgentMailOutboundSessionRoute(params: {
     return null;
   }
   const hasExplicitAccount = params.accountId != null && String(params.accountId).trim() !== "";
+  const configuredAccountIds = listAgentMailAccountIds(params.cfg);
+  const isAmbiguousAccount = configuredAccountIds.length > 1;
   const currentRoute = parseAgentMailSessionKey(params.currentSessionKey);
   const currentRouteBelongsToAgent =
     currentRoute !== null &&
@@ -54,12 +56,15 @@ export function resolveAgentMailOutboundSessionRoute(params: {
       accountId: currentRoute.accountId,
       conversationId: currentRoute.conversationId,
     }) === currentRoute.sessionKey;
+  // Infer only from a session whose account is STILL configured. A stale key naming a removed
+  // account would otherwise satisfy the ambiguity check below and resolve an unconfigured account,
+  // yielding a recipient-exact route on a synthesized account with an empty inboxId and no apiKey.
   const inferredAccountId =
     !hasExplicitAccount && currentRouteBelongsToAgent
-      ? currentRoute.accountId
+      ? configuredAccountIds.find((id) => id.toLowerCase() === currentRoute.accountId)
       : undefined;
   const effectiveAccountId = hasExplicitAccount ? params.accountId : inferredAccountId;
-  if (!effectiveAccountId && listAgentMailAccountIds(params.cfg).length > 1) {
+  if (!effectiveAccountId && isAmbiguousAccount) {
     // Without an account id, a multi-account route cannot be tied safely to the named account that
     // owns the active inbound session. Decline rather than fabricating a recipient-exact route
     // under the configured default account.
@@ -91,11 +96,15 @@ export function resolveAgentMailOutboundSessionRoute(params: {
   if (
     !hasExplicitAccount &&
     inferredAccountId &&
+    isAmbiguousAccount &&
     threadId !== undefined &&
     currentRoute &&
     currentRoute.sessionKey !== sessionKey
   ) {
     // A current session from another AgentMail thread is not evidence for this target's account.
+    // Only ambiguity is worth declining over: with a single configured account the inference cannot
+    // pick a wrong inbox, and declining would drop the route back to core's `dmScope ?? "main"`,
+    // collapsing every thread into one session — the exact failure this module exists to prevent.
     return null;
   }
   return {

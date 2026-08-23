@@ -481,6 +481,55 @@ describe("AgentMail REST-authoritative inbound", () => {
     expect(rm).not.toHaveBeenCalled();
   });
 
+  it("hands an in-flight turn's attachments to the shutdown reclaimer", async () => {
+    rm.mockClear();
+    loadAgentMailInboundAttachments.mockResolvedValueOnce({
+      paths: ["/tmp/in-flight.bin"],
+      types: ["application/octet-stream"],
+    });
+    const controller = new AbortController();
+    let started = () => {};
+    let release = () => {};
+    const runStarted = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const dispatched = dispatchAgentMailInboundEvent({
+      cfg: {},
+      account,
+      record,
+      channelRuntime: {
+        routing: { resolveAgentRoute: () => ({ agentId: "agent-1" }) },
+        inbound: {
+          buildContext: (ctx: Record<string, unknown>) => ctx,
+          // A turn still awaiting core when the account lifecycle aborts: it has neither deferred
+          // nor been adopted, so its media is cleaned on the abort path.
+          run: async () => {
+            started();
+            await gate;
+          },
+        },
+        session: { resolveStorePath: () => "/tmp/s.json", recordInboundSession: vi.fn() },
+        reply: { dispatchReplyWithBufferedBlockDispatcher: vi.fn() },
+      } as never,
+      client: { inboxes: { messages: { get: vi.fn(async () => message()) } } } as never,
+      abortSignal: controller.signal,
+    });
+    await runStarted;
+
+    controller.abort();
+    // Shutdown must be able to await the unlink instead of exiting with it in flight.
+    await expect(reclaimAbortedAgentMailDeferredMedia(controller.signal)).resolves.toBe(1);
+    expect(rm).toHaveBeenCalledWith("/tmp/in-flight.bin", { force: true });
+
+    release();
+    await dispatched.catch(() => undefined);
+    // The cleanup is memoized, so the reclaimer and the post-run path share one deletion.
+    expect(rm).toHaveBeenCalledTimes(1);
+  });
+
   it("cleans up attachments when inbound handling resolves without adoption", async () => {
     rm.mockClear();
     loadAgentMailInboundAttachments.mockResolvedValueOnce({
