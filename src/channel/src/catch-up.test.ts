@@ -19,6 +19,7 @@ import {
   AGENTMAIL_DURABLE_PENDING_TTL_MS,
   AgentMailIngressCapacityError,
 } from "./durable-receive.js";
+import { AGENTMAIL_PROVIDER_FUTURE_SKEW_MAX_MS } from "./received-message.js";
 import type { AgentMailIngressRecord, ResolvedAgentMailAccount } from "./types.js";
 
 const openKeyedStore = vi.hoisted(() => vi.fn());
@@ -482,7 +483,9 @@ describe("AgentMail durable REST catch-up", () => {
     expect(list).toHaveBeenNthCalledWith(
       1,
       "inbox_1",
-      expect.objectContaining({ before: new Date(nowMs + 1) }),
+      expect.objectContaining({
+        before: new Date(nowMs + AGENTMAIL_PROVIDER_FUTURE_SKEW_MAX_MS + 1),
+      }),
       expect.any(Object),
     );
     await session.run({ receive, abortSignal: new AbortController().signal });
@@ -495,7 +498,7 @@ describe("AgentMail durable REST catch-up", () => {
     );
   });
 
-  it("repairs a future baseline without regressing the committed high-water mark", async () => {
+  it("repairs future cursor bounds when the clock moves backward", async () => {
     const store = memoryStore<AgentMailCatchUpCursor>();
     const key = sha256Hex("default\ninbox_1");
     await store.register(key, {
@@ -525,7 +528,7 @@ describe("AgentMail durable REST catch-up", () => {
     );
     expect(await store.lookup(key)).toMatchObject({
       baselineAtMs: 1_000_000,
-      highWaterAtMs: 3_000_000,
+      highWaterAtMs: 1_000_000,
       established: true,
     });
   });
@@ -553,7 +556,7 @@ describe("AgentMail durable REST catch-up", () => {
       expect(query).toEqual(
         expect.objectContaining({
           after: new Date(nowMs),
-          before: new Date(nowMs + 1),
+          before: new Date(nowMs + AGENTMAIL_PROVIDER_FUTURE_SKEW_MAX_MS + 1),
         }),
       );
     }
@@ -634,7 +637,7 @@ describe("AgentMail durable REST catch-up", () => {
     );
   });
 
-  it("advances malformed timestamps and admits far-future rows with bounded retention", async () => {
+  it("advances malformed timestamps using provider creation time", async () => {
     const store = memoryStore<AgentMailCatchUpCursor>();
     const key = sha256Hex("default\ninbox_1");
     await store.register(key, {
@@ -647,10 +650,9 @@ describe("AgentMail durable REST catch-up", () => {
       ...message({ id: "malformed", timestamp: 900_000 }),
       timestamp: new Date(Number.NaN),
     };
-    const farFuture = message({ id: "future", timestamp: 100_000_000 });
     const list = vi
       .fn()
-      .mockResolvedValueOnce({ count: 2, messages: [malformed, farFuture] })
+      .mockResolvedValueOnce({ count: 1, messages: [malformed] })
       .mockResolvedValueOnce({ count: 0, messages: [] });
     const warn = vi.fn();
     const session = await createAgentMailCatchUpSession({
@@ -667,13 +669,12 @@ describe("AgentMail durable REST catch-up", () => {
 
     expect(receive.mock.calls.map(([record]) => [record.messageId, record.receivedAt])).toEqual([
       ["malformed", 900_000],
-      ["future", 1_000_000 + 24 * 60 * 60_000],
     ]);
     expect(list).toHaveBeenNthCalledWith(
       1,
       "inbox_1",
       expect.objectContaining({
-        before: new Date(1_000_001),
+        before: new Date(1_000_000 + AGENTMAIL_PROVIDER_FUTURE_SKEW_MAX_MS + 1),
       }),
       expect.any(Object),
     );
@@ -686,7 +687,6 @@ describe("AgentMail durable REST catch-up", () => {
       expect.any(Object),
     );
     expect(warn).toHaveBeenCalledWith(expect.stringContaining("invalid timestamp"));
-    expect(warn).toHaveBeenCalledWith(expect.stringContaining("clamped future timestamp"));
   });
 
   it("pauses the pass when durable ingress reports capacity", async () => {

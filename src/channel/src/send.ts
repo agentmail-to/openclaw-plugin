@@ -275,9 +275,8 @@ export async function reconcileAgentMailUnknownSend(
       retryable: false,
     };
   }
-  const nowMs = options.now?.() ?? Date.now();
   const recoveryReferenceAt = ctx.platformSendStartedAt ?? ctx.enqueuedAt;
-  const recoveryAgeMs = Math.max(0, nowMs - recoveryReferenceAt);
+  const recoveryAgeMs = Math.max(0, (options.now?.() ?? Date.now()) - recoveryReferenceAt);
   if (recoveryAgeMs >= AGENTMAIL_UNKNOWN_SEND_MAX_AGE_MS) {
     return {
       status: "unresolved",

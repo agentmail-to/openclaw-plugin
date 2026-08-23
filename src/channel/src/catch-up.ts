@@ -9,6 +9,7 @@ import {
   AgentMailIngressCapacityError,
 } from "./durable-receive.js";
 import {
+  AGENTMAIL_PROVIDER_FUTURE_SKEW_MAX_MS,
   AGENTMAIL_RECEIVED_LABEL,
   capAgentMailProviderTimestampForRetention,
   isValidAgentMailTimestampMs,
@@ -243,11 +244,12 @@ function mergeCursor(
   return {
     version: CURSOR_VERSION,
     baselineAtMs,
-    // Clamp only this run's contribution. A backward-moving clock must not lower a committed
-    // cursor; query-time effective bounds below keep provider ranges valid until the clock recovers.
+    // Repair committed values that are now beyond the wall-clock horizon while merging both
+    // in-range contributions monotonically. Without the committed-value clamp, frequent restarts
+    // can keep deep recovery from ever repairing a cursor left in the future by clock rollback.
     highWaterAtMs: Math.max(
       baselineAtMs,
-      current?.highWaterAtMs ?? 0,
+      Math.min(upperBoundAtMs, current?.highWaterAtMs ?? 0),
       Math.min(upperBoundAtMs, next.highWaterAtMs),
     ),
     established: current?.established === true || next.established,
@@ -404,14 +406,18 @@ export async function createAgentMailCatchUpSession(params: {
       const sweepAtMs = resumableCheckpoint
         ? resumableCheckpoint.beforeAtMs - 1
         : runAtMs;
-      // If the host clock moved backwards, both stored bounds can be in the future. Clamp only the
-      // effective query cursor for this run; committed cursor state remains monotonic.
+      // If the host clock moved backwards, both stored bounds can be in the future. Clamp the
+      // effective cursor for this run and persist the repaired value after a successful sweep.
       const effectiveBaselineAtMs = Math.min(storedCursor.baselineAtMs, sweepAtMs);
       const effectiveHighWaterAtMs = Math.max(
         effectiveBaselineAtMs,
         Math.min(storedCursor.highWaterAtMs, sweepAtMs),
       );
+      // Scan the same bounded future-skew horizon accepted by live ingress. This lets REST recover
+      // a missed live event promptly without allowing an arbitrary sender date to move the cursor
+      // beyond the local clock or retain its tombstone indefinitely.
       const beforeMs = sweepAtMs + 1;
+      const providerBeforeMs = beforeMs + AGENTMAIL_PROVIDER_FUTURE_SKEW_MAX_MS;
       const baseAfterMs =
         requestedSinceBaseline || !storedCursor.established
           ? effectiveBaselineAtMs
@@ -435,7 +441,7 @@ export async function createAgentMailCatchUpSession(params: {
             after: new Date(afterMs),
             // Exclude implausibly future provider rows from normal pagination. The per-row clamp
             // below remains defensive in case a provider projection violates this filter.
-            before: new Date(beforeMs),
+            before: new Date(providerBeforeMs),
             ascending: true,
             includeSpam: false,
             includeBlocked: false,

@@ -112,183 +112,188 @@ export async function startAgentMailGatewayAccount(params: {
     );
     return await waitUntilAbort(params.abortSignal);
   }
-  const client = createAgentMailClient(params.account);
+  // Own a child lifecycle so every exit path (including startup failures and an unexpectedly
+  // closed WebSocket) aborts queued ingress before deferred media is reclaimed. Abort listeners
+  // run synchronously, so a turn that has already begun adoption detaches its media before the
+  // final reclaimer snapshots the remaining account-owned files.
+  const lifecycleAbort = new AbortController();
+  const abortSignal = AbortSignal.any([params.abortSignal, lifecycleAbort.signal]);
+  try {
+    const client = createAgentMailClient(params.account);
 
-  const journal = createAgentMailDurableInboundReceiveJournal({
-    accountId: params.account.accountId,
-    inboxId: params.account.inboxId,
-  });
-  const dispatch = async (
-    record: AgentMailIngressRecord,
-    lifecycle: {
-      onTurnAdopted: () => Promise<void>;
-      onTurnDeferred: () => void;
-      onTurnAbandoned: () => Promise<void>;
-      abortSignal?: AbortSignal;
-    },
-  ) =>
-    await dispatchAgentMailInboundEvent({
-      cfg: params.cfg,
-      account: params.account,
-      record,
-      channelRuntime: params.channelRuntime,
-      client,
-      log: params.log,
-      onTurnAdopted: lifecycle.onTurnAdopted,
-      onTurnDeferred: lifecycle.onTurnDeferred,
-      onTurnAbandoned: lifecycle.onTurnAbandoned,
-      abortSignal: lifecycle.abortSignal,
+    const journal = createAgentMailDurableInboundReceiveJournal({
+      accountId: params.account.accountId,
+      inboxId: params.account.inboxId,
     });
-  const receive = async (record: AgentMailIngressRecord) => {
-    await processAgentMailIngress({
+    const dispatch = async (
+      record: AgentMailIngressRecord,
+      lifecycle: {
+        onTurnAdopted: () => Promise<void>;
+        onTurnDeferred: () => void;
+        onTurnAbandoned: () => Promise<void>;
+        abortSignal?: AbortSignal;
+      },
+    ) =>
+      await dispatchAgentMailInboundEvent({
+        cfg: params.cfg,
+        account: params.account,
+        record,
+        channelRuntime: params.channelRuntime,
+        client,
+        log: params.log,
+        onTurnAdopted: lifecycle.onTurnAdopted,
+        onTurnDeferred: lifecycle.onTurnDeferred,
+        onTurnAbandoned: lifecycle.onTurnAbandoned,
+        abortSignal: lifecycle.abortSignal,
+      });
+    const receive = async (record: AgentMailIngressRecord) => {
+      await processAgentMailIngress({
+        journal,
+        record,
+        dispatch,
+        abortSignal,
+        log: params.log,
+      });
+    };
+    await replayPendingAgentMailIngress({
       journal,
-      record,
       dispatch,
-      abortSignal: params.abortSignal,
+      abortSignal,
       log: params.log,
     });
-  };
-  await replayPendingAgentMailIngress({
-    journal,
-    dispatch,
-    abortSignal: params.abortSignal,
-    log: params.log,
-  });
 
-  const startWebSocket = async () => {
-    try {
+    const startWebSocket = async () =>
       await startAgentMailWebSocket({
         account: params.account,
-        abortSignal: params.abortSignal,
+        abortSignal,
         receive,
         log: params.log,
         client,
       });
-    } finally {
-      await reclaimAbortedAgentMailDeferredMedia(params.abortSignal);
-    }
-  };
 
-  if (!params.account.webhookSecret) {
-    params.log?.info?.(
-      `Starting AgentMail WebSocket ingress for account ${params.account.accountId}`,
-    );
-    return await startWebSocket();
-  }
-
-  const verifier = createAgentMailWebhookVerifier(params.account.webhookSecret);
-  if (!verifier) {
-    // A malformed secret would otherwise throw from new Webhook() and abort startup with no ingress.
-    params.log?.warn?.(
-      `- AgentMail: webhook secret for account ${params.account.accountId} is invalid; falling back to WebSocket ingress.`,
-    );
-    return await startWebSocket();
-  }
-
-  const path = params.account.webhookPath.startsWith("/")
-    ? params.account.webhookPath
-    : `/${params.account.webhookPath}`;
-  const setup = await withSerializedRouteStartup(params.account.accountId, async () => {
-    if (params.abortSignal.aborted) {
-      return null;
-    }
-    const owner = routeOwners.get(path);
-    if (owner && owner.accountId !== params.account.accountId) {
-      throw new Error(
-        `AgentMail webhook path ${path} is already registered by account ${owner.accountId}; configure a distinct webhookPath.`,
+    if (!params.account.webhookSecret) {
+      params.log?.info?.(
+        `Starting AgentMail WebSocket ingress for account ${params.account.accountId}`,
       );
+      return await startWebSocket();
     }
-    const previousRoute = activeRoutes.get(params.account.accountId);
-    const claim: RouteClaim = {
-      accountId: params.account.accountId,
-      generation: Symbol(params.account.accountId),
-    };
-    // Claim before initialization so a different account cannot race onto this path. Same-account
-    // startup is serialized above, so rollback always has one well-defined predecessor.
-    routeOwners.set(path, claim);
-    let unregister: (() => void) | undefined;
-    try {
-      const catchUpSession = await createAgentMailCatchUpSession({
-        account: params.account,
-        client,
-        log: params.log,
-      });
-      const catchUpSupervisor = createAgentMailCatchUpSupervisor({
-        session: catchUpSession,
-        receive,
-        abortSignal: params.abortSignal,
-        log: params.log,
-      });
-      const receiveWithRecovery = async (record: AgentMailIngressRecord) => {
-        try {
-          await receive(record);
-        } catch (error) {
-          // Provider retries remain useful, but REST recovery is the durable fallback if the
-          // provider exhausts them while local admission is temporarily unavailable.
-          catchUpSupervisor.request();
-          throw error;
-        }
-      };
-      unregister = registerPluginHttpRoute({
-        path,
-        auth: "plugin",
-        pluginId: "agentmail",
-        accountId: params.account.accountId,
-        handler: createAgentMailWebhookHandler({
-          account: params.account,
-          verifier,
-          receive: receiveWithRecovery,
-          log: params.log,
-        }),
-        // OpenClaw atomically replaces the predecessor and makes its stale unregister a no-op.
-        replaceExisting: true,
-      });
-      const activeRoute = { path, unregister, claim };
-      activeRoutes.set(params.account.accountId, activeRoute);
-      if (previousRoute) {
-        previousRoute.unregister();
-        if (routeOwners.get(previousRoute.path) === previousRoute.claim) {
-          routeOwners.delete(previousRoute.path);
-        }
+
+    const verifier = createAgentMailWebhookVerifier(params.account.webhookSecret);
+    if (!verifier) {
+      // A malformed secret would otherwise throw from new Webhook() and abort startup with no ingress.
+      params.log?.warn?.(
+        `- AgentMail: webhook secret for account ${params.account.accountId} is invalid; falling back to WebSocket ingress.`,
+      );
+      return await startWebSocket();
+    }
+
+    const path = params.account.webhookPath.startsWith("/")
+      ? params.account.webhookPath
+      : `/${params.account.webhookPath}`;
+    const setup = await withSerializedRouteStartup(params.account.accountId, async () => {
+      if (abortSignal.aborted) {
+        return null;
       }
-      return { activeRoute, catchUpSupervisor, claim, unregister };
-    } catch (error) {
-      unregister?.();
-      if (routeOwners.get(path) === claim) {
-        if (previousRoute?.path === path) {
-          routeOwners.set(path, previousRoute.claim);
-        } else {
+      const owner = routeOwners.get(path);
+      if (owner && owner.accountId !== params.account.accountId) {
+        throw new Error(
+          `AgentMail webhook path ${path} is already registered by account ${owner.accountId}; configure a distinct webhookPath.`,
+        );
+      }
+      const previousRoute = activeRoutes.get(params.account.accountId);
+      const claim: RouteClaim = {
+        accountId: params.account.accountId,
+        generation: Symbol(params.account.accountId),
+      };
+      // Claim before initialization so a different account cannot race onto this path. Same-account
+      // startup is serialized above, so rollback always has one well-defined predecessor.
+      routeOwners.set(path, claim);
+      let unregister: (() => void) | undefined;
+      try {
+        const catchUpSession = await createAgentMailCatchUpSession({
+          account: params.account,
+          client,
+          log: params.log,
+        });
+        const catchUpSupervisor = createAgentMailCatchUpSupervisor({
+          session: catchUpSession,
+          receive,
+          abortSignal,
+          log: params.log,
+        });
+        const receiveWithRecovery = async (record: AgentMailIngressRecord) => {
+          try {
+            await receive(record);
+          } catch (error) {
+            // Provider retries remain useful, but REST recovery is the durable fallback if the
+            // provider exhausts them while local admission is temporarily unavailable.
+            catchUpSupervisor.request();
+            throw error;
+          }
+        };
+        unregister = registerPluginHttpRoute({
+          path,
+          auth: "plugin",
+          pluginId: "agentmail",
+          accountId: params.account.accountId,
+          handler: createAgentMailWebhookHandler({
+            account: params.account,
+            verifier,
+            receive: receiveWithRecovery,
+            log: params.log,
+          }),
+          // OpenClaw atomically replaces the predecessor and makes its stale unregister a no-op.
+          replaceExisting: true,
+        });
+        const activeRoute = { path, unregister, claim };
+        activeRoutes.set(params.account.accountId, activeRoute);
+        if (previousRoute) {
+          previousRoute.unregister();
+          if (routeOwners.get(previousRoute.path) === previousRoute.claim) {
+            routeOwners.delete(previousRoute.path);
+          }
+        }
+        return { activeRoute, catchUpSupervisor, claim, unregister };
+      } catch (error) {
+        unregister?.();
+        if (routeOwners.get(path) === claim) {
+          if (previousRoute?.path === path) {
+            routeOwners.set(path, previousRoute.claim);
+          } else {
+            routeOwners.delete(path);
+          }
+        }
+        throw error;
+      }
+    });
+    if (!setup) {
+      return;
+    }
+    const { activeRoute, catchUpSupervisor, claim, unregister } = setup;
+    params.log?.info?.(
+      `Registered AgentMail webhook route ${path} for account ${params.account.accountId}`,
+    );
+    catchUpSupervisor.request();
+    // Run periodic REST recovery in webhook mode too. Otherwise, once a capacity pause clears the
+    // request, mail admitted after the pause would wait for the next provider webhook (or forever, if
+    // provider retries have expired) before catch-up runs again.
+    const periodicWorkers = startAgentMailPeriodicCatchUp({
+      supervisor: catchUpSupervisor,
+      abortSignal,
+    });
+    await waitUntilAbort(abortSignal, () => {
+      // A replaced account invocation can abort later; it must not delete the newer registration.
+      if (activeRoutes.get(params.account.accountId) === activeRoute) {
+        unregister();
+        activeRoutes.delete(params.account.accountId);
+        if (routeOwners.get(path) === claim) {
           routeOwners.delete(path);
         }
       }
-      throw error;
-    }
-  });
-  if (!setup) {
-    return;
+    });
+    await Promise.allSettled([...periodicWorkers, catchUpSupervisor.settle()]);
+  } finally {
+    lifecycleAbort.abort();
+    await reclaimAbortedAgentMailDeferredMedia(abortSignal);
   }
-  const { activeRoute, catchUpSupervisor, claim, unregister } = setup;
-  params.log?.info?.(
-    `Registered AgentMail webhook route ${path} for account ${params.account.accountId}`,
-  );
-  catchUpSupervisor.request();
-  // Run periodic REST recovery in webhook mode too. Otherwise, once a capacity pause clears the
-  // request, mail admitted after the pause would wait for the next provider webhook (or forever, if
-  // provider retries have expired) before catch-up runs again.
-  const periodicWorkers = startAgentMailPeriodicCatchUp({
-    supervisor: catchUpSupervisor,
-    abortSignal: params.abortSignal,
-  });
-  await waitUntilAbort(params.abortSignal, () => {
-    // A replaced account invocation can abort later; it must not delete the newer registration.
-    if (activeRoutes.get(params.account.accountId) === activeRoute) {
-      unregister();
-      activeRoutes.delete(params.account.accountId);
-      if (routeOwners.get(path) === claim) {
-        routeOwners.delete(path);
-      }
-    }
-  });
-  await Promise.allSettled([...periodicWorkers, catchUpSupervisor.settle()]);
-  await reclaimAbortedAgentMailDeferredMedia(params.abortSignal);
 }

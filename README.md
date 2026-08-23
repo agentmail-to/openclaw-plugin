@@ -112,6 +112,10 @@ The configured `inboxId` also identifies the durable receive queue. Keep its cas
 upgrades: changing only letter case can create a new queue identity, so messages covered only by
 older completion tombstones may be dispatched once more during the migration.
 
+Durable REST recovery accommodates provider message timestamps up to 24 hours ahead of the local
+clock. Messages farther in the future are still handled by live webhook or WebSocket delivery, but
+missed-live recovery follows the provider timestamp and may be delayed until it enters that window.
+
 ## CLI-backed skill
 
 The plugin registers a passthrough command:

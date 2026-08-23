@@ -28,16 +28,18 @@ const deferredMediaCleanups = new WeakMap<AbortSignal, Set<DeferredMediaCleanup>
  */
 export async function reclaimAbortedAgentMailDeferredMedia(
   abortSignal: AbortSignal,
-): Promise<void> {
+): Promise<number> {
   if (!abortSignal.aborted) {
-    return;
+    return 0;
   }
   const cleanups = deferredMediaCleanups.get(abortSignal);
   if (!cleanups) {
-    return;
+    return 0;
   }
   deferredMediaCleanups.delete(abortSignal);
+  const cleanupCount = cleanups.size;
   await Promise.allSettled([...cleanups].map((cleanup) => cleanup()));
+  return cleanupCount;
 }
 
 // AgentMail message labels the channel gates on. "received" marks authentic inbound mail; the
@@ -308,7 +310,7 @@ export async function dispatchAgentMailInboundEvent(params: {
     deferredMediaCleanups.set(abortSignal, cleanups);
     detachDeferredMediaCleanup = () => {
       cleanups.delete(cleanup);
-      if (cleanups.size === 0) {
+      if (cleanups.size === 0 && deferredMediaCleanups.get(abortSignal) === cleanups) {
         deferredMediaCleanups.delete(abortSignal);
       }
     };

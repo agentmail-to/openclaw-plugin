@@ -109,6 +109,7 @@ describe("AgentMail gateway route ownership", () => {
   it("uses WebSocket only when no webhook secret is configured", async () => {
     mocks.routes.length = 0;
     mocks.startWebSocket.mockClear();
+    mocks.reclaimDeferredMedia.mockClear();
     const websocketAccount = { ...account("default", "/webhooks/agentmail"), webhookSecret: "" };
     await startAgentMailGatewayAccount({
       cfg: {},
@@ -118,6 +119,8 @@ describe("AgentMail gateway route ownership", () => {
     });
     expect(mocks.startWebSocket).toHaveBeenCalledOnce();
     expect(mocks.routes).toHaveLength(0);
+    expect(mocks.reclaimDeferredMedia).toHaveBeenCalledOnce();
+    expect(mocks.reclaimDeferredMedia.mock.calls[0]?.[0].aborted).toBe(true);
   });
 
   it("falls back to WebSocket when the webhook secret is malformed", async () => {
@@ -196,7 +199,25 @@ describe("AgentMail gateway route ownership", () => {
     expect(mocks.catchUpRequest).toHaveBeenCalledTimes(2);
     controller.abort();
     await running;
-    expect(mocks.reclaimDeferredMedia).toHaveBeenCalledWith(controller.signal);
+    expect(mocks.reclaimDeferredMedia).toHaveBeenCalledOnce();
+    expect(mocks.reclaimDeferredMedia.mock.calls[0]?.[0].aborted).toBe(true);
+  });
+
+  it("reclaims deferred media when webhook startup begins after abort", async () => {
+    mocks.reclaimDeferredMedia.mockClear();
+    const controller = new AbortController();
+    controller.abort();
+
+    await startAgentMailGatewayAccount({
+      cfg: {},
+      account: account("aborted", "/webhooks/agentmail/aborted"),
+      channelRuntime: {} as never,
+      abortSignal: controller.signal,
+    });
+
+    expect(mocks.routes.some((route) => route.path.endsWith("/aborted"))).toBe(false);
+    expect(mocks.reclaimDeferredMedia).toHaveBeenCalledOnce();
+    expect(mocks.reclaimDeferredMedia.mock.calls[0]?.[0].aborted).toBe(true);
   });
 
   it("releases an account's old path without letting stale cleanup remove its replacement", async () => {
@@ -249,6 +270,7 @@ describe("AgentMail gateway route ownership", () => {
         mocks.createCatchUpSession.mockRejectedValueOnce(new Error("state store unavailable"));
       }
       const path = `/webhooks/agentmail/failure-${failure}`;
+      mocks.reclaimDeferredMedia.mockClear();
       await expect(
         startAgentMailGatewayAccount({
           cfg: {},
@@ -257,6 +279,8 @@ describe("AgentMail gateway route ownership", () => {
           abortSignal: new AbortController().signal,
         }),
       ).rejects.toThrow();
+      expect(mocks.reclaimDeferredMedia).toHaveBeenCalledOnce();
+      expect(mocks.reclaimDeferredMedia.mock.calls[0]?.[0].aborted).toBe(true);
 
       mocks.registerError = false;
       const controller = new AbortController();

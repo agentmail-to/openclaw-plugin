@@ -78,27 +78,14 @@ const activeDispatches = new Map<string, ActiveDispatch>();
 
 const retryDelayMs = createBackoff(30 * 60_000);
 
-function resolveAgentMailIngressTerminalAt(
-  record: AgentMailIngressRecord,
-  terminalAt = Date.now(),
-): number {
-  const providerReceivedAt = capAgentMailProviderTimestampForRetention(
-    isValidAgentMailTimestampMs(record.receivedAt) ? record.receivedAt : terminalAt,
-    terminalAt,
-  );
-  return Math.max(terminalAt, providerReceivedAt);
-}
-
 async function completeAgentMailIngress(params: {
   journal: AgentMailJournal;
   id: string;
-  record: AgentMailIngressRecord;
 }): Promise<void> {
-  // REST catch-up scans by provider timestamp. A live message stamped in the future must retain its
-  // tombstone through the durable recovery horizon after that bounded time, or it can re-enter a
-  // provider-time scan after a locally-timestamped marker has already expired.
+  // Terminal timestamps describe local state transitions. Retention includes the supported
+  // provider-skew allowance, so sender-authored dates never distort tombstone ordering or expiry.
   await params.journal.complete(params.id, {
-    completedAt: resolveAgentMailIngressTerminalAt(params.record),
+    completedAt: Date.now(),
   });
 }
 
@@ -186,6 +173,7 @@ export async function processAgentMailIngress(params: {
     : Date.now();
   const record = {
     ...params.record,
+    arrivedAt,
     receivedAt: capAgentMailProviderTimestampForRetention(
       isValidAgentMailTimestampMs(params.record.receivedAt)
         ? params.record.receivedAt
@@ -289,7 +277,7 @@ async function dispatchAgentMailIngressUntilSettled(params: DispatchParams): Pro
                     (await params.journal.fail(params.id, {
                       reason: "completion-marker-failed",
                       message: "AgentMail could not persist the adoption completion marker",
-                      failedAt: resolveAgentMailIngressTerminalAt(params.record),
+                      failedAt: Date.now(),
                     }))
                   ) {
                     params.dispatchCompleted = true;
@@ -381,7 +369,7 @@ async function dispatchAgentMailIngressUntilSettled(params: DispatchParams): Pro
               await params.journal.fail(params.id, {
                 reason: "dispatch-attempts-exhausted",
                 message: lastError,
-                failedAt: resolveAgentMailIngressTerminalAt(params.record),
+                failedAt: Date.now(),
               });
             } else {
               await completeAgentMailIngress(params);
@@ -431,7 +419,7 @@ async function dispatchAgentMailIngressUntilSettled(params: DispatchParams): Pro
               await params.journal.fail(params.id, {
                 reason: "dispatch-attempts-exhausted",
                 message: errorText(dispatchError),
-                failedAt: resolveAgentMailIngressTerminalAt(params.record),
+                failedAt: Date.now(),
               });
             } else {
               await completeAgentMailIngress(params);
@@ -488,7 +476,7 @@ async function dispatchAgentMailIngressUntilSettled(params: DispatchParams): Pro
           return await params.journal.fail(params.id, {
             reason: "completion-marker-failed",
             message: "AgentMail could not persist the completion marker",
-            failedAt: resolveAgentMailIngressTerminalAt(params.record),
+            failedAt: Date.now(),
           });
         }
         return false;

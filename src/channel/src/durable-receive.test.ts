@@ -330,7 +330,7 @@ describe("AgentMail durable ingress", () => {
 
       await vi.waitFor(() =>
         expect(complete).toHaveBeenCalledWith(createAgentMailDurableInboundId(record), {
-          completedAt: now + AGENTMAIL_PROVIDER_FUTURE_SKEW_MAX_MS,
+          completedAt: now,
         }),
       );
       expect(accept).toHaveBeenCalledWith(
@@ -339,6 +339,34 @@ describe("AgentMail durable ingress", () => {
           receivedAt: now + AGENTMAIL_PROVIDER_FUTURE_SKEW_MAX_MS,
         }),
         { receivedAt: now + AGENTMAIL_PROVIDER_FUTURE_SKEW_MAX_MS },
+      );
+    } finally {
+      dateNow.mockRestore();
+    }
+  });
+
+  it("persists a sanitized local arrival timestamp for direct callers", async () => {
+    const now = 1_000_000;
+    const dateNow = vi.spyOn(Date, "now").mockReturnValue(now);
+    const accept = vi.fn(async () => ({
+      kind: "accepted" as const,
+      duplicate: false,
+      record: {},
+    }));
+    try {
+      await processAgentMailIngress({
+        journal: {
+          accept,
+          complete: vi.fn(async () => undefined),
+          release: vi.fn(),
+        } as never,
+        record: { ...record, messageId: "invalid-arrival", arrivedAt: Number.NaN },
+        dispatch: vi.fn(async () => undefined),
+      });
+      expect(accept).toHaveBeenCalledWith(
+        createAgentMailDurableInboundId({ ...record, messageId: "invalid-arrival" }),
+        expect.objectContaining({ arrivedAt: now }),
+        expect.any(Object),
       );
     } finally {
       dateNow.mockRestore();
@@ -808,7 +836,7 @@ describe("AgentMail durable ingress", () => {
       expect(fail).toHaveBeenCalledWith(createAgentMailDurableInboundId(futureRecord), {
         reason: "completion-marker-failed",
         message: "AgentMail could not persist the completion marker",
-        failedAt: now + AGENTMAIL_PROVIDER_FUTURE_SKEW_MAX_MS,
+        failedAt: now,
       });
     } finally {
       dateNow.mockRestore();
@@ -1015,7 +1043,12 @@ describe("AgentMail durable ingress", () => {
 
   it("keeps completed dedupe for the full recovery horizon without an entry cap", () => {
     expect(AGENTMAIL_DURABLE_PENDING_TTL_MS).toBe(30 * 24 * 60 * 60 * 1000);
-    expect(AGENTMAIL_DURABLE_COMPLETED_TTL_MS).toBe(AGENTMAIL_DURABLE_PENDING_TTL_MS);
+    expect(AGENTMAIL_DURABLE_COMPLETED_TTL_MS).toBe(
+      AGENTMAIL_DURABLE_PENDING_TTL_MS + AGENTMAIL_PROVIDER_FUTURE_SKEW_MAX_MS,
+    );
+    expect(AGENTMAIL_DURABLE_RETENTION.failedTtlMs).toBe(
+      AGENTMAIL_DURABLE_COMPLETED_TTL_MS,
+    );
     expect(AGENTMAIL_DURABLE_PENDING_MAX_ENTRIES).toBe(450);
     expect(AGENTMAIL_DURABLE_RETENTION).not.toHaveProperty("completedMaxEntries");
   });

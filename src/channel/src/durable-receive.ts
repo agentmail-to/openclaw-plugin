@@ -1,19 +1,21 @@
 import { createDurableInboundReceiveJournalFromQueue } from "openclaw/plugin-sdk/channel-outbound";
 import { sha256Hex } from "./digest.js";
+import { AGENTMAIL_PROVIDER_FUTURE_SKEW_MAX_MS } from "./received-message.js";
 import { getAgentMailRuntime } from "./runtime.js";
 import type { AgentMailIngressRecord } from "./types.js";
 
 export const AGENTMAIL_DURABLE_PENDING_MAX_ENTRIES = 450;
 const AGENTMAIL_DURABLE_PRUNE_EVERY_ACCEPTS = 100;
 export const AGENTMAIL_DURABLE_PENDING_TTL_MS = 30 * 24 * 60 * 60 * 1000;
-// Keep completed tombstones for the full pending recovery horizon. REST catch-up may remain behind
-// while durable admission is full; expiring dedupe markers sooner either replays completed mail or
-// forces catch-up to skip never-admitted messages.
-export const AGENTMAIL_DURABLE_COMPLETED_TTL_MS = AGENTMAIL_DURABLE_PENDING_TTL_MS;
+// Terminal markers use truthful local transition times. Retain them for the pending recovery
+// horizon plus the future-skew window REST scans, so every supported provider timestamp remains
+// deduplicated until it has moved behind the local high-water cursor.
+export const AGENTMAIL_DURABLE_COMPLETED_TTL_MS =
+  AGENTMAIL_DURABLE_PENDING_TTL_MS + AGENTMAIL_PROVIDER_FUTURE_SKEW_MAX_MS;
 export const AGENTMAIL_DURABLE_RETENTION = {
   pendingTtlMs: AGENTMAIL_DURABLE_PENDING_TTL_MS,
   completedTtlMs: AGENTMAIL_DURABLE_COMPLETED_TTL_MS,
-  failedTtlMs: AGENTMAIL_DURABLE_PENDING_TTL_MS,
+  failedTtlMs: AGENTMAIL_DURABLE_COMPLETED_TTL_MS,
   failedMaxEntries: AGENTMAIL_DURABLE_PENDING_MAX_ENTRIES,
 } as const;
 

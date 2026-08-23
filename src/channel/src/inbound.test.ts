@@ -384,11 +384,101 @@ describe("AgentMail REST-authoritative inbound", () => {
     await new Promise((resolve) => setTimeout(resolve, 0));
     expect(rm).not.toHaveBeenCalled();
 
-    await reclaimAbortedAgentMailDeferredMedia(controller.signal);
+    await expect(reclaimAbortedAgentMailDeferredMedia(controller.signal)).resolves.toBe(1);
     expect(rm).toHaveBeenCalledWith("/tmp/deferred-abort.bin", { force: true });
 
     await lifecycle?.onAbandoned();
     expect(rm).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not let a stale detach evict a replacement cleanup set", async () => {
+    rm.mockClear();
+    loadAgentMailInboundAttachments
+      .mockResolvedValueOnce({
+        paths: ["/tmp/deferred-old.bin"],
+        types: ["application/octet-stream"],
+      })
+      .mockResolvedValueOnce({
+        paths: ["/tmp/deferred-new.bin"],
+        types: ["application/octet-stream"],
+      });
+    const controller = new AbortController();
+    const lifecycles: Array<{ onDeferred: () => void; onAbandoned: () => Promise<void> }> = [];
+    const dispatch = async () =>
+      await dispatchAgentMailInboundEvent({
+        cfg: {},
+        account,
+        record,
+        channelRuntime: {
+          routing: { resolveAgentRoute: () => ({ agentId: "agent-1" }) },
+          inbound: {
+            buildContext: (ctx: Record<string, unknown>) => ctx,
+            run: async ({
+              turnAdoptionLifecycle,
+            }: {
+              turnAdoptionLifecycle?: {
+                onDeferred: () => void;
+                onAbandoned: () => Promise<void>;
+              };
+            }) => {
+              if (turnAdoptionLifecycle) {
+                lifecycles.push(turnAdoptionLifecycle);
+                turnAdoptionLifecycle.onDeferred();
+              }
+            },
+          },
+          session: { resolveStorePath: () => "/tmp/s.json", recordInboundSession: vi.fn() },
+          reply: { dispatchReplyWithBufferedBlockDispatcher: vi.fn() },
+        } as never,
+        client: { inboxes: { messages: { get: vi.fn(async () => message()) } } } as never,
+        abortSignal: controller.signal,
+      });
+
+    await dispatch();
+    controller.abort();
+    await expect(reclaimAbortedAgentMailDeferredMedia(controller.signal)).resolves.toBe(1);
+
+    // This in-flight dispatch registers a replacement Set after reclamation removed the old one.
+    await dispatch();
+    await lifecycles[0]?.onAbandoned();
+
+    // The stale detach above must not delete the replacement Set from the WeakMap.
+    await expect(reclaimAbortedAgentMailDeferredMedia(controller.signal)).resolves.toBe(1);
+    await lifecycles[1]?.onAbandoned();
+  });
+
+  it("transfers deferred media ownership before shutdown reclamation", async () => {
+    rm.mockClear();
+    loadAgentMailInboundAttachments.mockResolvedValueOnce({
+      paths: ["/tmp/deferred-adopted.bin"],
+      types: ["application/octet-stream"],
+    });
+    const controller = new AbortController();
+    let lifecycle: { onDeferred: () => void; onAdopted: () => Promise<void> } | undefined;
+    await dispatchAgentMailInboundEvent({
+      cfg: {},
+      account,
+      record,
+      channelRuntime: {
+        routing: { resolveAgentRoute: () => ({ agentId: "agent-1" }) },
+        inbound: {
+          buildContext: (ctx: Record<string, unknown>) => ctx,
+          run: async ({ turnAdoptionLifecycle }: { turnAdoptionLifecycle: typeof lifecycle }) => {
+            lifecycle = turnAdoptionLifecycle;
+            lifecycle?.onDeferred();
+          },
+        },
+        session: { resolveStorePath: () => "/tmp/s.json", recordInboundSession: vi.fn() },
+        reply: { dispatchReplyWithBufferedBlockDispatcher: vi.fn() },
+      } as never,
+      client: { inboxes: { messages: { get: vi.fn(async () => message()) } } } as never,
+      abortSignal: controller.signal,
+    });
+
+    await lifecycle?.onAdopted();
+    controller.abort();
+    await expect(reclaimAbortedAgentMailDeferredMedia(controller.signal)).resolves.toBe(0);
+    expect(rm).not.toHaveBeenCalled();
   });
 
   it("cleans up attachments when inbound handling resolves without adoption", async () => {
