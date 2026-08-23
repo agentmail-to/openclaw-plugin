@@ -35,25 +35,26 @@ export function createAgentMailCliPlugin(
             .allowExcessArguments(true)
             .action(async (args: string[]) => {
               try {
-                let apiKey: string | undefined;
-                if (config.apiKey) {
-                  const resolved = await resolveConfiguredSecretInputString({
-                    config: api.config,
-                    env: process.env,
-                    value: config.apiKey,
-                    path: "plugins.entries.agentmail.config.apiKey",
-                  });
-                  if (!resolved.value) {
-                    throw new Error(
-                      resolved.unresolvedRefReason ??
-                        "AgentMail CLI apiKey resolved to an empty value.",
-                    );
-                  }
-                  apiKey = resolved.value;
+                if (!config.apiKey) {
+                  throw new Error(
+                    "AgentMail CLI requires plugins.entries.agentmail.config.apiKey.",
+                  );
+                }
+                const resolved = await resolveConfiguredSecretInputString({
+                  config: api.config,
+                  env: process.env,
+                  value: config.apiKey,
+                  path: "plugins.entries.agentmail.config.apiKey",
+                });
+                if (!resolved.value) {
+                  throw new Error(
+                    resolved.unresolvedRefReason ??
+                      "AgentMail CLI apiKey resolved to an empty value.",
+                  );
                 }
                 const exitCode = await runCli(
                   withConfiguredBaseUrl(args, config.baseUrl),
-                  { apiKey },
+                  { apiKey: resolved.value },
                 );
                 if (exitCode !== 0) {
                   process.exitCode = exitCode;

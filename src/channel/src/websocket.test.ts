@@ -382,31 +382,36 @@ describe("AgentMail WebSocket ingress", () => {
     await running;
   });
 
-  it("reconnects a half-open socket after its inactivity timeout", async () => {
+  it("keeps a healthy quiet socket open without application messages", async () => {
     handlers.clear();
     catchUpRun.mockClear();
     connect.mockClear();
     close.mockClear();
-    const warn = vi.fn();
+    vi.useFakeTimers();
     const controller = new AbortController();
-    const running = startAgentMailWebSocket({
-      account,
-      abortSignal: controller.signal,
-      receive: vi.fn(async () => undefined),
-      catchUpSession: { run: catchUpRun },
-      reconnectDelayMs: () => 0,
-      inactivityTimeoutMs: 1,
-      log: { warn },
-    });
-    await vi.waitFor(() => expect(handlers.has("open")).toBe(true));
-    handlers.get("open")?.();
+    try {
+      const running = startAgentMailWebSocket({
+        account,
+        abortSignal: controller.signal,
+        receive: vi.fn(async () => undefined),
+        catchUpSession: { run: catchUpRun },
+      });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(handlers.has("open")).toBe(true);
+      handlers.get("open")?.();
 
-    await vi.waitFor(() => expect(connect.mock.calls.length).toBeGreaterThanOrEqual(2));
-    expect(warn).toHaveBeenCalledWith(
-      "AgentMail WebSocket inactive for account default; reconnecting",
-    );
-    expect(close).toHaveBeenCalled();
-    controller.abort();
-    await running;
+      // The SDK exposes no heartbeat/liveness probe through this facade. Silence is healthy; the
+      // periodic REST sweep covers missed delivery without forcing a reconnect storm.
+      await vi.advanceTimersByTimeAsync(10 * 60_000);
+      expect(connect).toHaveBeenCalledOnce();
+      expect(close).not.toHaveBeenCalled();
+
+      controller.abort();
+      await running;
+      expect(close).toHaveBeenCalledOnce();
+    } finally {
+      controller.abort();
+      vi.useRealTimers();
+    }
   });
 });

@@ -1,7 +1,10 @@
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
-import { parseAgentSessionKey } from "openclaw/plugin-sdk/routing";
 import { listAgentMailAccountIds, resolveAgentMailAccount } from "./accounts.js";
-import { buildAgentMailConversationId, buildAgentMailSessionKey } from "./inbound.js";
+import {
+  buildAgentMailConversationId,
+  buildAgentMailSessionKey,
+  parseAgentMailSessionKey,
+} from "./inbound.js";
 import { normalizeAgentMailTarget } from "./send.js";
 
 type AgentMailOutboundSessionRoute = {
@@ -43,13 +46,17 @@ export function resolveAgentMailOutboundSessionRoute(params: {
     return null;
   }
   const hasExplicitAccount = params.accountId != null && String(params.accountId).trim() !== "";
-  const parsedCurrentSession = parseAgentSessionKey(params.currentSessionKey);
-  const currentRouteParts = parsedCurrentSession?.rest.split(":") ?? [];
+  const currentRoute = parseAgentMailSessionKey(params.currentSessionKey);
+  const currentRouteBelongsToAgent =
+    currentRoute !== null &&
+    buildAgentMailSessionKey({
+      agentId: params.agentId,
+      accountId: currentRoute.accountId,
+      conversationId: currentRoute.conversationId,
+    }) === currentRoute.sessionKey;
   const inferredAccountId =
-    parsedCurrentSession?.agentId === params.agentId.toLowerCase() &&
-    currentRouteParts[0] === "agentmail" &&
-    currentRouteParts[2] === "direct"
-      ? currentRouteParts[1]
+    !hasExplicitAccount && currentRouteBelongsToAgent
+      ? currentRoute.accountId
       : undefined;
   const effectiveAccountId = hasExplicitAccount ? params.accountId : inferredAccountId;
   if (!effectiveAccountId && listAgentMailAccountIds(params.cfg).length > 1) {
@@ -71,19 +78,26 @@ export function resolveAgentMailOutboundSessionRoute(params: {
   // Thread is encoded in the conversation id (matching inbound), so the session key stays flat — no
   // separate route threadId that could add a divergent thread suffix.
   const conversationId =
-    inboxId && threadId ? buildAgentMailConversationId(inboxId, threadId) : target;
-  if (
-    inferredAccountId &&
-    currentRouteParts.slice(3).join(":") !== conversationId
-  ) {
-    // A current session from another AgentMail thread is not evidence for this target's account.
-    return null;
-  }
+    inboxId && threadId
+      ? buildAgentMailConversationId(inboxId, threadId)
+      : inferredAccountId && currentRoute?.accountId === resolved.accountId.toLowerCase()
+        ? currentRoute.conversationId
+        : target;
   const sessionKey = buildAgentMailSessionKey({
     agentId: params.agentId,
     accountId: resolved.accountId,
     conversationId,
   });
+  if (
+    !hasExplicitAccount &&
+    inferredAccountId &&
+    threadId !== undefined &&
+    currentRoute &&
+    currentRoute.sessionKey !== sessionKey
+  ) {
+    // A current session from another AgentMail thread is not evidence for this target's account.
+    return null;
+  }
   return {
     sessionKey,
     baseSessionKey: sessionKey,

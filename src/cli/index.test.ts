@@ -224,4 +224,39 @@ describe("AgentMail CLI bridge", () => {
     process.exitCode = priorExitCode;
     error.mockRestore();
   });
+
+  it("reports the required plugin config instead of running without a credential", async () => {
+    const runCli = vi.fn().mockResolvedValue(0);
+    const plugin = createAgentMailCliPlugin(runCli);
+    let action: ((args: string[]) => Promise<void>) | undefined;
+    const command = {
+      description: vi.fn().mockReturnThis(),
+      helpOption: vi.fn().mockReturnThis(),
+      allowUnknownOption: vi.fn().mockReturnThis(),
+      allowExcessArguments: vi.fn().mockReturnThis(),
+      action: vi.fn((handler: (args: string[]) => Promise<void>) => {
+        action = handler;
+        return command;
+      }),
+    };
+    (plugin.register as never)({
+      config: {},
+      pluginConfig: {},
+      registerCli(callback: (context: { program: { command: () => typeof command } }) => void) {
+        callback({ program: { command: () => command } });
+      },
+    });
+    const priorExitCode = process.exitCode;
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    await action?.(["inboxes", "list"]);
+
+    expect(runCli).not.toHaveBeenCalled();
+    expect(error).toHaveBeenCalledWith(
+      "AgentMail CLI requires plugins.entries.agentmail.config.apiKey.",
+    );
+    expect(process.exitCode).toBe(1);
+    process.exitCode = priorExitCode;
+    error.mockRestore();
+  });
 });

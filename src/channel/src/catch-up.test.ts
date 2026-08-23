@@ -830,6 +830,7 @@ describe("AgentMail durable REST catch-up", () => {
       established: true,
     });
     let deepPageTwoPauses = true;
+    let nowMs = 1_000_000;
     const list = vi.fn(
       async (_inboxId: string, options: { after: Date; pageToken?: string }) => {
         if (options.pageToken === "deep_page_2") {
@@ -845,14 +846,17 @@ describe("AgentMail durable REST catch-up", () => {
             nextPageToken: "deep_page_2",
           };
         }
-        return { count: 0, messages: [] };
+        return {
+          count: 1,
+          messages: [message({ id: "normal_new", timestamp: 1_400_000 })],
+        };
       },
     );
     const session = await createAgentMailCatchUpSession({
       account,
       client: { inboxes: { messages: { list } } } as never,
       store,
-      now: () => 1_000_000,
+      now: () => nowMs,
     });
     const receive = vi.fn(async (record: AgentMailIngressRecord) => {
       if (record.messageId === "deep_old" && deepPageTwoPauses) {
@@ -866,17 +870,20 @@ describe("AgentMail durable REST catch-up", () => {
       abortSignal: new AbortController().signal,
       sinceBaseline: true,
     });
-    expect((await store.lookup(key))?.checkpoint).toMatchObject({
+    expect((await store.lookup(key))?.checkpoints?.deep).toMatchObject({
       pageToken: "deep_page_2",
       sinceBaseline: true,
     });
 
+    nowMs = 2_000_000;
     await session.run({ receive, abortSignal: new AbortController().signal });
-    expect((await store.lookup(key))?.checkpoint).toMatchObject({
+    expect((await store.lookup(key))?.checkpoints?.deep).toMatchObject({
       pageToken: "deep_page_2",
       sinceBaseline: true,
     });
+    expect((await store.lookup(key))?.highWaterAtMs).toBe(1_400_000);
 
+    nowMs = 3_000_000;
     await session.run({
       receive,
       abortSignal: new AbortController().signal,
@@ -887,7 +894,121 @@ describe("AgentMail durable REST catch-up", () => {
       expect.objectContaining({ pageToken: "deep_page_2" }),
       expect.any(Object),
     );
-    expect((await store.lookup(key))?.checkpoint).toBeUndefined();
+    expect((await store.lookup(key))?.checkpoints?.deep).toBeUndefined();
+    expect((await store.lookup(key))?.highWaterAtMs).toBe(1_400_000);
+  });
+
+  it("resumes a normal continuation while a deep continuation is paused", async () => {
+    const store = memoryStore<AgentMailCatchUpCursor>();
+    const key = sha256Hex("default\ninbox_1");
+    await store.register(key, {
+      version: 1,
+      baselineAtMs: 100_000,
+      highWaterAtMs: 800_000,
+      established: true,
+      checkpoints: {
+        deep: {
+          afterAtMs: 100_000,
+          beforeAtMs: 900_001,
+          pageToken: "deep_page_2",
+          highWaterAtMs: 800_000,
+          sinceBaseline: true,
+        },
+      },
+    });
+    let pause = true;
+    const list = vi.fn(async (_inboxId: string, options: { pageToken?: string }) =>
+      options.pageToken === "normal_page_2"
+        ? { count: 1, messages: [message({ id: "normal_b", timestamp: 900_000 })] }
+        : {
+            count: 1,
+            messages: [message({ id: "normal_a", timestamp: 850_000 })],
+            nextPageToken: "normal_page_2",
+          },
+    );
+    const session = await createAgentMailCatchUpSession({
+      account,
+      client: { inboxes: { messages: { list } } } as never,
+      store,
+      now: () => 1_000_000,
+    });
+    const receive = vi.fn(async (record: AgentMailIngressRecord) => {
+      if (record.messageId === "normal_b" && pause) {
+        pause = false;
+        throw new AgentMailIngressCapacityError();
+      }
+    });
+
+    await session.run({ receive, abortSignal: new AbortController().signal });
+    expect((await store.lookup(key))?.checkpoints).toMatchObject({
+      normal: { pageToken: "normal_page_2" },
+      deep: { pageToken: "deep_page_2" },
+    });
+    await session.run({ receive, abortSignal: new AbortController().signal });
+
+    expect(list.mock.calls.map(([, options]) => options.pageToken)).toEqual([
+      undefined,
+      "normal_page_2",
+      "normal_page_2",
+    ]);
+    expect(receive.mock.calls.map(([record]) => record.messageId)).toEqual([
+      "normal_a",
+      "normal_b",
+      "normal_b",
+    ]);
+    expect((await store.lookup(key))?.checkpoints?.deep?.pageToken).toBe("deep_page_2");
+  });
+
+  it("resumes an old account checkpoint while filtering rows beyond retention", async () => {
+    const store = memoryStore<AgentMailCatchUpCursor>();
+    const key = sha256Hex("default\ninbox_1");
+    const nowMs = 40 * 24 * 60 * 60_000;
+    const previousSweepAtMs = nowMs - 60_000;
+    const recoveryFloorMs = nowMs - AGENTMAIL_DURABLE_PENDING_TTL_MS;
+    await store.register(key, {
+      version: 1,
+      baselineAtMs: 0,
+      highWaterAtMs: previousSweepAtMs,
+      established: true,
+      // Exercise migration from the shipped single-slot cursor at the same time.
+      checkpoint: {
+        // This boundary was the recovery floor one periodic interval ago. Requiring it to remain
+        // above today's floor made old-account continuations expire almost immediately.
+        afterAtMs: previousSweepAtMs - AGENTMAIL_DURABLE_PENDING_TTL_MS,
+        beforeAtMs: previousSweepAtMs + 1,
+        pageToken: "old_deep_page_2",
+        highWaterAtMs: previousSweepAtMs,
+        sinceBaseline: true,
+      },
+    });
+    const list = vi.fn(async () => ({
+      count: 2,
+      messages: [
+        message({ id: "expired", timestamp: recoveryFloorMs - 1 }),
+        message({ id: "retained", timestamp: recoveryFloorMs + 1 }),
+      ],
+    }));
+    const session = await createAgentMailCatchUpSession({
+      account,
+      client: { inboxes: { messages: { list } } } as never,
+      store,
+      now: () => nowMs,
+    });
+    const receive = vi.fn(async () => undefined);
+
+    await session.run({
+      receive,
+      abortSignal: new AbortController().signal,
+      sinceBaseline: true,
+    });
+
+    expect(list).toHaveBeenCalledWith(
+      "inbox_1",
+      expect.objectContaining({ pageToken: "old_deep_page_2" }),
+      expect.any(Object),
+    );
+    expect(receive.mock.calls.map(([record]) => record.messageId)).toEqual(["retained"]);
+    expect((await store.lookup(key))?.checkpoints?.deep).toBeUndefined();
   });
 
   it("resumes the last completed page after a mid-page abort", async () => {

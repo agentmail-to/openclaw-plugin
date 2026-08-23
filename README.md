@@ -62,7 +62,7 @@ The CLI credential and optional API base URL override belong under
     entries: {
       agentmail: {
         config: {
-          apiKey: { source: "env", provider: "agentmail", id: "AGENTMAIL_API_KEY" },
+          apiKey: { source: "env", provider: "default", id: "AGENTMAIL_API_KEY" },
           baseUrl: "https://api.agentmail.to/v0",
         },
       },
@@ -92,9 +92,9 @@ The **channel** is configured under `channels.agentmail` (single inbox) or `chan
 {
   channels: {
     agentmail: {
-      apiKey: { source: "env", provider: "agentmail", id: "AGENTMAIL_API_KEY" },
+      apiKey: { source: "env", provider: "default", id: "AGENTMAIL_API_KEY" },
       inboxId: "agent@agentmail.to",
-      webhookSecret: { source: "env", provider: "agentmail", id: "AGENTMAIL_WEBHOOK_SECRET" },
+      webhookSecret: { source: "env", provider: "default", id: "AGENTMAIL_WEBHOOK_SECRET" },
       dmPolicy: "allowlist",       // default; an empty allowFrom denies every sender
       allowFrom: ["person@example.com"],
       mediaMaxMb: 20,

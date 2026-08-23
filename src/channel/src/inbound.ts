@@ -2,7 +2,7 @@ import { rm } from "node:fs/promises";
 import { AgentMailError, type AgentMail, type AgentMailClient } from "agentmail";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import type { PluginRuntime } from "openclaw/plugin-sdk/plugin-runtime";
-import { buildAgentSessionKey } from "openclaw/plugin-sdk/routing";
+import { buildAgentSessionKey, parseAgentSessionKey } from "openclaw/plugin-sdk/routing";
 import { htmlToMarkdown, markdownToText } from "openclaw/plugin-sdk/web-content-extractor";
 import type { AgentMailLog } from "./log.js";
 import { createAgentMailClient } from "./client.js";
@@ -70,6 +70,36 @@ export function buildAgentMailSessionKey(params: {
     peer: { kind: "direct", id: params.conversationId },
     dmScope: "per-account-channel-peer",
   });
+}
+
+export type ParsedAgentMailSessionKey = {
+  sessionKey: string;
+  agentId: string;
+  accountId: string;
+  conversationId: string;
+};
+
+/** Parses the exact flat session-key layout emitted by buildAgentMailSessionKey. */
+export function parseAgentMailSessionKey(
+  sessionKey: string | undefined,
+): ParsedAgentMailSessionKey | null {
+  const parsed = parseAgentSessionKey(sessionKey);
+  const parts = parsed?.rest.split(":") ?? [];
+  if (
+    !parsed ||
+    parts[0] !== CHANNEL_ID ||
+    !parts[1] ||
+    parts[2] !== "direct" ||
+    parts.length < 4
+  ) {
+    return null;
+  }
+  return {
+    sessionKey: `agent:${parsed.agentId}:${parsed.rest}`,
+    agentId: parsed.agentId,
+    accountId: parts[1],
+    conversationId: parts.slice(3).join(":"),
+  };
 }
 
 export function resolveAgentMailMessageText(message: AgentMail.Message): string {

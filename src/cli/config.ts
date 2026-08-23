@@ -1,6 +1,6 @@
 import { buildPluginConfigSchema } from "openclaw/plugin-sdk/plugin-entry";
 import { buildSecretInputSchema, type SecretInput } from "openclaw/plugin-sdk/secret-input";
-import { z } from "openclaw/plugin-sdk/zod";
+import { z } from "zod";
 
 export type AgentMailCliConfig = {
   apiKey?: SecretInput;

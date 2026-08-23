@@ -181,6 +181,69 @@ describe("resolveAgentMailOutboundSessionRoute", () => {
     expect(route?.peer.id).toBe(conversationId);
   });
 
+  it("compares mixed-case inbox and thread ids by their canonical session key", () => {
+    const mixedCfg = {
+      channels: {
+        agentmail: {
+          accounts: {
+            support: { apiKey: "key", inboxId: "Support@AgentMail.to" },
+          },
+        },
+      },
+    } as never;
+    const conversationId = buildAgentMailConversationId("Support@AgentMail.to", "Thread_X");
+    const currentSessionKey = buildAgentMailSessionKey({
+      agentId: "agent-1",
+      accountId: "support",
+      conversationId,
+    });
+
+    const route = resolveAgentMailOutboundSessionRoute({
+      cfg: mixedCfg,
+      agentId: "agent-1",
+      currentSessionKey,
+      target: "message:m",
+      threadId: "Thread_X",
+    });
+
+    expect(route?.sessionKey).toBe(currentSessionKey);
+  });
+
+  it("uses the active inbound conversation when core supplies no thread id", () => {
+    const conversationId = buildAgentMailConversationId(INBOX, "thread_1");
+    const currentSessionKey = buildAgentMailSessionKey({
+      agentId: "agent-1",
+      accountId: "default",
+      conversationId,
+    });
+    const route = resolveAgentMailOutboundSessionRoute({
+      cfg,
+      agentId: "agent-1",
+      currentSessionKey,
+      target: "message:msg_1",
+    });
+
+    expect(route?.sessionKey).toBe(currentSessionKey);
+    expect(route?.peer.id).toBe(conversationId.toLowerCase());
+  });
+
+  it("does not let an unrelated active session override an explicit account", () => {
+    const route = resolveAgentMailOutboundSessionRoute({
+      cfg,
+      agentId: "agent-1",
+      accountId: "default",
+      currentSessionKey: buildAgentMailSessionKey({
+        agentId: "agent-1",
+        accountId: "default",
+        conversationId: buildAgentMailConversationId(INBOX, "other_thread"),
+      }),
+      target: "message:msg_1",
+      threadId: "thread_1",
+    });
+
+    expect(route?.peer.id).toBe(buildAgentMailConversationId(INBOX, "thread_1"));
+  });
+
   it("returns null for a non-AgentMail target", () => {
     expect(
       resolveAgentMailOutboundSessionRoute({

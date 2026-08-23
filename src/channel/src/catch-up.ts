@@ -39,12 +39,19 @@ export type AgentMailCatchUpCheckpoint = {
   sinceBaseline: boolean;
 };
 
+export type AgentMailCatchUpCheckpoints = {
+  normal?: AgentMailCatchUpCheckpoint;
+  deep?: AgentMailCatchUpCheckpoint;
+};
+
 export type AgentMailCatchUpCursor = {
   version: typeof CURSOR_VERSION;
   baselineAtMs: number;
   highWaterAtMs: number;
   established: boolean;
   generation?: string;
+  checkpoints?: AgentMailCatchUpCheckpoints;
+  /** Legacy single-slot checkpoint, migrated by normalizeCursor. */
   checkpoint?: AgentMailCatchUpCheckpoint;
 };
 
@@ -215,7 +222,18 @@ function normalizeCursor(value: unknown): AgentMailCatchUpCursor | null {
   ) {
     return null;
   }
-  const checkpoint = normalizeCheckpoint(cursor.checkpoint);
+  const rawCheckpoints = cursor.checkpoints;
+  const normalCheckpoint = normalizeCheckpoint(rawCheckpoints?.normal);
+  const deepCheckpoint = normalizeCheckpoint(rawCheckpoints?.deep);
+  const legacyCheckpoint = normalizeCheckpoint(cursor.checkpoint);
+  const checkpoints: AgentMailCatchUpCheckpoints = {
+    ...(normalCheckpoint ? { normal: normalCheckpoint } : {}),
+    ...(deepCheckpoint ? { deep: deepCheckpoint } : {}),
+  };
+  if (legacyCheckpoint) {
+    const mode = legacyCheckpoint.sinceBaseline ? "deep" : "normal";
+    checkpoints[mode] ??= legacyCheckpoint;
+  }
   return {
     version: CURSOR_VERSION,
     baselineAtMs: cursor.baselineAtMs,
@@ -224,7 +242,7 @@ function normalizeCursor(value: unknown): AgentMailCatchUpCursor | null {
     ...(typeof cursor.generation === "string" && cursor.generation
       ? { generation: cursor.generation }
       : {}),
-    ...(checkpoint ? { checkpoint } : {}),
+    ...(checkpoints.normal || checkpoints.deep ? { checkpoints } : {}),
   };
 }
 
@@ -233,9 +251,16 @@ function mergeCursor(
   next: Pick<AgentMailCatchUpCursor, "baselineAtMs" | "highWaterAtMs" | "established">,
   upperBoundAtMs: number,
   generation: string,
+  checkpointMode: "normal" | "deep",
   checkpoint: AgentMailCatchUpCheckpoint | null,
 ): AgentMailCatchUpCursor {
   const current = normalizeCursor(currentValue);
+  const checkpoints = { ...current?.checkpoints };
+  if (checkpoint) {
+    checkpoints[checkpointMode] = checkpoint;
+  } else {
+    delete checkpoints[checkpointMode];
+  }
   const baselineAtMs = Math.min(
     upperBoundAtMs,
     current?.baselineAtMs ?? next.baselineAtMs,
@@ -253,7 +278,7 @@ function mergeCursor(
     ),
     established: current?.established === true || next.established,
     generation,
-    ...(checkpoint ? { checkpoint } : {}),
+    ...(checkpoints.normal || checkpoints.deep ? { checkpoints } : {}),
   };
 }
 
@@ -265,6 +290,7 @@ async function persistCursor(params: {
   established: boolean;
   upperBoundAtMs: number;
   generation: string;
+  checkpointMode: "normal" | "deep";
   checkpoint: AgentMailCatchUpCheckpoint | null;
 }): Promise<boolean> {
   const update = params.store.update;
@@ -283,6 +309,7 @@ async function persistCursor(params: {
         params,
         params.upperBoundAtMs,
         params.generation,
+        params.checkpointMode,
         params.checkpoint,
       );
     },
@@ -393,24 +420,17 @@ export async function createAgentMailCatchUpSession(params: {
       // the durable retention window and since monitoring began, but deliberately does not scan
       // before the baseline, which would re-inject pre-monitoring history.
       const runAtMs = now();
-      const recoveryFloorMs = runAtMs - AGENTMAIL_DURABLE_PENDING_TTL_MS;
+      const recoveryFloorMs = Math.max(0, runAtMs - AGENTMAIL_DURABLE_PENDING_TTL_MS);
       const requestedSinceBaseline = sinceBaseline === true;
+      const checkpointMode = requestedSinceBaseline ? "deep" : "normal";
+      const storedCheckpoint = storedCursor.checkpoints?.[checkpointMode];
       const eligibleCheckpoint =
-        storedCursor.checkpoint &&
-        storedCursor.checkpoint.beforeAtMs <= runAtMs + 1 &&
-        storedCursor.checkpoint.afterAtMs >= recoveryFloorMs
-          ? storedCursor.checkpoint
+        storedCheckpoint &&
+        storedCheckpoint.beforeAtMs <= runAtMs + 1 &&
+        storedCheckpoint.beforeAtMs > recoveryFloorMs
+          ? storedCheckpoint
           : undefined;
-      const resumableCheckpoint =
-        eligibleCheckpoint?.sinceBaseline === requestedSinceBaseline
-          ? eligibleCheckpoint
-          : undefined;
-      // A short normal overlap must not erase a paused deep sweep's continuation. The cursor format
-      // has one checkpoint slot, so deep recovery takes priority until it completes.
-      const pausedDeepCheckpoint =
-        !requestedSinceBaseline && eligibleCheckpoint?.sinceBaseline
-          ? eligibleCheckpoint
-          : undefined;
+      const resumableCheckpoint = eligibleCheckpoint;
       const sweepAtMs = resumableCheckpoint
         ? resumableCheckpoint.beforeAtMs - 1
         : runAtMs;
@@ -473,6 +493,11 @@ export async function createAgentMailCatchUpSession(params: {
             message,
             params.account.inboxId,
           );
+          // A resumed page token retains the original query boundary. Skip rows that have since
+          // aged beyond durable tombstone retention so an old continuation cannot re-admit them.
+          if (providerReceivedAt !== null && providerReceivedAt < recoveryFloorMs) {
+            continue;
+          }
           const arrivedAt = now();
           const receivedAt = providerReceivedAt !== null
             ? Math.min(providerReceivedAt, sweepAtMs)
@@ -526,16 +551,18 @@ export async function createAgentMailCatchUpSession(params: {
             baselineAtMs: effectiveBaselineAtMs,
             highWaterAtMs: effectiveHighWaterAtMs,
             established: storedCursor.established,
-            upperBoundAtMs: sweepAtMs,
+            // A deep continuation can predate a completed normal sweep. Bound clock repair to the
+            // current run, not the resumed sweep, so its older window cannot rewind high-water.
+            upperBoundAtMs: runAtMs,
             generation,
-            checkpoint:
-              pausedDeepCheckpoint ?? {
-                afterAtMs: afterMs,
-                beforeAtMs: beforeMs,
-                pageToken: pageCursor,
-                highWaterAtMs,
-                sinceBaseline: requestedSinceBaseline,
-              },
+            checkpointMode,
+            checkpoint: {
+              afterAtMs: afterMs,
+              beforeAtMs: beforeMs,
+              pageToken: pageCursor,
+              highWaterAtMs,
+              sinceBaseline: requestedSinceBaseline,
+            },
           });
           if (!persisted) {
             return;
@@ -552,9 +579,10 @@ export async function createAgentMailCatchUpSession(params: {
         baselineAtMs: effectiveBaselineAtMs,
         highWaterAtMs,
         established: true,
-        upperBoundAtMs: sweepAtMs,
+        upperBoundAtMs: runAtMs,
         generation,
-        checkpoint: pausedDeepCheckpoint ?? null,
+        checkpointMode,
+        checkpoint: null,
       });
       if (!persisted) {
         return;
