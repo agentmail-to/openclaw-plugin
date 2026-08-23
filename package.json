@@ -1,7 +1,7 @@
 {
   "name": "@agentmail/agentmail",
-  "version": "0.1.0",
-  "description": "AgentMail for OpenClaw: a CLI-backed skill plus a durable, allowlisted, reply-only email channel.",
+  "version": "0.2.0",
+  "description": "AgentMail for OpenClaw: Official email plugin and email channel for OpenClaw. Your agent gets its own inbox.",
   "type": "module",
   "private": false,
   "license": "MIT",
@@ -38,15 +38,16 @@
     "THIRD_PARTY_NOTICES.md"
   ],
   "peerDependencies": {
-    "openclaw": ">=2026.7.2-beta.3"
+    "openclaw": ">=2026.8.1-beta.2"
   },
   "dependencies": {
     "agentmail": "^0.5.16",
-    "svix": "^1.96.1"
+    "svix": "^1.96.1",
+    "zod": "4.4.3"
   },
   "devDependencies": {
     "fflate": "^0.8.3",
-    "openclaw": "2026.7.2-beta.3",
+    "openclaw": "2026.8.1-beta.2",
     "typescript": "^5.9.0",
     "vitest": "^3.2.0"
   },
@@ -63,20 +64,28 @@
       "docsLabel": "agentmail",
       "blurb": "Durable, allowlisted, reply-only email conversations through AgentMail.",
       "order": 89,
-      "quickstartAllowFrom": true
+      "quickstartAllowFrom": true,
+      "configuredState": {
+        "env": {
+          "anyOf": [
+            "AGENTMAIL_API_KEY",
+            "AGENTMAIL_WEBHOOK_SECRET"
+          ]
+        }
+      }
     },
     "compat": {
-      "pluginApi": ">=2026.7.2-beta.3",
-      "minGatewayVersion": "2026.7.2-beta.3"
+      "pluginApi": ">=2026.8.1-beta.2",
+      "minGatewayVersion": "2026.8.1-beta.2"
     },
     "build": {
-      "openclawVersion": "2026.7.2-beta.3",
-      "pluginSdkVersion": "2026.7.2-beta.3"
+      "openclawVersion": "2026.8.1-beta.2",
+      "pluginSdkVersion": "2026.8.1-beta.2"
     },
     "install": {
       "npmSpec": "@agentmail/agentmail",
       "defaultChoice": "npm",
-      "minHostVersion": ">=2026.7.2-beta.3",
+      "minHostVersion": ">=2026.8.1-beta.2",
       "allowInvalidConfigRecovery": true
     }
   }

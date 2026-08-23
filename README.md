@@ -10,7 +10,7 @@ Give an OpenClaw agent an email address with [AgentMail](https://www.agentmail.t
 ## Requirements
 
 - Node.js 22.22.3–22.x, 24.15.0–24.x, or 25.9.0+
-- OpenClaw 2026.7.2 (beta) or newer
+- OpenClaw 2026.8.1-beta.2 or newer
 - An AgentMail API key from the [AgentMail console](https://console.agentmail.to/)
 
 The published plugin includes the official AgentMail CLI for supported macOS, Linux, and Windows
