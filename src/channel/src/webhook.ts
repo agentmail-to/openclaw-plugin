@@ -5,7 +5,11 @@ import {
 } from "openclaw/plugin-sdk/webhook-ingress";
 import { Webhook } from "svix";
 import { type AgentMailLog, errorText } from "./log.js";
-import { agentMailInboxIdsEqual, resolveAgentMailTimestampMs } from "./received-message.js";
+import {
+  agentMailInboxIdsEqual,
+  capAgentMailProviderTimestampForRetention,
+  resolveAgentMailTimestampMs,
+} from "./received-message.js";
 import type { AgentMailIngressRecord, ResolvedAgentMailAccount } from "./types.js";
 
 const MAX_WEBHOOK_BODY_BYTES = 1024 * 1024;
@@ -42,7 +46,10 @@ function parseVerifiedEvent(payload: unknown): {
   if (!inboxId || !messageId) {
     return null;
   }
-  const receivedAt = resolveAgentMailTimestampMs(mail.timestamp);
+  // message.timestamp drives REST scan ordering, so retain its bounded value for dedupe. Fall back
+  // to provider ingestion time when the sender-authored timestamp is absent or malformed.
+  const receivedAt =
+    resolveAgentMailTimestampMs(mail.timestamp) ?? resolveAgentMailTimestampMs(mail.created_at);
   return { inboxId, messageId, ...(receivedAt === null ? {} : { receivedAt }) };
 }
 
@@ -117,12 +124,16 @@ export function createAgentMailWebhookHandler(params: {
     }
     try {
       const nowMs = Date.now();
+      const receivedAt = capAgentMailProviderTimestampForRetention(
+        event.receivedAt ?? nowMs,
+        nowMs,
+      );
       await params.receive({
         accountId: params.account.accountId,
         inboxId: params.account.inboxId,
         messageId: event.messageId,
         transport: "webhook",
-        receivedAt: event.receivedAt ?? nowMs,
+        receivedAt,
         arrivedAt: nowMs,
       });
       return respond(res, 200);

@@ -62,6 +62,8 @@ export async function loadAgentMailInboundAttachments(params: {
   }
   let declaredBytes = 0;
   for (const attachment of accepted) {
+    // Hydrated AgentMail.Attachment objects require `size` in the provider SDK contract. Keep the
+    // runtime check as a fail-closed guard for malformed or version-skewed provider payloads.
     const declaredSize: unknown = attachment.size;
     if (
       typeof declaredSize !== "number" ||

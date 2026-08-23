@@ -9,8 +9,12 @@ import {
   AgentMailIngressCapacityError,
 } from "./durable-receive.js";
 import {
+  AGENTMAIL_PROVIDER_FUTURE_SKEW_MAX_MS,
   AGENTMAIL_RECEIVED_LABEL,
+  capAgentMailProviderTimestampForRetention,
+  isValidAgentMailTimestampMs,
   isReceivedAgentMailMessage,
+  resolveAgentMailTimestampMs,
   resolveReceivedAgentMailMessageTimestampMs,
 } from "./received-message.js";
 import { createBackoff, waitForRetry } from "./retry.js";
@@ -180,22 +184,18 @@ function cursorNamespace(account: ResolvedAgentMailAccount): string {
   return `${AGENTMAIL_REST_CATCH_UP_NAMESPACE}.${sha256Hex(account.accountId)}`;
 }
 
-function validTimestamp(value: unknown): value is number {
-  return typeof value === "number" && Number.isFinite(value) && value >= 0;
-}
-
 function normalizeCheckpoint(value: unknown): AgentMailCatchUpCheckpoint | undefined {
   if (!value || typeof value !== "object") {
     return undefined;
   }
   const checkpoint = value as Partial<AgentMailCatchUpCheckpoint>;
   if (
-    !validTimestamp(checkpoint.afterAtMs) ||
-    !validTimestamp(checkpoint.beforeAtMs) ||
+    !isValidAgentMailTimestampMs(checkpoint.afterAtMs) ||
+    !isValidAgentMailTimestampMs(checkpoint.beforeAtMs) ||
     checkpoint.beforeAtMs < checkpoint.afterAtMs ||
     typeof checkpoint.pageToken !== "string" ||
     checkpoint.pageToken.length === 0 ||
-    !validTimestamp(checkpoint.highWaterAtMs) ||
+    !isValidAgentMailTimestampMs(checkpoint.highWaterAtMs) ||
     typeof checkpoint.sinceBaseline !== "boolean"
   ) {
     return undefined;
@@ -216,8 +216,8 @@ function normalizeCursor(value: unknown): AgentMailCatchUpCursor | null {
   const cursor = value as Partial<AgentMailCatchUpCursor>;
   if (
     cursor.version !== CURSOR_VERSION ||
-    !validTimestamp(cursor.baselineAtMs) ||
-    !validTimestamp(cursor.highWaterAtMs) ||
+    !isValidAgentMailTimestampMs(cursor.baselineAtMs) ||
+    !isValidAgentMailTimestampMs(cursor.highWaterAtMs) ||
     typeof cursor.established !== "boolean"
   ) {
     return null;
@@ -269,8 +269,9 @@ function mergeCursor(
   return {
     version: CURSOR_VERSION,
     baselineAtMs,
-    // A wall-clock rollback must be allowed to lower a cursor that is now in the future. Within
-    // the current clock horizon, concurrent updates still merge monotonically.
+    // Repair committed values that are now beyond the wall-clock horizon while merging both
+    // in-range contributions monotonically. Without the committed-value clamp, frequent restarts
+    // can keep deep recovery from ever repairing a cursor left in the future by clock rollback.
     highWaterAtMs: Math.max(
       baselineAtMs,
       Math.min(upperBoundAtMs, current?.highWaterAtMs ?? 0),
@@ -441,7 +442,11 @@ export async function createAgentMailCatchUpSession(params: {
         effectiveBaselineAtMs,
         Math.min(storedCursor.highWaterAtMs, sweepAtMs),
       );
+      // Scan the same bounded future-skew horizon accepted by live ingress. This lets REST recover
+      // a missed live event promptly without allowing an arbitrary sender date to move the cursor
+      // beyond the local clock or retain its tombstone indefinitely.
       const beforeMs = sweepAtMs + 1;
+      const providerBeforeMs = beforeMs + AGENTMAIL_PROVIDER_FUTURE_SKEW_MAX_MS;
       const baseAfterMs =
         requestedSinceBaseline || !storedCursor.established
           ? effectiveBaselineAtMs
@@ -465,7 +470,7 @@ export async function createAgentMailCatchUpSession(params: {
             after: new Date(afterMs),
             // Exclude implausibly future provider rows from normal pagination. The per-row clamp
             // below remains defensive in case a provider projection violates this filter.
-            before: new Date(beforeMs),
+            before: new Date(providerBeforeMs),
             ascending: true,
             includeSpam: false,
             includeBlocked: false,
@@ -499,19 +504,21 @@ export async function createAgentMailCatchUpSession(params: {
             continue;
           }
           const arrivedAt = now();
-          const receivedAt = providerReceivedAt !== null
-            ? Math.min(providerReceivedAt, sweepAtMs)
-            : sweepAtMs;
+          const providerCreatedAt = resolveAgentMailTimestampMs(message.createdAt);
+          const receivedAt = capAgentMailProviderTimestampForRetention(
+            providerReceivedAt ?? providerCreatedAt ?? arrivedAt,
+            arrivedAt,
+          );
           if (providerReceivedAt === null) {
-            // Use local arrival time so a malformed newest row is admitted once and advances the
-            // cursor instead of being re-listed and warned about forever.
+            // Invalid sender time must not turn a missed event into a permanent drop. Admit using
+            // provider/local arrival and advance to the fixed sweep bound so it is not re-listed
+            // and warned about on every periodic scan.
             params.log?.warn?.(
-              `AgentMail catch-up used arrival time for message ${message.messageId} with an invalid timestamp`,
+              `AgentMail catch-up used provider/local arrival time for message ${message.messageId} with an invalid timestamp`,
             );
           } else if (providerReceivedAt > sweepAtMs) {
-            // Provider clock skew must not push the cursor into the far future and disable periodic
-            // overlap recovery. Preserve the row while clamping its ordering timestamp to this
-            // sweep's fixed wall-clock bound.
+            // Sender-authored time can be arbitrarily skewed. The row was admitted above using a
+            // bounded retention timestamp, and cursor advancement remains clamped to this sweep.
             params.log?.warn?.(
               `AgentMail catch-up clamped future timestamp for message ${message.messageId}`,
             );
@@ -538,7 +545,10 @@ export async function createAgentMailCatchUpSession(params: {
             throw error;
           }
           admitted += 1;
-          highWaterAtMs = Math.max(highWaterAtMs, receivedAt);
+          highWaterAtMs = Math.max(
+            highWaterAtMs,
+            providerReceivedAt === null ? sweepAtMs : Math.min(providerReceivedAt, sweepAtMs),
+          );
         }
         pageCursor = page.nextPageToken;
         if (pageCursor) {
