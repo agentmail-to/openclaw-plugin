@@ -2,7 +2,7 @@
   "id": "agentmail",
   "name": "AgentMail",
   "description": "AgentMail for OpenClaw: Official email plugin and email channel for OpenClaw. Your agent gets its own inbox.",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "configSchema": {
     "type": "object",
     "properties": {

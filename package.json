@@ -1,6 +1,6 @@
 {
   "name": "@agentmail/agentmail",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "AgentMail for OpenClaw: Official email plugin and email channel for OpenClaw. Your agent gets its own inbox.",
   "type": "module",
   "private": false,
