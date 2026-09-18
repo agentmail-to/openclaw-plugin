@@ -12,6 +12,7 @@ import { fileURLToPath } from "node:url";
 const root = fileURLToPath(new URL("..", import.meta.url));
 const openclaw = fileURLToPath(new URL("../node_modules/.bin/openclaw", import.meta.url));
 const cliRunner = await import(new URL("../dist/cli/runner.js", import.meta.url));
+const secretContract = await import(new URL("../dist/secret-contract-api.js", import.meta.url));
 const cliRelease = JSON.parse(
   readFileSync(new URL("../dist/cli/agentmail-cli-release.json", import.meta.url), "utf8"),
 );
@@ -58,6 +59,13 @@ function fail(message, detail) {
     console.error(detail);
   }
   process.exit(1);
+}
+
+if (typeof secretContract.collectRuntimeConfigAssignments !== "function") {
+  fail("root secret-contract entry point does not export collectRuntimeConfigAssignments");
+}
+if (!Array.isArray(secretContract.secretTargetRegistryEntries)) {
+  fail("root secret-contract entry point does not export secretTargetRegistryEntries");
 }
 
 try {
