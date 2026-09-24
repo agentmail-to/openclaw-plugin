@@ -1,11 +1,9 @@
-// Pure helpers for asserting an `npm pack` tarball vendors every bundled AgentMail CLI target.
+// Pure helpers for asserting a package vendors every bundled AgentMail CLI target.
 //
-// The plugin ships the AgentMail CLI for all platforms under `vendor/agentmail/<target>/…`, but
-// that tree is only assembled when `prepack` runs `cli:prepare -- --all` during pack/publish.
-// A build that skips lifecycle scripts (or a host-only `plugin:build`) vendors just the current
-// platform, and `npm pack` still succeeds silently — which is how 0.2.1 shipped with only
-// `vendor/agentmail/darwin-arm64/agentmail`. `scripts/assert-cli-targets-packed.mjs` uses the
-// functions below to turn that silent gap into a hard failure.
+// `prepack` (plugin:validate) already fails when the on-disk vendor tree is incomplete, but 0.2.1
+// shipped with only `vendor/agentmail/darwin-arm64/agentmail` because the release skipped
+// lifecycle scripts. `scripts/assert-cli-targets-packed.mjs` uses these helpers to check what is
+// actually in the package: the `npm pack` file list, or a built .tgz passed on the command line.
 
 export interface CliReleaseAsset {
   executableName: string;
@@ -48,4 +46,17 @@ export function findMissingCliTargets(
     packed.add(normalizePackPath(path));
   }
   return expectedCliVendorPaths(release).filter((path) => !packed.has(path));
+}
+
+/**
+ * File paths from `npm pack --dry-run --json` stdout. Tolerates leading non-JSON text and accepts
+ * either the array npm prints or a single entry object.
+ */
+export function parseNpmPackFiles(stdout: string): string[] {
+  const start = stdout.indexOf("[");
+  const parsed: unknown = JSON.parse(start >= 0 ? stdout.slice(start) : stdout);
+  const entry = (Array.isArray(parsed) ? parsed[0] : parsed) as
+    | { files?: { path: string }[] }
+    | undefined;
+  return (entry?.files ?? []).map((file) => file.path);
 }

@@ -5,6 +5,7 @@ import {
   expectedCliVendorPaths,
   findMissingCliTargets,
   normalizePackPath,
+  parseNpmPackFiles,
 } from "./pack-targets.js";
 
 const release = JSON.parse(
@@ -68,5 +69,26 @@ describe("normalizePackPath", () => {
     expect(normalizePackPath("vendor\\agentmail\\win32-x64\\agentmail.exe")).toBe(
       "vendor/agentmail/win32-x64/agentmail.exe",
     );
+  });
+});
+
+describe("parseNpmPackFiles", () => {
+  const packJson = JSON.stringify([
+    { name: "@agentmail/agentmail", files: [{ path: "package.json" }, { path: "dist/index.js" }] },
+  ]);
+
+  it("reads the file paths from npm pack --json output", () => {
+    expect(parseNpmPackFiles(packJson)).toEqual(["package.json", "dist/index.js"]);
+  });
+
+  it("tolerates text printed before the JSON", () => {
+    expect(parseNpmPackFiles(`> prepack notice\n${packJson}`)).toEqual([
+      "package.json",
+      "dist/index.js",
+    ]);
+  });
+
+  it("returns an empty list when npm reports no files", () => {
+    expect(parseNpmPackFiles("[{}]")).toEqual([]);
   });
 });
