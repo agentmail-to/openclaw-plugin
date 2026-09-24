@@ -21,4 +21,7 @@ jobs:
       - run: npm run build
       - run: npm run plugin:check
       - run: npm run plugin:validate
+      # Assert the tarball npm would publish vendors every CLI target, not just the runner's
+      # platform. Catches the 0.2.1 darwin-only packaging defect before a release can ship it.
+      - run: npm run pack:verify
       - run: npm test

@@ -103,6 +103,13 @@ The **channel** is configured under `channels.agentmail` (single inbox) or `chan
 }
 ```
 
+> **Channel credential and version:** setting `AGENTMAIL_API_KEY` in the Gateway environment works
+> on every version and is the simplest channel credential — to use it, omit
+> `channels.agentmail.apiKey` entirely. The SecretRef form shown above (`apiKey: { source: "env", … }`)
+> is resolved only on **0.2.2 or newer**. On 0.2.1 that reference is not pre-resolved, so the channel
+> fails to start with `unresolved SecretRef "env:default:AGENTMAIL_API_KEY"`; use the Gateway env var
+> until you are on 0.2.2+.
+
 Security defaults worth knowing:
 
 - `dmPolicy` defaults to `allowlist`. With an empty `allowFrom`, **every sender is denied**.
