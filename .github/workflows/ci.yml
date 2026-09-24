@@ -21,4 +21,7 @@ jobs:
       - run: npm run build
       - run: npm run plugin:check
       - run: npm run plugin:validate
+      # Assert the npm pack file list includes every CLI target (plugin:validate checks the disk,
+      # this checks what the package would contain). Releases should also run it on the built .tgz.
+      - run: npm run pack:verify
       - run: npm test

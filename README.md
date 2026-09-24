@@ -103,6 +103,13 @@ The **channel** is configured under `channels.agentmail` (single inbox) or `chan
 }
 ```
 
+> **Channel credential and version:** setting `AGENTMAIL_API_KEY` in the Gateway environment works
+> on 0.2.1 and later and is the simplest channel credential — to use it, omit
+> `channels.agentmail.apiKey` entirely. The SecretRef form shown above (`apiKey: { source: "env", … }`)
+> is resolved only on **0.2.2 or newer**. On 0.2.1 that reference is not pre-resolved, so the channel
+> fails to start with `unresolved SecretRef "env:default:AGENTMAIL_API_KEY"`; use the Gateway env var
+> until you are on 0.2.2+.
+
 Security defaults worth knowing:
 
 - `dmPolicy` defaults to `allowlist`. With an empty `allowFrom`, **every sender is denied**.
@@ -153,7 +160,9 @@ npm test               # vitest
 verifies its SHA-256 checksum, and regenerates `openclaw.plugin.json`. `npm pack` prepares every
 supported CLI target so installation never runs lifecycle scripts or downloads executables. Do not
 publish with lifecycle scripts disabled (`--ignore-scripts`), because `prepack` is what assembles
-and validates the complete eight-platform vendor tree.
+and validates the complete eight-platform vendor tree. Before uploading a release, run
+`npm run pack:verify -- <package>.tgz` on the exact tarball you are about to publish; it fails if
+any of the eight CLI executables is missing.
 
 CLI release version, archive checksums, and extracted-executable checksums live in
 `src/cli/agentmail-cli-release.json`. Update that file when intentionally adopting a new AgentMail
