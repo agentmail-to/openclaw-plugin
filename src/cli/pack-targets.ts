@@ -1,9 +1,11 @@
-// Pure helpers for asserting a package vendors every bundled AgentMail CLI target.
+// Pure helpers for asserting a package vendors every bundled AgentMail CLI target and fits on
+// ClawHub.
 //
 // `prepack` (plugin:validate) already fails when the on-disk vendor tree is incomplete, but 0.2.1
 // shipped with only `vendor/agentmail/darwin-arm64/agentmail` because the release skipped
 // lifecycle scripts. `scripts/assert-cli-targets-packed.mjs` uses these helpers to check what is
 // actually in the package: the `npm pack` file list, or a built .tgz passed on the command line.
+import { gunzipSync } from "node:zlib";
 
 export interface CliReleaseAsset {
   executableName: string;
@@ -13,6 +15,19 @@ export interface CliRelease {
   vendorDirectory: string;
   assets: Record<string, CliReleaseAsset>;
 }
+
+/** One regular file in a package, as `npm pack` lists it or a .tgz contains it. */
+export interface PackEntry {
+  path: string;
+  size: number;
+}
+
+/**
+ * ClawHub rejects a package whose files total more than this many bytes (`MAX_UNPACKED_BYTES` in
+ * the ClawHub CLI's clawpack.js). Each bundled CLI executable is roughly 12 MiB, so only a few
+ * targets fit.
+ */
+export const CLAWHUB_MAX_UNPACKED_BYTES = 50 * 1024 * 1024;
 
 /** Normalizes an `npm pack` file path to a forward-slash, package-root-relative form. */
 export function normalizePackPath(path: string): string {
@@ -48,15 +63,68 @@ export function findMissingCliTargets(
   return expectedCliVendorPaths(release).filter((path) => !packed.has(path));
 }
 
+function firstPackResult(parsed: unknown): unknown {
+  if (Array.isArray(parsed)) {
+    return parsed[0];
+  }
+  if (parsed && typeof parsed === "object") {
+    // npm 12 keys results by package name; a bare result object carries `files` itself.
+    return "files" in parsed ? parsed : Object.values(parsed)[0];
+  }
+  return undefined;
+}
+
 /**
- * File paths from `npm pack --dry-run --json` stdout. Tolerates leading non-JSON text and accepts
- * either the array npm prints or a single entry object.
+ * File paths and sizes from `npm pack --dry-run --json` stdout. Tolerates leading non-JSON text and
+ * accepts the array npm 11 prints, the object keyed by package name npm 12 prints, or a single
+ * result object.
  */
-export function parseNpmPackFiles(stdout: string): string[] {
-  const start = stdout.indexOf("[");
-  const parsed: unknown = JSON.parse(start >= 0 ? stdout.slice(start) : stdout);
-  const entry = (Array.isArray(parsed) ? parsed[0] : parsed) as
-    | { files?: { path: string }[] }
-    | undefined;
-  return (entry?.files ?? []).map((file) => file.path);
+export function parseNpmPackEntries(stdout: string): PackEntry[] {
+  const starts = ["[", "{"].map((token) => stdout.indexOf(token)).filter((index) => index >= 0);
+  const json = starts.length > 0 ? stdout.slice(Math.min(...starts)) : stdout;
+  const parsed: unknown = JSON.parse(json);
+  const result = firstPackResult(parsed) as { files?: PackEntry[] } | undefined;
+  return (result?.files ?? []).map(({ path, size }) => ({ path, size }));
+}
+
+function readTarField(header: Uint8Array, offset: number, length: number): string {
+  const field = header.subarray(offset, offset + length);
+  const end = field.indexOf(0);
+  return new TextDecoder().decode(end === -1 ? field : field.subarray(0, end));
+}
+
+/**
+ * Regular files in an `npm pack` .tgz with package-root-relative paths, read the way ClawHub reads
+ * a ClawPack. Directories are skipped; any other entry type fails, since ClawHub rejects it too.
+ */
+export function listTarballEntries(tgz: Uint8Array): PackEntry[] {
+  const tar = gunzipSync(tgz);
+  const entries: PackEntry[] = [];
+  let offset = 0;
+  while (offset + 512 <= tar.byteLength) {
+    const header = tar.subarray(offset, offset + 512);
+    if (header.every((byte) => byte === 0)) {
+      break;
+    }
+    const name = readTarField(header, 0, 100);
+    const prefix = readTarField(header, 345, 155);
+    const size = Number.parseInt(readTarField(header, 124, 12).trim() || "0", 8);
+    const type = String.fromCharCode(header[156] ?? 0);
+    if (type === "0" || type === "\0") {
+      entries.push({ path: normalizePackPath(prefix ? `${prefix}/${name}` : name), size });
+    } else if (type !== "5") {
+      throw new Error(`Unsupported tar entry type "${type}" for ${name}.`);
+    }
+    offset += 512 + Math.ceil(size / 512) * 512;
+  }
+  return entries;
+}
+
+/** Total bytes of `entries`, the figure ClawHub compares against its package size limit. */
+export function unpackedBytes(entries: Iterable<PackEntry>): number {
+  let total = 0;
+  for (const entry of entries) {
+    total += entry.size;
+  }
+  return total;
 }

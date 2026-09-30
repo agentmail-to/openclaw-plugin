@@ -4,7 +4,7 @@
 // Kept separate from `plugin:check` (manifest staleness).
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -132,6 +132,19 @@ for (const [target, metadata] of Object.entries(cliRelease.assets)) {
   if (!target.startsWith("win32-") && (statSync(executable).mode & 0o111) === 0) {
     fail(`bundled AgentMail CLI executable is not executable for ${target}`);
   }
+}
+// cli:prepare never deletes targets, so a tree prepared before a target was dropped still holds
+// it, and npm pack would ship it past ClawHub's 50 MiB limit.
+const undeclaredTargets = readdirSync(cliRunner.resolveAgentMailCliVendorPath(), {
+  withFileTypes: true,
+})
+  .filter((entry) => entry.isDirectory() && !(entry.name in cliRelease.assets))
+  .map((entry) => entry.name);
+if (undeclaredTargets.length > 0) {
+  fail(
+    `vendor tree contains CLI targets not declared in agentmail-cli-release.json: ${undeclaredTargets.join(", ")}`,
+    "Delete vendor/ and re-run `npm run plugin:validate`.",
+  );
 }
 let cliHelp = "";
 try {
