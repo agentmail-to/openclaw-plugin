@@ -51,7 +51,13 @@ export function resolveAgentMailCliTarget(
   const directory = `${platform}-${arch}`;
   const asset = release.assets[directory as keyof typeof release.assets];
   if (!asset) {
-    throw new Error(`The bundled AgentMail CLI does not support ${platform}/${arch}.`);
+    // ClawHub caps a package at 50 MiB unpacked, so only a few ~12 MiB executables can ship.
+    const bundled = Object.keys(release.assets).sort().join(", ");
+    throw new Error(
+      `This AgentMail plugin package does not bundle the AgentMail CLI for ${directory} ` +
+        `(bundled: ${bundled}). The AgentMail email channel does not use the CLI. To run the CLI ` +
+        `on this host, install it from https://github.com/${release.repository}/releases.`,
+    );
   }
   if (asset.executableName !== "agentmail" && asset.executableName !== "agentmail.exe") {
     throw new Error(`The bundled AgentMail CLI metadata is invalid for ${platform}/${arch}.`);

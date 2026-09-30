@@ -18,12 +18,19 @@ describe("AgentMail CLI bridge", () => {
       directory: "darwin-arm64",
       executableName: "agentmail",
     });
-    expect(resolveAgentMailCliTarget("win32", "x64")).toEqual({
-      directory: "win32-x64",
-      executableName: "agentmail.exe",
+    expect(resolveAgentMailCliTarget("linux", "arm64")).toEqual({
+      directory: "linux-arm64",
+      executableName: "agentmail",
     });
-    expect(() => resolveAgentMailCliTarget("darwin", "ia32")).toThrow(
-      "does not support darwin/ia32",
+  });
+
+  it("explains which CLI targets are bundled when the host is not one of them", () => {
+    // ClawHub caps a package at 50 MiB unpacked, so only three ~12 MiB executables ship.
+    expect(() => resolveAgentMailCliTarget("win32", "x64")).toThrow(
+      "does not bundle the AgentMail CLI for win32-x64 (bundled: darwin-arm64, linux-arm64, linux-x64)",
+    );
+    expect(() => resolveAgentMailCliTarget("darwin", "x64")).toThrow(
+      "The AgentMail email channel does not use the CLI",
     );
   });
 

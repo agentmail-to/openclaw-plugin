@@ -1,4 +1,4 @@
-// Fails if a package would omit any bundled AgentMail CLI target.
+// Fails if a package would omit any bundled AgentMail CLI target or exceed ClawHub's size limit.
 //
 // Usage:
 //   npm run pack:verify                         checks the file list `npm pack` would publish now
@@ -9,6 +9,10 @@
 // so plugin:validate never ran. Checking the tarball you are about to upload catches that no matter
 // how it was built. Without an argument it packs with --ignore-scripts so it reports the tree on
 // disk instead of rebuilding it; run it after `npm run plugin:validate`.
+//
+// ClawHub rejects packages over 50 MiB unpacked. With one ~12 MiB executable per CLI target, the
+// size check is what stops a new target or a larger CLI release from producing an unpublishable
+// package.
 import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 
@@ -22,7 +26,14 @@ try {
   console.error(String(error));
   process.exit(1);
 }
-const { findMissingCliTargets, expectedCliVendorPaths, parseNpmPackFiles } = packTargets;
+const {
+  CLAWHUB_MAX_UNPACKED_BYTES,
+  expectedCliVendorPaths,
+  findMissingCliTargets,
+  listTarballEntries,
+  parseNpmPackEntries,
+  unpackedBytes,
+} = packTargets;
 
 const release = JSON.parse(
   readFileSync(new URL("../src/cli/agentmail-cli-release.json", import.meta.url), "utf8"),
@@ -30,12 +41,9 @@ const release = JSON.parse(
 
 const tarball = process.argv[2];
 
-function packedPaths() {
+function packedEntries() {
   if (tarball) {
-    // `tar -t` lists entries as package/<path>; normalizePackPath strips the prefix.
-    return execFileSync("tar", ["-tzf", tarball], { encoding: "utf8" })
-      .split(/\r?\n/)
-      .filter(Boolean);
+    return listTarballEntries(readFileSync(tarball));
   }
   const stdout = execFileSync("npm", ["pack", "--dry-run", "--json", "--ignore-scripts"], {
     encoding: "utf8",
@@ -43,12 +51,18 @@ function packedPaths() {
     // npm is npm.cmd on Windows, which only launches through a shell. The arguments are fixed.
     shell: process.platform === "win32",
   });
-  return parseNpmPackFiles(stdout);
+  return parseNpmPackEntries(stdout);
 }
 
 const source = tarball ? tarball : "the npm pack file list";
+const entries = packedEntries();
 const expected = expectedCliVendorPaths(release);
-const missing = findMissingCliTargets(packedPaths(), release);
+const missing = findMissingCliTargets(
+  entries.map((entry) => entry.path),
+  release,
+);
+const size = unpackedBytes(entries);
+const mebibytes = (bytes) => `${(bytes / 1024 / 1024).toFixed(1)} MiB`;
 
 if (missing.length > 0) {
   console.error(
@@ -65,4 +79,17 @@ if (missing.length > 0) {
   process.exit(1);
 }
 
-console.log(`pack:verify OK: all ${expected.length} AgentMail CLI targets are in ${source}.`);
+if (size > CLAWHUB_MAX_UNPACKED_BYTES) {
+  console.error(
+    `pack:verify FAILED: ${source} is ${mebibytes(size)} unpacked; ClawHub rejects packages over ${mebibytes(CLAWHUB_MAX_UNPACKED_BYTES)}.`,
+  );
+  console.error(
+    "Bundle fewer CLI targets in src/cli/agentmail-cli-release.json or reduce the executable size.",
+  );
+  process.exit(1);
+}
+
+console.log(
+  `pack:verify OK: all ${expected.length} AgentMail CLI targets are in ${source} ` +
+    `(${mebibytes(size)} of ClawHub's ${mebibytes(CLAWHUB_MAX_UNPACKED_BYTES)} limit).`,
+);

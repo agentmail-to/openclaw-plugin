@@ -13,8 +13,12 @@ Give an OpenClaw agent an email address with [AgentMail](https://www.agentmail.t
 - OpenClaw 2026.8.1-beta.2 or newer
 - An AgentMail API key from the [AgentMail console](https://console.agentmail.to/)
 
-The published plugin includes the official AgentMail CLI for supported macOS, Linux, and Windows
-architectures. A separate global CLI installation is not required.
+The published plugin includes the official AgentMail CLI for macOS on Apple silicon (darwin-arm64)
+and Linux on x64 and arm64. A separate global CLI installation is not required on those hosts.
+ClawHub limits a package to 50 MiB unpacked and each CLI executable is about 12 MiB, so other
+platforms are not bundled. On those hosts the email channel works normally, but the
+`openclaw agentmail` command and the CLI skill are unavailable; install the CLI directly from the
+[AgentMail CLI releases](https://github.com/agentmail-to/agentmail-cli/releases) to use it there.
 
 ## Install
 
@@ -160,9 +164,16 @@ npm test               # vitest
 verifies its SHA-256 checksum, and regenerates `openclaw.plugin.json`. `npm pack` prepares every
 supported CLI target so installation never runs lifecycle scripts or downloads executables. Do not
 publish with lifecycle scripts disabled (`--ignore-scripts`), because `prepack` is what assembles
-and validates the complete eight-platform vendor tree. Before uploading a release, run
-`npm run pack:verify -- <package>.tgz` on the exact tarball you are about to publish; it fails if
-any of the eight CLI executables is missing.
+and validates the vendor tree for every target in `src/cli/agentmail-cli-release.json`. Before
+uploading a release, run `npm run pack:verify -- <package>.tgz` on the exact tarball you are about
+to publish; it fails if a bundled CLI executable is missing or the package exceeds ClawHub's
+50 MiB unpacked limit.
+
+Publish that tarball itself, for example
+`clawhub package publish ./agentmail-agentmail-<version>.tgz --family code-plugin --owner agentmail --source-repo agentmail-to/openclaw-plugin --source-commit <sha> --source-ref main`.
+Publishing the repository folder instead makes the ClawHub CLI run `npm pack --ignore-scripts`,
+which skips `prepack` and ships whatever vendor tree is on disk; that is how 0.2.1 shipped only the
+darwin-arm64 CLI.
 
 CLI release version, archive checksums, and extracted-executable checksums live in
 `src/cli/agentmail-cli-release.json`. Update that file when intentionally adopting a new AgentMail
