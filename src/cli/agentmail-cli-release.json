@@ -8,18 +8,6 @@
       "sha256": "3e4bdd699826dfbe043b3c1b3da330d7ab09aee81498fd194c2448cf8002da59",
       "executableSha256": "5ed06a8071fa3269f7b45726a6c11d8bc09a6fe5c7fa6c4d94760494be8c9bb9",
       "executableName": "agentmail"
-    },
-    "linux-arm64": {
-      "archive": "agentmail_0.7.14_linux_arm64.tar.gz",
-      "sha256": "3aaaa675793c6c182ce5877205e7211ed490ec92fcfef1da8ca555dd402d4a6e",
-      "executableSha256": "0793dc1a7913addc893e8aeb5717e2576dcdb2f12438299ee853756f78b1f280",
-      "executableName": "agentmail"
-    },
-    "linux-x64": {
-      "archive": "agentmail_0.7.14_linux_amd64.tar.gz",
-      "sha256": "8b5304be5b29d2457234a7a3655eba87ff2b89e5c57d01a51788fdafe63b2b65",
-      "executableSha256": "b90acaaf52a3f5b77c8812e6092db1dfc66148b39300bacc84c74635cf991bd5",
-      "executableName": "agentmail"
     }
   }
 }

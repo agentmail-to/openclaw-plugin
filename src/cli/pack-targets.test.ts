@@ -7,6 +7,7 @@ import {
   type CliRelease,
   expectedCliVendorPaths,
   findMissingCliTargets,
+  CLAWHUB_PUBLISHABLE_UNPACKED_BYTES,
   listTarballEntries,
   normalizePackPath,
   parseNpmPackEntries,
@@ -34,19 +35,23 @@ describe("findMissingCliTargets", () => {
     expect(findMissingCliTargets(fullPackFileList(), release)).toEqual([]);
   });
 
-  it("flags every other target for a darwin-arm64-only pack (the 0.2.1 defect)", () => {
+  it("flags every other declared target for a host-only pack (the 0.2.1 defect)", () => {
+    const multiTarget: CliRelease = {
+      vendorDirectory: "vendor/agentmail",
+      assets: {
+        "darwin-arm64": { executableName: "agentmail" },
+        "linux-x64": { executableName: "agentmail" },
+      },
+    };
     const hostOnly = [
       "package.json",
       "vendor/agentmail/VERSION",
       "vendor/agentmail/darwin-arm64/agentmail",
     ];
-    const missing = findMissingCliTargets(hostOnly, release);
 
-    expect(missing).not.toContain("vendor/agentmail/darwin-arm64/agentmail");
-    expect(missing).toHaveLength(targetCount - 1);
-    // The Linux CLI a customer on those platforms actually needs.
-    expect(missing).toContain("vendor/agentmail/linux-x64/agentmail");
-    expect(missing).toContain("vendor/agentmail/linux-arm64/agentmail");
+    expect(findMissingCliTargets(hostOnly, multiTarget)).toEqual([
+      "vendor/agentmail/linux-x64/agentmail",
+    ]);
   });
 
   it("flags all targets when the vendor tree is absent entirely", () => {
@@ -154,8 +159,21 @@ describe("listTarballEntries", () => {
   });
 });
 
+describe("CLAWHUB_PUBLISHABLE_UNPACKED_BYTES", () => {
+  const MiB = 1024 * 1024;
+
+  it("admits one ~12 MiB CLI executable plus the plugin", () => {
+    expect(12.6 * MiB).toBeLessThanOrEqual(CLAWHUB_PUBLISHABLE_UNPACKED_BYTES);
+  });
+
+  it("rejects two CLI executables, which ClawHub's publish endpoint failed on", () => {
+    // Two targets come to ~25.7 MB unpacked; three (35.7 MiB) returned a bare 500 every time.
+    expect(25.7 * 1000 * 1000).toBeGreaterThan(CLAWHUB_PUBLISHABLE_UNPACKED_BYTES);
+  });
+});
+
 describe("unpackedBytes", () => {
-  it("sums file sizes, the figure ClawHub's 50 MiB package limit applies to", () => {
+  it("sums file sizes, the figure ClawHub's package size limits apply to", () => {
     expect(
       unpackedBytes([
         { path: "package.json", size: 120 },

@@ -13,11 +13,11 @@ Give an OpenClaw agent an email address with [AgentMail](https://www.agentmail.t
 - OpenClaw 2026.8.1-beta.2 or newer
 - An AgentMail API key from the [AgentMail console](https://console.agentmail.to/)
 
-The published plugin includes the official AgentMail CLI for macOS on Apple silicon (darwin-arm64)
-and Linux on x64 and arm64. A separate global CLI installation is not required on those hosts.
-ClawHub limits a package to 50 MiB unpacked and each CLI executable is about 12 MiB, so other
-platforms are not bundled. On those hosts the email channel works normally, but the
-`openclaw agentmail` command and the CLI skill are unavailable; install the CLI directly from the
+The published plugin includes the official AgentMail CLI for macOS on Apple silicon (darwin-arm64),
+so a separate global CLI installation is not required there. ClawHub cannot publish packages much
+over 20 MiB unpacked and each CLI executable is about 12 MiB, so other platforms are not bundled.
+On those hosts the email channel works normally, but the `openclaw agentmail` command and the CLI
+skill are unavailable; install the CLI directly from the
 [AgentMail CLI releases](https://github.com/agentmail-to/agentmail-cli/releases) to use it there.
 
 ## Install
@@ -166,14 +166,16 @@ supported CLI target so installation never runs lifecycle scripts or downloads e
 publish with lifecycle scripts disabled (`--ignore-scripts`), because `prepack` is what assembles
 and validates the vendor tree for every target in `src/cli/agentmail-cli-release.json`. Before
 uploading a release, run `npm run pack:verify -- <package>.tgz` on the exact tarball you are about
-to publish; it fails if a bundled CLI executable is missing or the package exceeds ClawHub's
-50 MiB unpacked limit.
+to publish; it fails if a bundled CLI executable is missing or the package is over 20 MiB
+unpacked. ClawHub advertises a 50 MiB limit, but its publish endpoint returned a bare 500 for a
+35.7 MiB package.
 
 Publish that tarball itself, for example
 `clawhub package publish ./agentmail-agentmail-<version>.tgz --family code-plugin --owner agentmail --source-repo agentmail-to/openclaw-plugin --source-commit <sha> --source-ref main`.
 Publishing the repository folder instead makes the ClawHub CLI run `npm pack --ignore-scripts`,
 which skips `prepack` and ships whatever vendor tree is on disk; that is how 0.2.1 shipped only the
-darwin-arm64 CLI.
+darwin-arm64 CLI. Use a ClawHub CLI that includes openclaw/clawhub#3584: clawhub 0.23.3 from npm
+sends tarballs up to 18 MiB inline, and clawhub.ai rejects request bodies over 4.5 MB with 413.
 
 CLI release version, archive checksums, and extracted-executable checksums live in
 `src/cli/agentmail-cli-release.json`. Update that file when intentionally adopting a new AgentMail
