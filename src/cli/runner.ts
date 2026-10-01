@@ -51,7 +51,7 @@ export function resolveAgentMailCliTarget(
   const directory = `${platform}-${arch}`;
   const asset = release.assets[directory as keyof typeof release.assets];
   if (!asset) {
-    // ClawHub caps a package at 50 MiB unpacked, so only a few ~12 MiB executables can ship.
+    // ClawHub cannot publish packages much over 20 MiB, so only one ~12 MiB executable ships.
     const bundled = Object.keys(release.assets).sort().join(", ");
     throw new Error(
       `This AgentMail plugin package does not bundle the AgentMail CLI for ${directory} ` +

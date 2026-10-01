@@ -134,7 +134,7 @@ for (const [target, metadata] of Object.entries(cliRelease.assets)) {
   }
 }
 // cli:prepare never deletes targets, so a tree prepared before a target was dropped still holds
-// it, and npm pack would ship it past ClawHub's 50 MiB limit.
+// it, and npm pack would ship it past ClawHub's publish size limit.
 const undeclaredTargets = readdirSync(cliRunner.resolveAgentMailCliVendorPath(), {
   withFileTypes: true,
 })

@@ -1,4 +1,5 @@
-// Fails if a package would omit any bundled AgentMail CLI target or exceed ClawHub's size limit.
+// Fails if a package would omit any bundled AgentMail CLI target or be too large to publish to
+// ClawHub.
 //
 // Usage:
 //   npm run pack:verify                         checks the file list `npm pack` would publish now
@@ -10,7 +11,8 @@
 // how it was built. Without an argument it packs with --ignore-scripts so it reports the tree on
 // disk instead of rebuilding it; run it after `npm run plugin:validate`.
 //
-// ClawHub rejects packages over 50 MiB unpacked. With one ~12 MiB executable per CLI target, the
+// ClawHub's publish endpoint fails on packages much over 20 MiB unpacked, well below its advertised
+// 50 MiB (see CLAWHUB_PUBLISHABLE_UNPACKED_BYTES). With one ~12 MiB executable per CLI target, the
 // size check is what stops a new target or a larger CLI release from producing an unpublishable
 // package.
 import { execFileSync } from "node:child_process";
@@ -27,7 +29,7 @@ try {
   process.exit(1);
 }
 const {
-  CLAWHUB_MAX_UNPACKED_BYTES,
+  CLAWHUB_PUBLISHABLE_UNPACKED_BYTES,
   expectedCliVendorPaths,
   findMissingCliTargets,
   listTarballEntries,
@@ -79,9 +81,9 @@ if (missing.length > 0) {
   process.exit(1);
 }
 
-if (size > CLAWHUB_MAX_UNPACKED_BYTES) {
+if (size > CLAWHUB_PUBLISHABLE_UNPACKED_BYTES) {
   console.error(
-    `pack:verify FAILED: ${source} is ${mebibytes(size)} unpacked; ClawHub rejects packages over ${mebibytes(CLAWHUB_MAX_UNPACKED_BYTES)}.`,
+    `pack:verify FAILED: ${source} is ${mebibytes(size)} unpacked; ClawHub cannot publish packages over ${mebibytes(CLAWHUB_PUBLISHABLE_UNPACKED_BYTES)}.`,
   );
   console.error(
     "Bundle fewer CLI targets in src/cli/agentmail-cli-release.json or reduce the executable size.",
@@ -90,6 +92,6 @@ if (size > CLAWHUB_MAX_UNPACKED_BYTES) {
 }
 
 console.log(
-  `pack:verify OK: all ${expected.length} AgentMail CLI targets are in ${source} ` +
-    `(${mebibytes(size)} of ClawHub's ${mebibytes(CLAWHUB_MAX_UNPACKED_BYTES)} limit).`,
+  `pack:verify OK: ${expected.length === 1 ? "the bundled AgentMail CLI target is" : `all ${expected.length} AgentMail CLI targets are`} in ${source} ` +
+    `(${mebibytes(size)} of the ${mebibytes(CLAWHUB_PUBLISHABLE_UNPACKED_BYTES)} ClawHub publish limit).`,
 );

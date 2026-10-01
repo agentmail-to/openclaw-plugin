@@ -23,11 +23,13 @@ export interface PackEntry {
 }
 
 /**
- * ClawHub rejects a package whose files total more than this many bytes (`MAX_UNPACKED_BYTES` in
- * the ClawHub CLI's clawpack.js). Each bundled CLI executable is roughly 12 MiB, so only a few
- * targets fit.
+ * Largest package, as total file bytes, this plugin publishes to ClawHub. ClawHub advertises a
+ * 50 MiB unpacked limit, but its publish endpoint parses the package inside a 64 MiB Convex action
+ * at roughly tarball + 2x unpacked peak memory. A 35.7 MiB package returned a bare 500 on every
+ * attempt, and the largest package ClawHub had accepted was about 24 MB. Each bundled CLI
+ * executable is roughly 12 MiB, so one target fits.
  */
-export const CLAWHUB_MAX_UNPACKED_BYTES = 50 * 1024 * 1024;
+export const CLAWHUB_PUBLISHABLE_UNPACKED_BYTES = 20 * 1024 * 1024;
 
 /** Normalizes an `npm pack` file path to a forward-slash, package-root-relative form. */
 export function normalizePackPath(path: string): string {
@@ -120,7 +122,7 @@ export function listTarballEntries(tgz: Uint8Array): PackEntry[] {
   return entries;
 }
 
-/** Total bytes of `entries`, the figure ClawHub compares against its package size limit. */
+/** Total bytes of `entries`, the figure ClawHub's package size limits apply to. */
 export function unpackedBytes(entries: Iterable<PackEntry>): number {
   let total = 0;
   for (const entry of entries) {
