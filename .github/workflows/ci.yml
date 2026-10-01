@@ -10,7 +10,9 @@ permissions:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    # plugin:validate runs the bundled CLI, and the package bundles only the darwin-arm64 build
+    # (see CLAWHUB_PUBLISHABLE_UNPACKED_BYTES), so this job needs an Apple silicon runner.
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -24,4 +26,17 @@ jobs:
       # Assert the npm pack file list includes every CLI target (plugin:validate checks the disk,
       # this checks what the package would contain). Releases should also run it on the built .tgz.
       - run: npm run pack:verify
+      - run: npm test
+
+  # Most gateways run the email channel on Linux, so keep its tests running there too.
+  test-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.15.0
+          cache: npm
+      - run: npm ci
+      - run: npm run build
       - run: npm test
