@@ -14,6 +14,7 @@ import { isAgentMailSenderAllowed, parseSingleFromMailbox } from "./mailbox.js";
 import { AgentMailMediaPolicyError, loadAgentMailOutboundAttachments } from "./media.js";
 import { agentMailInboxIdsEqual } from "./received-message.js";
 import { HYDRATION_NOT_FOUND_RETRY_WINDOW_MS } from "./inbound.js";
+import { renderEmailHtml } from "./markdown-html.js";
 
 // A media-size policy violation is genuinely terminal: the same payload will always exceed the
 // limit, so retrying the reply is pointless.
@@ -194,6 +195,7 @@ async function sendBoundAgentMailReply(
     ...(ctx.mediaReadFile ? { mediaReadFile: ctx.mediaReadFile } : {}),
   });
   const text = (ctx.payload?.text ?? ctx.text)?.trim() || undefined;
+  const html = text ? renderEmailHtml(text) : undefined;
   if (!text && attachments.length === 0) {
     throw new Error("AgentMail reply must contain text or at least one attachment.");
   }
@@ -203,6 +205,7 @@ async function sendBoundAgentMailReply(
     triggeringMessageId,
     {
       ...(text ? { text } : {}),
+      ...(html ? { html } : {}),
       ...(attachments.length > 0 ? { attachments } : {}),
       to: [sender.address],
       replyAll: false,
