@@ -3,7 +3,7 @@ import { AgentMailError, type AgentMail, type AgentMailClient } from "agentmail"
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import type { PluginRuntime } from "openclaw/plugin-sdk/plugin-runtime";
 import { buildAgentSessionKey, parseAgentSessionKey } from "openclaw/plugin-sdk/routing";
-import { htmlToMarkdown, markdownToText } from "openclaw/plugin-sdk/web-content-extractor";
+import { htmlToMarkdown } from "openclaw/plugin-sdk/web-content-extractor";
 import type { AgentMailLog } from "./log.js";
 import { createAgentMailClient } from "./client.js";
 import { isAgentMailSenderAllowed, parseSingleFromMailbox } from "./mailbox.js";
@@ -135,7 +135,7 @@ export function resolveAgentMailMessageText(message: AgentMail.Message): string 
   }
   const extractedHtml = message.extractedHtml?.trim();
   const extractedHtmlText = extractedHtml
-    ? markdownToText(htmlToMarkdown(extractedHtml).text).trim()
+    ? htmlToMarkdown(extractedHtml).text.trim()
     : "";
   if (extractedHtmlText) {
     return extractedHtmlText;
@@ -145,7 +145,7 @@ export function resolveAgentMailMessageText(message: AgentMail.Message): string 
     return text;
   }
   const html = message.html?.trim();
-  const htmlText = html ? markdownToText(htmlToMarkdown(html).text).trim() : "";
+  const htmlText = html ? htmlToMarkdown(html).text.trim() : "";
   return htmlText || message.subject?.trim() || "";
 }
 

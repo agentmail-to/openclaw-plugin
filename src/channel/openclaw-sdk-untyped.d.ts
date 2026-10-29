@@ -35,8 +35,6 @@ declare module "openclaw/plugin-sdk/plugin-state-runtime" {
 declare module "openclaw/plugin-sdk/web-content-extractor" {
   /** Converts sanitized HTML into coarse markdown plus an optional title. */
   export function htmlToMarkdown(html: string): { text: string; title?: string };
-  /** Removes markdown decoration for plain text extraction. */
-  export function markdownToText(markdown: string): string;
 }
 
 declare module "openclaw/plugin-sdk/outbound-media" {
