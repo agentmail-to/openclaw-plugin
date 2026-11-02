@@ -477,9 +477,10 @@ describe("AgentMail WebSocket ingress", () => {
       await vi.advanceTimersByTimeAsync(0);
       expect(handlers.has("open")).toBe(true);
       handlers.get("open")?.();
+      handlers.get("message")?.({ type: "subscribed" });
 
-      // The SDK exposes no heartbeat/liveness probe through this facade. Silence is healthy; the
-      // periodic REST sweep covers missed delivery without forcing a reconnect storm.
+      // The SDK exposes no heartbeat/liveness probe through this facade. Silence up to the server's
+      // own idle close is healthy; the periodic REST sweep covers missed delivery meanwhile.
       await vi.advanceTimersByTimeAsync(10 * 60_000);
       expect(connect).toHaveBeenCalledOnce();
       expect(close).not.toHaveBeenCalled();
@@ -491,5 +492,174 @@ describe("AgentMail WebSocket ingress", () => {
       controller.abort();
       vi.useRealTimers();
     }
+  });
+
+  it("logs subscribed only once the server acknowledges the subscription", async () => {
+    handlers.clear();
+    const info = vi.fn();
+    const controller = new AbortController();
+    const running = startAgentMailWebSocket({
+      account,
+      abortSignal: controller.signal,
+      receive: vi.fn(async () => undefined),
+      catchUpSession: { run: catchUpRun },
+      log: { info },
+    });
+    await vi.waitFor(() => expect(handlers.has("open")).toBe(true));
+    handlers.get("open")?.();
+    expect(info).not.toHaveBeenCalledWith("AgentMail WebSocket subscribed for account default");
+
+    handlers.get("message")?.({ type: "subscribed", inboxIds: ["inbox_1"] });
+    expect(info).toHaveBeenCalledWith("AgentMail WebSocket subscribed for account default");
+
+    controller.abort();
+    await running;
+    expect(info).toHaveBeenLastCalledWith(
+      "AgentMail WebSocket ingress stopped for account default",
+    );
+  });
+
+  it("reconnects when the server never acknowledges the subscription", async () => {
+    handlers.clear();
+    connect.mockClear();
+    close.mockClear();
+    vi.useFakeTimers();
+    const warn = vi.fn();
+    const controller = new AbortController();
+    try {
+      const running = startAgentMailWebSocket({
+        account,
+        abortSignal: controller.signal,
+        receive: vi.fn(async () => undefined),
+        catchUpSession: { run: catchUpRun },
+        reconnectDelayMs: () => 0,
+        log: { warn },
+      });
+      await vi.advanceTimersByTimeAsync(0);
+      handlers.get("open")?.();
+
+      await vi.advanceTimersByTimeAsync(29_999);
+      expect(connect).toHaveBeenCalledOnce();
+      await vi.advanceTimersByTimeAsync(1);
+      expect(connect).toHaveBeenCalledTimes(2);
+      expect(close).toHaveBeenCalledOnce();
+      expect(warn).toHaveBeenCalledWith(
+        "AgentMail WebSocket closed for account default (subscription not confirmed within 30s); reconnecting",
+      );
+
+      controller.abort();
+      await running;
+    } finally {
+      controller.abort();
+      vi.useRealTimers();
+    }
+  });
+
+  it("recycles a socket that goes silent past the server's idle close without a close event", async () => {
+    handlers.clear();
+    connect.mockClear();
+    close.mockClear();
+    catchUpRun.mockClear();
+    vi.useFakeTimers();
+    const warn = vi.fn();
+    const controller = new AbortController();
+    try {
+      const running = startAgentMailWebSocket({
+        account,
+        abortSignal: controller.signal,
+        receive: vi.fn(async () => undefined),
+        catchUpSession: { run: catchUpRun },
+        reconnectDelayMs: () => 0,
+        log: { warn },
+      });
+      await vi.advanceTimersByTimeAsync(0);
+      handlers.get("open")?.();
+      handlers.get("message")?.({ type: "subscribed" });
+
+      // Any frame re-arms the idle deadline.
+      await vi.advanceTimersByTimeAsync(15 * 60_000);
+      handlers.get("message")?.({ type: "event", eventType: "message.sent" });
+      await vi.advanceTimersByTimeAsync(15 * 60_000);
+      expect(connect).toHaveBeenCalledOnce();
+
+      await vi.advanceTimersByTimeAsync(5 * 60_000);
+      expect(connect).toHaveBeenCalledTimes(2);
+      expect(close).toHaveBeenCalledOnce();
+      expect(warn).toHaveBeenCalledWith(
+        "AgentMail WebSocket closed for account default (no frames for 20 minutes); reconnecting",
+      );
+
+      controller.abort();
+      await running;
+    } finally {
+      controller.abort();
+      vi.useRealTimers();
+    }
+  });
+
+  it("logs a refused subscription and reconnects", async () => {
+    handlers.clear();
+    connect.mockClear();
+    catchUpRun.mockClear();
+    const error = vi.fn();
+    const warn = vi.fn();
+    const controller = new AbortController();
+    const running = startAgentMailWebSocket({
+      account,
+      abortSignal: controller.signal,
+      receive: vi.fn(async () => undefined),
+      catchUpSession: { run: catchUpRun },
+      reconnectDelayMs: () => 0,
+      log: { error, warn },
+    });
+    await vi.waitFor(() => expect(handlers.has("open")).toBe(true));
+    handlers.get("open")?.();
+    handlers.get("message")?.({
+      type: "error",
+      name: "LimitExceededError",
+      message: "WebSocket subscriptions limit exceeded",
+    });
+
+    await vi.waitFor(() => expect(connect).toHaveBeenCalledTimes(2));
+    expect(error).toHaveBeenCalledWith(
+      "AgentMail WebSocket server error for account default: LimitExceededError: WebSocket subscriptions limit exceeded",
+    );
+    expect(warn).toHaveBeenCalledWith(
+      "AgentMail WebSocket closed for account default (subscription refused); reconnecting",
+    );
+    controller.abort();
+    await running;
+  });
+
+  it("keeps a confirmed socket open after a server error and logs the close code", async () => {
+    handlers.clear();
+    connect.mockClear();
+    const error = vi.fn();
+    const warn = vi.fn();
+    const controller = new AbortController();
+    const running = startAgentMailWebSocket({
+      account,
+      abortSignal: controller.signal,
+      receive: vi.fn(async () => undefined),
+      catchUpSession: { run: catchUpRun },
+      reconnectDelayMs: () => 0,
+      log: { error, warn },
+    });
+    await vi.waitFor(() => expect(handlers.has("open")).toBe(true));
+    handlers.get("open")?.();
+    handlers.get("message")?.({ type: "subscribed" });
+    handlers.get("message")?.({ type: "error", name: "ValidationError", message: "bad frame" });
+    expect(error).toHaveBeenCalledWith(
+      "AgentMail WebSocket server error for account default: ValidationError: bad frame",
+    );
+    expect(connect).toHaveBeenCalledOnce();
+
+    handlers.get("close")?.({ code: 1001, reason: "Going away" });
+    await vi.waitFor(() => expect(connect).toHaveBeenCalledTimes(2));
+    expect(warn).toHaveBeenCalledWith(
+      "AgentMail WebSocket closed for account default (code 1001: Going away); reconnecting",
+    );
+    controller.abort();
+    await running;
   });
 });
