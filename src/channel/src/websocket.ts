@@ -23,6 +23,31 @@ const AGENTMAIL_WEBSOCKET_STABLE_CONNECTION_MS = 30_000;
 // admissions, hand the record to REST catch-up (which retains the provider-side source) so later
 // live events keep advancing.
 const AGENTMAIL_WEBSOCKET_MAX_RECORD_ATTEMPTS = 8;
+// The server closes an idle socket after 10 minutes. A connection that has gone twice as long with
+// neither a frame nor a close event is gone even though no close was ever reported, so recycle it.
+const AGENTMAIL_WEBSOCKET_IDLE_TIMEOUT_MS = 20 * 60_000;
+// The server acknowledges every subscribe frame. A socket without that ack delivers nothing.
+const AGENTMAIL_WEBSOCKET_SUBSCRIBE_ACK_TIMEOUT_MS = 30_000;
+
+function frameType(value: unknown): unknown {
+  return value && typeof value === "object" ? (value as { type?: unknown }).type : undefined;
+}
+
+function describeServerError(value: unknown): string {
+  const frame = value as Partial<AgentMail.Error_>;
+  const parts = [frame.name, frame.message].filter((part) => typeof part === "string");
+  return parts.length > 0 ? parts.join(": ") : "unknown error";
+}
+
+function describeClose(event: unknown): string {
+  const close = event as { code?: unknown; reason?: unknown } | undefined;
+  if (typeof close?.code !== "number") {
+    return "no close code";
+  }
+  return typeof close.reason === "string" && close.reason
+    ? `code ${close.code}: ${close.reason}`
+    : `code ${close.code}`;
+}
 
 function isReceivedEvent(value: unknown): value is AgentMail.MessageReceivedEvent {
   if (!value || typeof value !== "object") {
@@ -99,6 +124,8 @@ export async function startAgentMailWebSocket(params: {
   liveQueueMax?: number;
   catchUpIntervalMs?: number;
   deepSweepIntervalMs?: number;
+  idleTimeoutMs?: number;
+  subscribeAckTimeoutMs?: number;
   client?: AgentMailClient;
   now?: () => number;
 }): Promise<void> {
@@ -113,6 +140,9 @@ export async function startAgentMailWebSocket(params: {
   const retryDelay = params.retryDelayMs ?? websocketRetryDelayMs;
   const reconnectDelay = params.reconnectDelayMs ?? retryDelay;
   const liveQueueMax = params.liveQueueMax ?? AGENTMAIL_WEBSOCKET_LIVE_QUEUE_MAX;
+  const idleTimeoutMs = params.idleTimeoutMs ?? AGENTMAIL_WEBSOCKET_IDLE_TIMEOUT_MS;
+  const subscribeAckTimeoutMs =
+    params.subscribeAckTimeoutMs ?? AGENTMAIL_WEBSOCKET_SUBSCRIBE_ACK_TIMEOUT_MS;
   const now = params.now ?? Date.now;
   const liveQueue: AgentMailIngressRecord[] = [];
   const queuedMessageIds = new Set<string>();
@@ -244,6 +274,34 @@ export async function startAgentMailWebSocket(params: {
       }
       let subscribedForCurrentConnection = false;
       let subscribedAtMs: number | undefined;
+      let confirmed = false;
+      let closeDetail = "no close code";
+      let idleTimer: ReturnType<typeof setTimeout> | undefined;
+      let ackTimer: ReturnType<typeof setTimeout> | undefined;
+      let settleClosed!: (detail: string) => void;
+      const closed = new Promise<void>((resolve) => {
+        let settled = false;
+        settleClosed = (detail) => {
+          if (settled) {
+            return;
+          }
+          settled = true;
+          closeDetail = detail;
+          subscribedForCurrentConnection = false;
+          clearTimeout(idleTimer);
+          clearTimeout(ackTimer);
+          resolve();
+        };
+      });
+      // Every frame proves the connection is alive. Re-arm on each one, so only a socket that has
+      // gone silent past the server's own idle close is treated as dead.
+      const markActive = () => {
+        clearTimeout(idleTimer);
+        idleTimer = setTimeout(
+          () => settleClosed(`no frames for ${Math.round(idleTimeoutMs / 60_000)} minutes`),
+          idleTimeoutMs,
+        );
+      };
       const subscribe = () => {
         if (subscribedForCurrentConnection) {
           return;
@@ -255,41 +313,59 @@ export async function startAgentMailWebSocket(params: {
         });
         subscribedForCurrentConnection = true;
         subscribedAtMs = now();
-        params.log?.info?.(
-          `AgentMail WebSocket subscribed for account ${params.account.accountId}`,
+        ackTimer = setTimeout(
+          () =>
+            settleClosed(
+              `subscription not confirmed within ${Math.round(subscribeAckTimeoutMs / 1_000)}s`,
+            ),
+          subscribeAckTimeoutMs,
         );
         // Subscribe first, then overlap the persisted REST cursor. Live and catch-up events share
         // the same durable id, closing restart/reconnect gaps without creating duplicate turns.
         catchUpSupervisor.request();
       };
-      const closed = new Promise<void>((resolve) => {
-        let settled = false;
-        const settleClosed = () => {
-          if (settled) {
-            return;
+      markActive();
+      socket.on("open", () => {
+        markActive();
+        subscribe();
+      });
+      socket.on("close", (event) => settleClosed(describeClose(event)));
+      socket.on("error", (error) => {
+        params.log?.error?.(
+          `AgentMail WebSocket error for account ${params.account.accountId}: ${errorText(error)}`,
+        );
+        // Parsing/transport errors may not close the socket. Recover authoritative events even
+        // when the socket stays connected and emits no close.
+        catchUpSupervisor.request();
+        // Fatal socket errors do not always emit a later close. Treat either event as terminal
+        // for this connection so the outer loop recreates it.
+        settleClosed("socket error");
+      });
+      socket.on("message", (event) => {
+        markActive();
+        const type = frameType(event);
+        if (type === "subscribed") {
+          clearTimeout(ackTimer);
+          if (!confirmed) {
+            confirmed = true;
+            params.log?.info?.(
+              `AgentMail WebSocket subscribed for account ${params.account.accountId}`,
+            );
           }
-          settled = true;
-          subscribedForCurrentConnection = false;
-          resolve();
-        };
-        socket.on("open", () => {
-          subscribe();
-        });
-        socket.on("close", settleClosed);
-        socket.on("error", (error) => {
+          return;
+        }
+        if (type === "error") {
           params.log?.error?.(
-            `AgentMail WebSocket error for account ${params.account.accountId}: ${errorText(error)}`,
+            `AgentMail WebSocket server error for account ${params.account.accountId}: ${describeServerError(event)}`,
           );
-          // Parsing/transport errors may not close the socket. Recover authoritative events even
-          // when the socket stays connected and emits no close.
           catchUpSupervisor.request();
-          // Fatal socket errors do not always emit a later close. Treat either event as terminal
-          // for this connection so the outer loop recreates it.
-          settleClosed();
-        });
-        socket.on("message", (event) => {
-          handleMessage(event);
-        });
+          // A refused subscribe leaves an open socket that will never deliver an event.
+          if (!confirmed) {
+            settleClosed("subscription refused");
+          }
+          return;
+        }
+        handleMessage(event);
       });
       // waitForOpen() does not settle on an aborted initial connection; close the already-open race
       // from readyState instead.
@@ -297,6 +373,8 @@ export async function startAgentMailWebSocket(params: {
         subscribe();
       }
       await Promise.race([closed, aborted]);
+      clearTimeout(idleTimer);
+      clearTimeout(ackTimer);
       socket.close();
       if (params.abortSignal.aborted) {
         return;
@@ -312,7 +390,7 @@ export async function startAgentMailWebSocket(params: {
       }
       // Unexpected close: reconnect after a bounded backoff. REST catch-up covers the gap.
       params.log?.warn?.(
-        `AgentMail WebSocket closed for account ${params.account.accountId}; reconnecting`,
+        `AgentMail WebSocket closed for account ${params.account.accountId} (${closeDetail}); reconnecting`,
       );
       catchUpSupervisor.request();
       if (!(await waitForRetry(params.abortSignal, reconnectDelay(++reconnectAttempt)))) {
@@ -329,4 +407,9 @@ export async function startAgentMailWebSocket(params: {
     catchUpSupervisor.settle(),
   ].filter((worker): worker is Promise<void> => worker !== undefined);
   await Promise.allSettled(workers);
+  // Only an abort ends the loop, and it also stops REST catch-up. Say so, so a stopped account is
+  // never mistaken for a live one that has gone quiet.
+  params.log?.info?.(
+    `AgentMail WebSocket ingress stopped for account ${params.account.accountId}`,
+  );
 }
